@@ -1,0 +1,38 @@
+name: ci
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: pytest (python ${{ matrix.python }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ["3.12", "3.13"]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: install uv
+        uses: astral-sh/setup-uv@v3
+        with:
+          version: latest
+
+      - name: install package + test extra
+        run: |
+          uv venv --python ${{ matrix.python }}
+          uv pip install -e ".[test]"
+
+      # Deterministic suite only. test_payload.py is a CLI tool, not a
+      # pytest target. Honeypot liveness needs ANTHROPIC_API_KEY +
+      # network, so it runs out-of-band (manual / release smoke), not
+      # on every PR.
+      - name: pytest
+        run: .venv/bin/python -m pytest tests/test_intercept.py tests/test_regex.py -v
