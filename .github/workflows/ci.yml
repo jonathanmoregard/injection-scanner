@@ -30,9 +30,53 @@ jobs:
           uv venv --python ${{ matrix.python }}
           uv pip install -e ".[test]"
 
-      # Deterministic suite only. test_payload.py is a CLI tool, not a
-      # pytest target. Honeypot liveness needs ANTHROPIC_API_KEY +
-      # network, so it runs out-of-band (manual / release smoke), not
-      # on every PR.
+      # Deterministic suite — no API keys, no network. test_payload.py
+      # is a CLI tool, not a pytest target.
       - name: pytest
         run: .venv/bin/python -m pytest tests/test_intercept.py tests/test_regex.py -v
+
+  smoke:
+    name: smoke (full pipeline incl. honeypot)
+    runs-on: ubuntu-latest
+    needs: test
+    # Skip on forks — secrets aren't available there, and we don't want
+    # CI to fail for outside contributors. Maintainers re-run via PR
+    # from a branch in this repo.
+    if: github.event.pull_request.head.repo.full_name == github.repository || github.event_name == 'push'
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: install uv
+        uses: astral-sh/setup-uv@v3
+        with:
+          version: latest
+
+      - name: install package
+        run: |
+          uv venv --python 3.12
+          uv pip install -e .
+
+      # Live e2e: 6 deterministic canaries (no API) + 1 honeypot
+      # liveness probe that hits Anthropic + OpenAI. Costs ~3 API
+      # calls per run. Runs against the SHA being merged so a PR
+      # that breaks honeypot integration (broken scenario file,
+      # SDK incompat, etc.) cannot reach main.
+      - name: run_smoke
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+        run: |
+          if [ -z "$ANTHROPIC_API_KEY" ] || [ -z "$OPENAI_API_KEY" ]; then
+            echo "::error::Missing ANTHROPIC_API_KEY or OPENAI_API_KEY secret. Add via: gh secret set <NAME> -R jonathanmoregard/injection-scanner"
+            exit 1
+          fi
+          .venv/bin/python -c "
+          import logging, sys
+          logging.basicConfig(level=logging.INFO, format='%(levelname)s %(message)s')
+          from injection_scanner.smoke import SmokeFailure, run_smoke
+          try:
+              run_smoke(log_info=logging.info, log_error=logging.error)
+          except SmokeFailure as e:
+              print(f'::error::smoke failed: {e.reason}', file=sys.stderr)
+              sys.exit(2)
+          "
