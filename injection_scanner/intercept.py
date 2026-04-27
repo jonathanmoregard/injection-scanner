@@ -114,11 +114,20 @@ def scan_text(raw: str, use_honeypot: bool = True) -> Verdict:
             sanitized_text=san.text,
         )
 
-    # L3 honeypot. Always runs. The module itself degrades to
-    # "skipped:<why>" when its SDK or API key is unreachable, so it can
-    # never hard-fail a call; it just doesn't add detection value in that
-    # degraded mode. The `use_honeypot=False` path is used by unit tests
-    # that must not hit the Anthropic API.
+    # L3 honeypot. Always runs in production.
+    #
+    # Fail-closed on degraded honeypot: honeypot_check returns ok=False
+    # with reason="honeypot_unavailable:<scenario>:<why>" when the SDK
+    # is missing, the API key is unset/revoked, or the provider is
+    # unreachable. The `if not hp.ok` branch below catches both
+    # triggered (real attack signal) and unavailable (degraded coverage)
+    # outcomes. An outage quarantines real reports until the honeypot
+    # is back — that's intentional, since silently lowered detection is
+    # the exact failure mode operators must hear about. Diagnose via
+    # `layers.honeypot` in the audit record.
+    #
+    # The `use_honeypot=False` path is used by unit tests that must not
+    # hit the Anthropic API.
     if use_honeypot:
         hp = honeypot_check(san.text)
         layers["honeypot"] = hp.reason
