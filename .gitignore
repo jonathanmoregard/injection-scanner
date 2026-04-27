@@ -2,7 +2,12 @@ __pycache__/
 *.py[cod]
 *.egg-info/
 .venv/
+.venv-*/
 .pytest_cache/
 build/
 dist/
 .coverage
+
+# Library — consumers manage their own lock; we don't pin
+# dev-time deps here.
+uv.lock
