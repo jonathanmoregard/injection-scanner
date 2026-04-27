@@ -3,7 +3,6 @@ Intercept orchestrator: runs the layered shim and produces a single verdict.
 
 Order (each layer can short-circuit):
   L0  unicode_sanitize      — strip covert channels, NFKC normalize, flag anomaly
-  L1a regex (injection_scanner.regex) — seed patterns for role-swap, system-tag, etc.
   L1b secret_shapes         — high-precision API-key / JWT / PEM patterns
   L3  honeypot              — tempt a downstream Haiku with trap tools;
                               if the report coerces it into a tool call, fail
@@ -14,6 +13,14 @@ use both to decide to deliver and to attach audit metadata.
 
 Honeypot is opt-in: the server toggles it with the RESEARCH_HONEYPOT env
 var so cheap local tests don't always pay the API call.
+
+L1a regex was removed: the previous role-swap / instruction-override /
+wrap-escape rules false-positived on legitimate research output that
+quoted prompt-injection examples (security tooling docs, AI-safety
+posts, the scanner's own README). Wrap-escape protection now lives at
+the consumer's delivery boundary — research-agent encodes dangerous
+tag chars on the report body before wrapping it. That's structurally
+zero-FP and survives any future tag rename.
 """
 from __future__ import annotations
 
@@ -21,7 +28,6 @@ import os
 from dataclasses import asdict, dataclass
 from pathlib import Path
 
-from injection_scanner import regex as regex_layer
 from injection_scanner import secret_shapes, unicode_sanitize
 from injection_scanner.honeypot import check as honeypot_check
 
@@ -84,19 +90,6 @@ def scan_text(raw: str, use_honeypot: bool = True) -> Verdict:
         return Verdict(
             ok=False,
             reason=f"unicode_anomaly:stripped={san.stripped}/{len(raw)}",
-            layers=layers,
-            sanitize_stats=asdict(san),
-            sanitized_text=san.text,
-        )
-
-    # L1a — the pre-existing regex shim, but run over the sanitized text so
-    # zero-width obfuscation can't hide matches.
-    ok_a, reason_a = regex_layer.scan_text(san.text)
-    layers["regex"] = "pass" if ok_a else f"fail:{reason_a[:80]}"
-    if not ok_a:
-        return Verdict(
-            ok=False,
-            reason=f"regex:{reason_a}",
             layers=layers,
             sanitize_stats=asdict(san),
             sanitized_text=san.text,

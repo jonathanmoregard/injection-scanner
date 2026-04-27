@@ -96,7 +96,6 @@ def test_orchestrator_passes_clean_report():
         path = Path(f.name)
     v = scan(path, use_honeypot=False)
     assert v.ok, f"expected pass, got {v.reason}"
-    assert v.layers["regex"] == "pass"
     assert v.layers["secret_shapes"] == "pass"
 
 
