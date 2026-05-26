@@ -142,7 +142,18 @@ def test_run_all_reason_includes_skipped_count_on_concurrent_trigger():
          um.patch.object(hp, "_call_openai", _aboom):
         r = asyncio.run(hp._run_all("any"))
     assert r.ok is False
-    assert "+skipped=2" in r.reason
+    assert "+skipped=2/3" in r.reason
+
+
+def test_run_all_reason_includes_skipped_count_on_full_outage():
+    # All three providers blow up. Reason carries +skipped=3/3 so an
+    # operator can distinguish full outage from partial.
+    with um.patch.object(hp, "_call_anthropic", _aboom), \
+         um.patch.object(hp, "_call_openai", _aboom):
+        r = asyncio.run(hp._run_all("any"))
+    assert r.ok is False
+    assert "honeypot_unavailable" in r.reason
+    assert "+skipped=3/3" in r.reason
 
 
 def test_classifier_routes_known_legit_name_normally():

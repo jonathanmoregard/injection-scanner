@@ -124,9 +124,17 @@ def scan_text(raw: str, use_honeypot: bool = True) -> Verdict:
         )
     layers["secret_shapes"] = "pass" if not hits else f"fail:{hits[0].name}"
     if hits:
+        # Reason carries the matched rule NAME only — never the matched
+        # snippet bytes. The 40-char snippet was attacker-controllable
+        # (the bytes of a planted credential-shape that triggered the
+        # rule); echoing it into `reason` flowed it back to the calling
+        # LLM's context, violating honeypot-manufacturing Invariant 4
+        # ("the caught bytes never return"). The full matched snippet
+        # is available off-path in the operator-only secret_shapes log,
+        # not in the caller-visible Verdict.
         return Verdict(
             ok=False,
-            reason=f"secret_shape:{hits[0].name}:{hits[0].snippet[:40]}",
+            reason=f"secret_shape:{hits[0].name}",
             layers=layers,
             sanitize_stats=asdict(san),
             sanitized_text=san.text,

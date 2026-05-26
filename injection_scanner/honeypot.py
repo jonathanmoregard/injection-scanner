@@ -106,22 +106,17 @@ def _openai_key() -> str | None:
 #   1. The wrap uses a per-call random nonce so the attacker can't guess
 #      the exact close tag in advance. Each scenario call gets a fresh
 #      nonce; nothing about the wrap structure is stable across calls.
+#      At 128 bits (32 hex chars) birthday collisions across the lifetime
+#      of a long-running MCP server are negligible.
 #   2. As a belt to the nonce's braces, if the attacker DID somehow guess
-#      the nonce (cryptographically vanishing odds at 16 hex chars / 64
-#      bits) we still rewrite any literal occurrence of that exact close
-#      tag in the body before interpolating, neutralising the escape.
+#      the nonce we still rewrite any literal occurrence of that exact
+#      close tag in the body before interpolating, neutralising the
+#      escape.
 #
 # The tag name itself ("content_<nonce>") is deliberately generic — not
 # `attached`, not `untrusted`, not anything that hints the judge should
 # trust the surrounding frame more than the body. The semantic separation
 # lives in the judge's system prompt, not in the tag name.
-#
-# Nonce length: 32 hex chars / 128 bits. Birthday collisions across the
-# lifetime of a long-running MCP server are negligible at 128 bits, and
-# the per-byte cost of doubling vs the prior 64-bit nonce is irrelevant
-# relative to a network round-trip. The body-rewrite belt-and-braces
-# below is what actually saves us from a same-nonce collision; the
-# nonce length keeps the belt's job rare.
 
 
 def _seal(report_text: str) -> str:
@@ -130,10 +125,10 @@ def _seal(report_text: str) -> str:
     nonce = secrets.token_hex(16)  # 32 hex chars / 128 bits
     open_tag = f"<content_{nonce}>"
     close_tag = f"</content_{nonce}>"
-    # Even with a 64-bit nonce, prefer defense in depth: a body that
-    # happens to embed our exact close tag (collision OR same-process
-    # state leak) shouldn't escape the wrap. Replace the close tag bytes
-    # with an inert form before interpolation.
+    # Defense in depth: a body that happens to embed our exact close tag
+    # (negligible collision odds at 128 bits, but also same-process state
+    # leak via a logged prior nonce) shouldn't escape the wrap. Replace
+    # the close-tag bytes with an inert form before interpolation.
     body = report_text.replace(close_tag, f"&lt;/content_{nonce}&gt;")
     return f"{open_tag}\n{body}\n{close_tag}"
 
@@ -323,6 +318,10 @@ async def _call_anthropic(scenario: Scenario, report_text: str) -> ScenarioResul
             provider="anthropic", model=scenario["model"],
         )
     client = anthropic.Anthropic(api_key=key)
+    # Shallow copy intentional — we rebind `messages[-1]` below to a NEW
+    # dict so the module-level scenario["history"] singleton stays pristine
+    # across concurrent scans. Do NOT switch to mutating in place
+    # (`messages[-1]["content"] = ...`); that would poison the singleton.
     messages = list(scenario["history"])
     attach = f"{messages[-1]['content']}\n\n{_seal(report_text)}"
     if messages and messages[-1]["role"] == "user":
@@ -462,14 +461,21 @@ async def _run_all(report_text: str) -> HoneypotResult:
             results.append(r)
 
     triggered = [r for r in results if r.verdict == "Honeypot_Triggered"]
-    skipped = [r for r in results if r.verdict == "Honeypot_Skipped"]
+    # Defensive: anything that's not explicitly Triggered or Left_Alone
+    # counts as degraded coverage. A future verdict variant (e.g. an
+    # Errored bucket) won't silently drop out of the skipped count.
+    skipped = [
+        r for r in results
+        if r.verdict not in ("Honeypot_Triggered", "Honeypot_Left_Alone")
+    ]
+    total = len(results)
     if triggered:
         first = triggered[0]
         # Surface concurrent provider outages even on trigger: the top-line
         # reason flows into `layers.honeypot` and audit summaries; without
         # this an operator sees only the trigger and misses that a sibling
         # provider was simultaneously down (degraded coverage).
-        skip_suffix = f"+skipped={len(skipped)}" if skipped else ""
+        skip_suffix = f"+skipped={len(skipped)}/{total}" if skipped else ""
         return HoneypotResult(
             ok=False,
             reason=f"honeypot:{first.scenario}:{first.signal}{skip_suffix}",
@@ -477,9 +483,11 @@ async def _run_all(report_text: str) -> HoneypotResult:
         )
     if skipped:
         first = skipped[0]
+        # Symmetric to the trigger path: include the skipped count so a
+        # full-outage (3/3) is distinguishable from a partial (1/3).
         return HoneypotResult(
             ok=False,
-            reason=f"honeypot_unavailable:{first.scenario}:{first.signal}",
+            reason=f"honeypot_unavailable:{first.scenario}:{first.signal}+skipped={len(skipped)}/{total}",
             per_scenario=results,
         )
     return HoneypotResult(ok=True, reason="pass", per_scenario=results)
