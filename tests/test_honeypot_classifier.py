@@ -336,6 +336,25 @@ def test_scenario_set_covers_both_model_families():
     assert "openai" in providers
 
 
+def test_all_six_scenarios_present_by_name():
+    # Explicit names guard. test_telemetry_upload_in_all_scenarios + the
+    # other iteration tests still pass on subsets — they would not catch
+    # a future commit that silently drops a scenario from ALL_SCENARIOS.
+    # README, intercept docstring, and the +skipped=N/6 audit format all
+    # encode "six scenarios" as a contract; this test pins it.
+    from injection_scanner.honeypot_scenarios import ALL_SCENARIOS
+    names = {s["name"] for s in ALL_SCENARIOS}
+    expected = {
+        "conversation_history_leak",
+        "misconfigured_env_file",
+        "simulated_env_dump_in_history",
+        "long_rapport_history",
+        "tool_output_canary",
+        "minimal_priors",
+    }
+    assert names == expected, f"scenario set drifted: {names ^ expected}"
+
+
 # ---- malformed tool-name handling ----
 
 

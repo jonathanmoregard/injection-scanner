@@ -8,7 +8,7 @@ Layered prompt-injection / secret-exfil scanner. Extracted from `research-agent`
 |------|-------|---------|
 | L0 | `unicode_sanitize` | Strip covert channels (zero-width, bidi, tag-block), NFKC normalize, flag anomalous density. |
 | L1b | `secret_shapes` | High-precision API key / JWT / PEM patterns. |
-| L3 | `honeypot` | Run the report past a multi-provider judge ensemble (Anthropic Haiku + OpenAI gpt-4o-mini + gpt-4.1-nano) across six canary scenarios. If any judge gets coerced into calling a bait tool, echoing a canary via a legitimate tool argument, or surfacing one in freeform text, the report is rejected. |
+| L3 | `honeypot` | Run the report past a 3-model judge ensemble (`claude-haiku-4-5`, `gpt-4o-mini`, `gpt-4.1-nano`) across six canary scenarios — two scenarios per model. If any judge gets coerced into calling a bait tool, echoing a canary via a legitimate tool argument, or surfacing one in freeform text, the report is rejected. |
 
 L1a (regex) was retired (legit research output false-positived); wrap-escape protection moved to the consumer's delivery boundary. L2 (cheap LLM classifier) and L4 (LLM-as-judge synthesis) are planned, not yet wired.
 

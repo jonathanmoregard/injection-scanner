@@ -4,8 +4,10 @@ Intercept orchestrator: runs the layered shim and produces a single verdict.
 Order (each layer can short-circuit):
   L0  unicode_sanitize      — strip covert channels, NFKC normalize, flag anomaly
   L1b secret_shapes         — high-precision API-key / JWT / PEM patterns
-  L3  honeypot              — tempt a downstream Haiku with trap tools;
-                              if the report coerces it into a tool call, fail
+  L3  honeypot              — fan the report out to a 3-model judge ensemble
+                              (claude-haiku-4-5, gpt-4o-mini, gpt-4.1-nano)
+                              across 6 canary scenarios; if any judge gets
+                              coerced into a bait-tool call or canary echo, fail
   (L2 LLM classifier and L4 LLM-as-judge are planned, not yet wired)
 
 Caller passes the cleaned path and receives a Verdict dict the server can
