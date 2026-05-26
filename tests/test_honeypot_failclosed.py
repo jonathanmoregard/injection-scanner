@@ -91,3 +91,69 @@ def test_scan_text_fails_closed_does_not_echo_exception_message():
     assert secret_marker not in v.reason
     for k, val in v.layers.items():
         assert secret_marker not in val, f"leaked in layers[{k}]"
+
+
+def test_scan_text_fails_closed_on_unicode_sanitize_raise():
+    # All scanner layers must fail closed, not just honeypot. A bug in
+    # unicode_sanitize that raises on malformed text must not propagate
+    # to the caller.
+    import injection_scanner.intercept as ic
+
+    def boom_sanitize(_raw):
+        raise ValueError("synthetic unicode failure")
+
+    with um.patch.object(ic.unicode_sanitize, "sanitize", boom_sanitize):
+        v = scan_text("anything", use_honeypot=False)
+    assert v.ok is False
+    assert "unicode_sanitize_unavailable" in v.reason
+    assert "ValueError" in v.reason
+    assert "synthetic unicode failure" not in v.reason  # type-name only
+
+
+def test_scan_text_fails_closed_on_secret_shapes_raise():
+    import injection_scanner.intercept as ic
+
+    def boom_shapes(_text):
+        raise RuntimeError("synthetic shapes failure")
+
+    with um.patch.object(ic.secret_shapes, "scan", boom_shapes):
+        v = scan_text("anything", use_honeypot=False)
+    assert v.ok is False
+    assert "secret_shapes_unavailable" in v.reason
+    assert "RuntimeError" in v.reason
+
+
+def test_run_all_reason_includes_skipped_count_on_concurrent_trigger():
+    # When one scenario triggers AND another is concurrently skipped,
+    # the top-line reason must signal degraded coverage so operators
+    # don't mistake the trigger for a healthy layer.
+    # Force scenario A → triggered (bait tool call); patch _call_openai
+    # to raise so both OpenAI scenarios go to Skipped.
+    from injection_scanner.honeypot_scenarios import SCENARIO_A_CONVERSATION_HISTORY_LEAK
+    a = SCENARIO_A_CONVERSATION_HISTORY_LEAK
+
+    async def fake_anthropic(_s, _t):
+        return hp.ScenarioResult(
+            scenario=a["name"], verdict="Honeypot_Triggered",
+            signal="trap:send_http", provider="anthropic", model=a["model"],
+        )
+
+    with um.patch.object(hp, "_call_anthropic", fake_anthropic), \
+         um.patch.object(hp, "_call_openai", _aboom):
+        r = asyncio.run(hp._run_all("any"))
+    assert r.ok is False
+    assert "+skipped=2" in r.reason
+
+
+def test_classifier_routes_known_legit_name_normally():
+    # Sanity: validated names still work end-to-end. A valid
+    # return_summary call with clean text passes.
+    from injection_scanner.honeypot import _classify_from_parts
+    from injection_scanner.honeypot_scenarios import SCENARIO_B_MISCONFIGURED_ENV
+    r = _classify_from_parts(
+        SCENARIO_B_MISCONFIGURED_ENV,
+        [("return_summary", {"text": "Clean summary."})],
+        "",
+    )
+    assert r.verdict == "Honeypot_Left_Alone"
+    assert r.signal == "left_alone"

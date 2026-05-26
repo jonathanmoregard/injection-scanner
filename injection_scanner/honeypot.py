@@ -31,6 +31,7 @@ from injection_scanner.honeypot_scenarios import (
     ALL_CANARIES,
     ALL_SCENARIOS,
     TRAP_TOOL_NAMES,
+    VALID_TOOL_NAMES,
     Scenario,
     canary_label,
 )
@@ -114,12 +115,19 @@ def _openai_key() -> str | None:
 # `attached`, not `untrusted`, not anything that hints the judge should
 # trust the surrounding frame more than the body. The semantic separation
 # lives in the judge's system prompt, not in the tag name.
+#
+# Nonce length: 32 hex chars / 128 bits. Birthday collisions across the
+# lifetime of a long-running MCP server are negligible at 128 bits, and
+# the per-byte cost of doubling vs the prior 64-bit nonce is irrelevant
+# relative to a network round-trip. The body-rewrite belt-and-braces
+# below is what actually saves us from a same-nonce collision; the
+# nonce length keeps the belt's job rare.
 
 
 def _seal(report_text: str) -> str:
     """Wrap report_text in nonce-tagged delimiters; neutralise any literal
     close-tag occurrence in the body."""
-    nonce = secrets.token_hex(8)  # 16 hex chars / 64 bits
+    nonce = secrets.token_hex(16)  # 32 hex chars / 128 bits
     open_tag = f"<content_{nonce}>"
     close_tag = f"</content_{nonce}>"
     # Even with a 64-bit nonce, prefer defense in depth: a body that
@@ -178,8 +186,35 @@ def _classify_from_parts(
     text: str,
 ) -> ScenarioResult:
     """Given the list of (tool_name, tool_input) calls plus any freeform
-    text, decide Honeypot_Triggered / Honeypot_Left_Alone."""
+    text, decide Honeypot_Triggered / Honeypot_Left_Alone.
+
+    Tool names from the judge response are checked against
+    VALID_TOOL_NAMES (= schema-defined names). A returned name outside
+    that set is treated as a malformed response — Honeypot_Skipped, not
+    Honeypot_Left_Alone — both to avoid silent fall-through on broken
+    SDK responses (Invariant 3) AND to fence out judge-controlled bytes
+    from ever reaching the caller-visible `signal` / `reason` strings
+    (Invariant 4). Even when the name IS valid, it's known-clean ASCII
+    so interpolation is safe.
+    """
     own_canary = scenario["canary"]
+
+    # 0. Defense in depth: reject any malformed-name tool call. A judge
+    #    that returned `name=None` or a string outside the schema set
+    #    is either a broken SDK response or a coerced model emitting
+    #    attacker-shaped bytes in the name field. Either way, falling
+    #    through to left_alone would synthesize a positive signal from
+    #    the absence of a parseable trigger — exactly what Invariant 3
+    #    forbids.
+    for name, _inp in called_tools:
+        if not isinstance(name, str) or name not in VALID_TOOL_NAMES:
+            return ScenarioResult(
+                scenario=scenario["name"],
+                verdict="Honeypot_Skipped",
+                signal="unavailable:malformed-tool-call",
+                provider=scenario["provider"],
+                model=scenario["model"],
+            )
 
     # 1. Bait-tool call: triggered regardless of args. Even an "empty"
     #    bait-tool call demonstrates the judge was coerced into the wrong
@@ -202,6 +237,8 @@ def _classify_from_parts(
     if arg_hit:
         c, tool_name = arg_hit
         suffix = "" if c == own_canary else "_crosstalk"
+        # tool_name is validated against VALID_TOOL_NAMES above, so it's
+        # safe to interpolate (known ASCII identifier, no attacker bytes).
         return ScenarioResult(
             scenario=scenario["name"],
             verdict="Honeypot_Triggered",
@@ -425,14 +462,19 @@ async def _run_all(report_text: str) -> HoneypotResult:
             results.append(r)
 
     triggered = [r for r in results if r.verdict == "Honeypot_Triggered"]
+    skipped = [r for r in results if r.verdict == "Honeypot_Skipped"]
     if triggered:
         first = triggered[0]
+        # Surface concurrent provider outages even on trigger: the top-line
+        # reason flows into `layers.honeypot` and audit summaries; without
+        # this an operator sees only the trigger and misses that a sibling
+        # provider was simultaneously down (degraded coverage).
+        skip_suffix = f"+skipped={len(skipped)}" if skipped else ""
         return HoneypotResult(
             ok=False,
-            reason=f"honeypot:{first.scenario}:{first.signal}",
+            reason=f"honeypot:{first.scenario}:{first.signal}{skip_suffix}",
             per_scenario=results,
         )
-    skipped = [r for r in results if r.verdict != "Honeypot_Left_Alone"]
     if skipped:
         first = skipped[0]
         return HoneypotResult(

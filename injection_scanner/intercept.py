@@ -77,11 +77,26 @@ def scan_text(raw: str, use_honeypot: bool = True) -> Verdict:
     load the content into memory themselves (e.g. `os.open(..., O_NOFOLLOW)`)
     and scan the same bytes they've already snapshotted — no second disk
     read that could race against a file swap.
+
+    Each scanner layer is wrapped in a try/except per honeypot-manufacturing
+    Invariant 3: any exception inside a layer must reduce to *reject*, not
+    propagate. The exception *type name* lands in the reason — never
+    `str(e)`, which can echo input bytes back to the caller.
     """
     layers: dict[str, str] = {}
 
     # L0
-    san = unicode_sanitize.sanitize(raw)
+    try:
+        san = unicode_sanitize.sanitize(raw)
+    except Exception as e:
+        layers["unicode_sanitize"] = f"unhandled:{type(e).__name__}"
+        return Verdict(
+            ok=False,
+            reason=f"unicode_sanitize_unavailable:unhandled:{type(e).__name__}",
+            layers=layers,
+            sanitize_stats={},
+            sanitized_text="",
+        )
     layers["unicode_sanitize"] = (
         f"stripped={san.stripped} bidi={san.bidi_hits} "
         f"tag={san.tag_hits} zw={san.zw_hits} nfkc_changed={san.nfkc_changed}"
@@ -96,7 +111,17 @@ def scan_text(raw: str, use_honeypot: bool = True) -> Verdict:
         )
 
     # L1b — secret-shape scan.
-    hits = secret_shapes.scan(san.text)
+    try:
+        hits = secret_shapes.scan(san.text)
+    except Exception as e:
+        layers["secret_shapes"] = f"unhandled:{type(e).__name__}"
+        return Verdict(
+            ok=False,
+            reason=f"secret_shapes_unavailable:unhandled:{type(e).__name__}",
+            layers=layers,
+            sanitize_stats=asdict(san),
+            sanitized_text=san.text,
+        )
     layers["secret_shapes"] = "pass" if not hits else f"fail:{hits[0].name}"
     if hits:
         return Verdict(
@@ -133,7 +158,7 @@ def scan_text(raw: str, use_honeypot: bool = True) -> Verdict:
         # exceptions can echo the prompt body we sent.
         try:
             hp = honeypot_check(san.text)
-        except BaseException as e:
+        except Exception as e:
             layers["honeypot"] = f"unhandled:{type(e).__name__}"
             return Verdict(
                 ok=False,
