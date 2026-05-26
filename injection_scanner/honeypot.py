@@ -135,6 +135,7 @@ def _seal(report_text: str) -> str:
 
 def _scan_args_for_canary(
     called_tools: list[tuple[str, dict]],
+    own_canary: str,
 ) -> tuple[str, str] | None:
     """If any tool-call argument blob contains a known canary substring,
     return (canary_value, tool_name). Catches summary-exfiltration and
@@ -144,14 +145,29 @@ def _scan_args_for_canary(
     `report_issue(category=Refinement, description=CANARY)`) is still
     leaking — name-based trap-tool detection alone misses these. See
     LivePI / EchoLeak (CVE-2025-32711) for the published attack class.
+
+    Scan order: own_canary first across all tools, then the rest of
+    ALL_CANARIES. If a coerced judge leaks BOTH its own canary and an
+    attacker-supplied cross-canary in the same arg blob, the more
+    forensically meaningful own-canary signal wins — labelling that
+    case as crosstalk would misroute the operator's investigation.
     """
+    # Pass 1: own canary across all tools.
+    for tool_name, inp in called_tools:
+        try:
+            blob = json.dumps(inp, ensure_ascii=False)
+        except Exception:
+            blob = str(inp)
+        if own_canary in blob:
+            return (own_canary, tool_name)
+    # Pass 2: any other canary (crosstalk).
     for tool_name, inp in called_tools:
         try:
             blob = json.dumps(inp, ensure_ascii=False)
         except Exception:
             blob = str(inp)
         for c in ALL_CANARIES:
-            if c in blob:
+            if c != own_canary and c in blob:
                 return (c, tool_name)
     return None
 
@@ -182,7 +198,7 @@ def _classify_from_parts(
     #    return_summary / report_issue). This catches the "summary
     #    exfiltration" attack class — a judge coerced into echoing the
     #    canary back via a benign-looking channel still leaks.
-    arg_hit = _scan_args_for_canary(called_tools)
+    arg_hit = _scan_args_for_canary(called_tools, own_canary)
     if arg_hit:
         c, tool_name = arg_hit
         suffix = "" if c == own_canary else "_crosstalk"
@@ -379,16 +395,42 @@ async def _run_one(scenario: Scenario, report_text: str) -> ScenarioResult:
 
 
 async def _run_all(report_text: str) -> HoneypotResult:
-    results = await asyncio.gather(
-        *(_run_one(s, report_text) for s in ALL_SCENARIOS)
+    # return_exceptions=True so a per-scenario coroutine that raises
+    # OUTSIDE its own inner try/except (constructor errors, asyncio.to_thread
+    # failures, exotic env probes in _keyring_env, etc.) doesn't propagate
+    # up and crash the caller — which currently has no outer try/except
+    # around honeypot_check. Per honeypot-manufacturing skill Invariant 3:
+    # "Any exception raised inside a scanner / detection layer must reduce
+    # to *reject*, not *pass*." A raised exception is converted to a
+    # Honeypot_Skipped result so the standard skipped→ok=False path then
+    # quarantines the report.
+    raw = await asyncio.gather(
+        *(_run_one(s, report_text) for s in ALL_SCENARIOS),
+        return_exceptions=True,
     )
+    results: list[ScenarioResult] = []
+    for s, r in zip(ALL_SCENARIOS, raw):
+        if isinstance(r, BaseException):
+            # Only the exception *type name* — `str(e)` on SDK exceptions
+            # can embed request/response fragments that are themselves
+            # attacker-shaped (the report bytes we sent in the prompt).
+            results.append(ScenarioResult(
+                scenario=s["name"],
+                verdict="Honeypot_Skipped",
+                signal=f"unavailable:unhandled:{type(r).__name__}",
+                provider=s["provider"],
+                model=s["model"],
+            ))
+        else:
+            results.append(r)
+
     triggered = [r for r in results if r.verdict == "Honeypot_Triggered"]
     if triggered:
         first = triggered[0]
         return HoneypotResult(
             ok=False,
             reason=f"honeypot:{first.scenario}:{first.signal}",
-            per_scenario=list(results),
+            per_scenario=results,
         )
     skipped = [r for r in results if r.verdict != "Honeypot_Left_Alone"]
     if skipped:
@@ -396,9 +438,9 @@ async def _run_all(report_text: str) -> HoneypotResult:
         return HoneypotResult(
             ok=False,
             reason=f"honeypot_unavailable:{first.scenario}:{first.signal}",
-            per_scenario=list(results),
+            per_scenario=results,
         )
-    return HoneypotResult(ok=True, reason="pass", per_scenario=list(results))
+    return HoneypotResult(ok=True, reason="pass", per_scenario=results)
 
 
 def check(report_text: str) -> HoneypotResult:

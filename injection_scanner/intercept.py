@@ -122,7 +122,26 @@ def scan_text(raw: str, use_honeypot: bool = True) -> Verdict:
     # The `use_honeypot=False` path is used by unit tests that must not
     # hit the Anthropic API.
     if use_honeypot:
-        hp = honeypot_check(san.text)
+        # Blanket try/except per honeypot-manufacturing Invariant 3:
+        # any exception raised inside a scanner layer must reduce to
+        # *reject*, not propagate up and short-circuit downstream gates.
+        # honeypot._run_all already converts per-scenario coroutine
+        # raises to Skipped results; this catches the residual
+        # possibility (import-time errors, scheduling failures, etc.)
+        # so the scan boundary is fail-closed end-to-end. Only the
+        # exception type name lands in the reason — `str(e)` on SDK
+        # exceptions can echo the prompt body we sent.
+        try:
+            hp = honeypot_check(san.text)
+        except BaseException as e:
+            layers["honeypot"] = f"unhandled:{type(e).__name__}"
+            return Verdict(
+                ok=False,
+                reason=f"honeypot_unavailable:unhandled:{type(e).__name__}",
+                layers=layers,
+                sanitize_stats=asdict(san),
+                sanitized_text=san.text,
+            )
         layers["honeypot"] = hp.reason
         for s in hp.per_scenario:
             layers[f"honeypot.{s.scenario}"] = f"{s.verdict}:{s.signal}"
