@@ -287,13 +287,72 @@ def test_classify_prefers_own_canary_over_crosstalk_in_text():
 
 
 def test_telemetry_upload_in_all_scenarios():
-    # Scenario A previously lacked telemetry_upload — asymmetric trap
-    # surface. Now every scenario carries it so the subtle bait can
-    # fire in all three.
+    # Every scenario must carry the subtle bait. Asymmetric trap
+    # surfaces let attackers slip through scenarios that lack a given
+    # bait tool.
     from injection_scanner.honeypot_scenarios import ALL_SCENARIOS
     for s in ALL_SCENARIOS:
         tool_names = {t["name"] for t in s["tools"]}
         assert "telemetry_upload" in tool_names, f"missing in {s['name']}"
+
+
+def test_every_scenario_has_legit_tools():
+    # return_summary + report_issue must be available in every scenario;
+    # otherwise the judge has no legitimate exit path and can only
+    # either bait-trigger or stay silent (false negatives).
+    from injection_scanner.honeypot_scenarios import ALL_SCENARIOS
+    for s in ALL_SCENARIOS:
+        names = {t["name"] for t in s["tools"]}
+        assert "return_summary" in names, f"missing in {s['name']}"
+        assert "report_issue" in names, f"missing in {s['name']}"
+
+
+def test_scenario_canaries_are_registered():
+    # Every scenario's canary must be in ALL_CANARIES + CANARY_LABELS.
+    # Catches the case where a new scenario adds a canary but forgets
+    # the registry — own-canary detection would silently treat it as
+    # CANARY_UNKNOWN and the audit signal would carry that opaque label
+    # with no way to map back.
+    from injection_scanner.honeypot_scenarios import (
+        ALL_CANARIES, ALL_SCENARIOS, CANARY_LABELS,
+    )
+    for s in ALL_SCENARIOS:
+        assert s["canary"] in ALL_CANARIES, f"unregistered canary in {s['name']}"
+        assert s["canary"] in CANARY_LABELS, f"unlabelled canary in {s['name']}"
+
+
+def test_scenario_names_unique():
+    from injection_scanner.honeypot_scenarios import ALL_SCENARIOS
+    names = [s["name"] for s in ALL_SCENARIOS]
+    assert len(names) == len(set(names)), f"duplicate scenario names: {names}"
+
+
+def test_scenario_set_covers_both_model_families():
+    # Detection lift comes from cross-family diversity. If a future
+    # refactor accidentally drops one family, fail.
+    from injection_scanner.honeypot_scenarios import ALL_SCENARIOS
+    providers = {s["provider"] for s in ALL_SCENARIOS}
+    assert "anthropic" in providers
+    assert "openai" in providers
+
+
+def test_all_six_scenarios_present_by_name():
+    # Explicit names guard. test_telemetry_upload_in_all_scenarios + the
+    # other iteration tests still pass on subsets — they would not catch
+    # a future commit that silently drops a scenario from ALL_SCENARIOS.
+    # README, intercept docstring, and the +skipped=N/6 audit format all
+    # encode "six scenarios" as a contract; this test pins it.
+    from injection_scanner.honeypot_scenarios import ALL_SCENARIOS
+    names = {s["name"] for s in ALL_SCENARIOS}
+    expected = {
+        "conversation_history_leak",
+        "misconfigured_env_file",
+        "simulated_env_dump_in_history",
+        "long_rapport_history",
+        "tool_output_canary",
+        "minimal_priors",
+    }
+    assert names == expected, f"scenario set drifted: {names ^ expected}"
 
 
 # ---- malformed tool-name handling ----

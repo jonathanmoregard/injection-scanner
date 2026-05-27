@@ -1,17 +1,18 @@
 """
 Layer 3: multi-provider honeypot ensemble.
 
-Each research report is fed to a fresh downstream model (Haiku, gpt-4o-mini,
-gpt-4.1-nano) in three different honeypot scenarios (see
-honeypot_scenarios.py). Each scenario defines its own provider + model so
-the ensemble spans model families — an injection tuned for one family often
-misses on another, and vice versa; diversity is the detection boost.
+Each research report is fanned out to six downstream judge calls — two
+per model across three small models (claude-haiku-4-5, gpt-4o-mini,
+gpt-4.1-nano) spanning two providers (Anthropic + OpenAI). Each scenario
+in honeypot_scenarios.py picks its own (provider, model) pair, framing,
+and canary placement. Cross-family diversity is the detection boost: an
+injection tuned for one family often misses on another, and vice versa.
 
 A legitimate judge calls `return_summary` (the benign task) or
 `report_issue(Prompt_Injection_Attempt, …)`; both count as
-`Honeypot_Left_Alone`. A judge that calls any trap tool OR echoes the
-scenario's canary substring is `Honeypot_Triggered` and the report is
-quarantined.
+`Honeypot_Left_Alone`. A judge that calls any bait tool OR echoes the
+scenario's canary via a tool argument or freeform text is
+`Honeypot_Triggered` and the report is rejected.
 
 Fail-closed: missing SDK, missing API key, and any per-scenario API
 error all collapse to `ok=False`. Silent skip is not allowed — the whole

@@ -127,33 +127,50 @@ def test_run_all_reason_includes_skipped_count_on_concurrent_trigger():
     # When one scenario triggers AND another is concurrently skipped,
     # the top-line reason must signal degraded coverage so operators
     # don't mistake the trigger for a healthy layer.
-    # Force scenario A → triggered (bait tool call); patch _call_openai
-    # to raise so both OpenAI scenarios go to Skipped.
-    from injection_scanner.honeypot_scenarios import SCENARIO_A_CONVERSATION_HISTORY_LEAK
+    # Counts derived from ALL_SCENARIOS so the test stays robust to
+    # scenario-set growth. Fake the Anthropic adapter to trigger only
+    # for scenario A and pass cleanly for any other Anthropic scenario;
+    # patch the OpenAI adapter to raise so all OpenAI scenarios bucket
+    # as Skipped. Expected skipped count = number of OpenAI scenarios.
+    from injection_scanner.honeypot_scenarios import (
+        ALL_SCENARIOS,
+        SCENARIO_A_CONVERSATION_HISTORY_LEAK,
+    )
+    total = len(ALL_SCENARIOS)
+    openai_count = sum(1 for s in ALL_SCENARIOS if s["provider"] == "openai")
     a = SCENARIO_A_CONVERSATION_HISTORY_LEAK
 
-    async def fake_anthropic(_s, _t):
+    async def fake_anthropic(s, _t):
+        if s["name"] == a["name"]:
+            return hp.ScenarioResult(
+                scenario=s["name"], verdict="Honeypot_Triggered",
+                signal="trap:send_http",
+                provider=s["provider"], model=s["model"],
+            )
         return hp.ScenarioResult(
-            scenario=a["name"], verdict="Honeypot_Triggered",
-            signal="trap:send_http", provider="anthropic", model=a["model"],
+            scenario=s["name"], verdict="Honeypot_Left_Alone",
+            signal="left_alone",
+            provider=s["provider"], model=s["model"],
         )
 
     with um.patch.object(hp, "_call_anthropic", fake_anthropic), \
          um.patch.object(hp, "_call_openai", _aboom):
         r = asyncio.run(hp._run_all("any"))
     assert r.ok is False
-    assert "+skipped=2/3" in r.reason
+    assert f"+skipped={openai_count}/{total}" in r.reason
 
 
 def test_run_all_reason_includes_skipped_count_on_full_outage():
-    # All three providers blow up. Reason carries +skipped=3/3 so an
+    # Every provider blows up. Reason carries +skipped=N/N so an
     # operator can distinguish full outage from partial.
+    from injection_scanner.honeypot_scenarios import ALL_SCENARIOS
+    total = len(ALL_SCENARIOS)
     with um.patch.object(hp, "_call_anthropic", _aboom), \
          um.patch.object(hp, "_call_openai", _aboom):
         r = asyncio.run(hp._run_all("any"))
     assert r.ok is False
     assert "honeypot_unavailable" in r.reason
-    assert "+skipped=3/3" in r.reason
+    assert f"+skipped={total}/{total}" in r.reason
 
 
 def test_classifier_routes_known_legit_name_normally():
