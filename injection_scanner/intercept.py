@@ -84,7 +84,8 @@ def scan_text(raw: str, use_honeypot: bool = True) -> Verdict:
     san = unicode_sanitize.sanitize(raw)
     layers["unicode_sanitize"] = (
         f"stripped={san.stripped} bidi={san.bidi_hits} "
-        f"tag={san.tag_hits} zw={san.zw_hits} nfkc_changed={san.nfkc_changed}"
+        f"tag={san.tag_hits} zw={san.zw_hits} fmt={san.fmt_hits} "
+        f"nfkc_changed={san.nfkc_changed}"
     )
     if unicode_sanitize.is_anomalous(san, len(raw)):
         return Verdict(

@@ -29,8 +29,9 @@ from typing import Literal
 from injection_scanner.honeypot_scenarios import (
     ALL_CANARIES,
     ALL_SCENARIOS,
-    TRAP_TOOL_NAMES,
+    LEGIT_TOOLS,
     Scenario,
+    build_trap_tools,
 )
 
 Verdict = Literal["Honeypot_Triggered", "Honeypot_Left_Alone", "Honeypot_Skipped"]
@@ -114,9 +115,14 @@ def _classify_from_parts(
     scenario: Scenario,
     called_tools: list[tuple[str, dict]],
     text: str,
+    trap_names: set[str],
 ) -> ScenarioResult:
     """Given the list of (tool_name, tool_input) calls plus any freeform
-    text, decide Honeypot_Triggered / Honeypot_Left_Alone."""
+    text, decide Honeypot_Triggered / Honeypot_Left_Alone.
+
+    `trap_names` is THIS run's randomized trap-tool name set (from
+    build_trap_tools) — the trap check keys off it rather than any fixed
+    module-level constant, so it matches whatever names the model was shown."""
     # A coerced judge may hide the exfiltrated canary inside a *legit* tool's
     # arguments (e.g. return_summary(text="...<canary>...")) rather than in
     # freeform text. Match canaries against text + all tool-call inputs.
@@ -126,7 +132,7 @@ def _classify_from_parts(
     haystack = text + "\n" + arg_blob
 
     for name, inp in called_tools:
-        if name in TRAP_TOOL_NAMES:
+        if name in trap_names:
             return ScenarioResult(
                 scenario=scenario["name"],
                 verdict="Honeypot_Triggered",
@@ -194,7 +200,12 @@ def _openai_tools(tools: list[dict]) -> list[dict]:
     return out
 
 
-async def _call_anthropic(scenario: Scenario, report_text: str) -> ScenarioResult:
+async def _call_anthropic(
+    scenario: Scenario,
+    report_text: str,
+    tools: list[dict],
+    trap_names: set[str],
+) -> ScenarioResult:
     try:
         import anthropic  # type: ignore
     except ImportError:
@@ -226,7 +237,7 @@ async def _call_anthropic(scenario: Scenario, report_text: str) -> ScenarioResul
                 client.messages.create,
                 model=scenario["model"],
                 max_tokens=400,
-                tools=scenario["tools"],  # type: ignore[arg-type]
+                tools=tools,  # type: ignore[arg-type]
                 system=scenario["system"],
                 messages=messages,
             )
@@ -261,10 +272,15 @@ async def _call_anthropic(scenario: Scenario, report_text: str) -> ScenarioResul
             signal=f"unavailable:anthropic-parse-error:{type(e).__name__}",
             provider="anthropic", model=scenario["model"],
         )
-    return _classify_from_parts(scenario, called, " ".join(text_chunks))
+    return _classify_from_parts(scenario, called, " ".join(text_chunks), trap_names)
 
 
-async def _call_openai(scenario: Scenario, report_text: str) -> ScenarioResult:
+async def _call_openai(
+    scenario: Scenario,
+    report_text: str,
+    tools: list[dict],
+    trap_names: set[str],
+) -> ScenarioResult:
     try:
         from openai import OpenAI  # type: ignore
     except ImportError:
@@ -301,7 +317,7 @@ async def _call_openai(scenario: Scenario, report_text: str) -> ScenarioResult:
                 client.chat.completions.create,
                 model=scenario["model"],
                 messages=messages,
-                tools=_openai_tools(scenario["tools"]),
+                tools=_openai_tools(tools),
                 max_tokens=400,
             )
         )
@@ -332,14 +348,20 @@ async def _call_openai(scenario: Scenario, report_text: str) -> ScenarioResult:
             signal=f"unavailable:openai-parse-error:{type(e).__name__}",
             provider="openai", model=scenario["model"],
         )
-    return _classify_from_parts(scenario, called, text)
+    return _classify_from_parts(scenario, called, text, trap_names)
 
 
 async def _run_one(scenario: Scenario, report_text: str) -> ScenarioResult:
+    # Materialize this run's trap tools with FRESH randomized names and the
+    # matching trap-name set, then present LEGIT (stable) + trap (randomized)
+    # tools to the model. The classifier keys off `trap_names` so it matches
+    # exactly the names the model was shown this run.
+    trap_tools, trap_names = build_trap_tools(scenario["traps"])
+    tools = LEGIT_TOOLS + trap_tools
     if scenario["provider"] == "anthropic":
-        return await _call_anthropic(scenario, report_text)
+        return await _call_anthropic(scenario, report_text, tools, trap_names)
     if scenario["provider"] == "openai":
-        return await _call_openai(scenario, report_text)
+        return await _call_openai(scenario, report_text, tools, trap_names)
     return ScenarioResult(
         scenario=scenario["name"], verdict="Honeypot_Skipped",
         signal=f"unavailable:unknown-provider:{scenario['provider']}",
