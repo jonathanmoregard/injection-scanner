@@ -71,7 +71,7 @@ _DETERMINISTIC: tuple[_Canary, ...] = (
 _BENIGN_PROBE = "Benign smoke probe. Sources: 1. Routine self-test, no payload."
 
 
-def _scan_via_path(payload: str, *, use_honeypot: bool) -> Verdict:
+def _scan_via_path(payload: str, *, use_honeypot: bool, use_lakera: bool = True) -> Verdict:
     """Write payload to a temp file and run scan(Path). Cleans up the
     temp file even if scan raises. Exists so the disk-read wrapper
     doesn't sit untested."""
@@ -81,7 +81,7 @@ def _scan_via_path(payload: str, *, use_honeypot: bool) -> Verdict:
         tf.write(payload)
         tpath = Path(tf.name)
     try:
-        return scan(tpath, use_honeypot=use_honeypot)
+        return scan(tpath, use_honeypot=use_honeypot, use_lakera=use_lakera)
     finally:
         try:
             tpath.unlink()
@@ -109,8 +109,8 @@ def run_smoke(
     # research-agent's hot path; scan(Path) covers claude-cl-sync's.
     for c in _DETERMINISTIC:
         for variant, runner in (
-            ("scan_text", lambda p: scan_text(p, use_honeypot=False)),
-            ("scan",      lambda p: _scan_via_path(p, use_honeypot=False)),
+            ("scan_text", lambda p: scan_text(p, use_honeypot=False, use_lakera=False)),
+            ("scan",      lambda p: _scan_via_path(p, use_honeypot=False, use_lakera=False)),
         ):
             v: Verdict = runner(c.payload)
             tag = f"{c.label}[{variant}]"

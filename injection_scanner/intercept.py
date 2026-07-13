@@ -4,9 +4,13 @@ Intercept orchestrator: runs the layered shim and produces a single verdict.
 Order (each layer can short-circuit):
   L0  unicode_sanitize      — strip covert channels, NFKC normalize, flag anomaly
   L1b secret_shapes         — high-precision API-key / JWT / PEM patterns
+  L2  lakera                — hosted Lakera Guard classifier (ADDITIVE): only a
+                              positive detection blocks; if unconfigured (no
+                              key), errors, or times out it SKIPS and continues
+                              to the honeypot — it is NOT a gate
   L3  honeypot              — tempt a downstream Haiku with trap tools;
                               if the report coerces it into a tool call, fail
-  (L2 LLM classifier and L4 LLM-as-judge are planned, not yet wired)
+  (L4 LLM-as-judge is planned, not yet wired)
 
 Caller passes the cleaned path and receives a Verdict dict the server can
 use both to decide to deliver and to attach audit metadata.
@@ -28,7 +32,7 @@ from __future__ import annotations
 from dataclasses import asdict, dataclass
 from pathlib import Path
 
-from injection_scanner import decode, secret_shapes, unicode_sanitize
+from injection_scanner import decode, lakera, secret_shapes, unicode_sanitize
 from injection_scanner.honeypot import check as honeypot_check
 
 
@@ -57,20 +61,24 @@ class Verdict:
         return d
 
 
-def scan(path: Path, use_honeypot: bool = True) -> Verdict:
+def scan(path: Path, use_honeypot: bool = True, use_lakera: bool = True) -> Verdict:
     """Run all layers on the file at `path`. Returns a Verdict.
 
     `use_honeypot` defaults to True and is kept only so tests can force it
     off for unit runs that must not hit the Anthropic API. In production
     call paths, callers should NOT pass this — the honeypot is always on.
+
+    `use_lakera` (additive L2) mirrors `use_honeypot`: default True, forced
+    False in unit tests so they never even attempt a Lakera key lookup.
     """
     return scan_text(
         path.read_text(encoding="utf-8", errors="replace"),
         use_honeypot=use_honeypot,
+        use_lakera=use_lakera,
     )
 
 
-def scan_text(raw: str, use_honeypot: bool = True) -> Verdict:
+def scan_text(raw: str, use_honeypot: bool = True, use_lakera: bool = True) -> Verdict:
     """Run all layers on pre-read `raw` text. Returns a Verdict.
 
     Separate entry point so callers that need symlink/TOCTOU-safe reads can
@@ -128,6 +136,30 @@ def scan_text(raw: str, use_honeypot: bool = True) -> Verdict:
             sanitize_stats=asdict(san),
             sanitized_text=san.text,
         )
+
+    # L2 lakera — hosted Lakera Guard classifier. ADDITIVE, not a gate.
+    #
+    # Unlike the honeypot below, an unconfigured/broken/timed-out Lakera does
+    # NOT quarantine the report: lakera.check() returns ok=True with a
+    # `skipped_reason` and we continue straight to the honeypot, which still
+    # gates. Only a POSITIVE detection (res.flagged / ok=False) blocks here.
+    # This keeps the layer inert until a key is provisioned — with no key,
+    # check() returns "unconfigured:no-lakera-api-key" and never hits the
+    # network. `use_lakera=False` skips even the key lookup for hermetic
+    # unit tests.
+    if use_lakera:
+        res = lakera.check(san.text)
+        layers["lakera"] = res.reason if res.flagged else (res.skipped_reason or "pass")
+        if res.flagged:  # ok=False only on a positive detection
+            return Verdict(
+                ok=False,
+                reason=res.reason,
+                layers=layers,
+                sanitize_stats=asdict(san),
+                sanitized_text=san.text,
+            )
+    else:
+        layers["lakera"] = "disabled (test-only)"
 
     # L3 honeypot. Always runs in production.
     #

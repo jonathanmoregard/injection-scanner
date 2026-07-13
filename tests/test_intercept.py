@@ -94,7 +94,7 @@ def test_orchestrator_passes_clean_report():
             "# Python 3.13\n\n*Sources: 1*\n\n## Summary\nReleased October 2024.\n"
         )
         path = Path(f.name)
-    v = scan(path, use_honeypot=False)
+    v = scan(path, use_honeypot=False, use_lakera=False)
     assert v.ok, f"expected pass, got {v.reason}"
     assert v.layers["secret_shapes"] == "pass"
 
@@ -105,7 +105,7 @@ def test_orchestrator_blocks_secret():
             "# Report\n\nLeaked key: sk-ant-oat01-" + "X" * 60 + "\n"
         )
         path = Path(f.name)
-    v = scan(path, use_honeypot=False)
+    v = scan(path, use_honeypot=False, use_lakera=False)
     assert not v.ok
     # secret_shapes catches the anthropic oauth token shape.
     assert "anthropic" in v.reason or "secret_shape" in v.reason
@@ -116,7 +116,7 @@ def test_orchestrator_blocks_unicode_covert():
     with tempfile.NamedTemporaryFile("w", suffix=".md", delete=False) as f:
         f.write("benign \u202Emalicious" * 100)
         path = Path(f.name)
-    v = scan(path, use_honeypot=False)
+    v = scan(path, use_honeypot=False, use_lakera=False)
     assert not v.ok
     assert "unicode_anomaly" in v.reason
 
@@ -127,6 +127,6 @@ def test_orchestrator_strips_but_passes_single_zw():
     with tempfile.NamedTemporaryFile("w", suffix=".md", delete=False) as f:
         f.write("clean text " * 500 + "\u200Bcontaminated")
         path = Path(f.name)
-    v = scan(path, use_honeypot=False)
+    v = scan(path, use_honeypot=False, use_lakera=False)
     assert v.ok
     assert "\u200B" not in v.sanitized_text
