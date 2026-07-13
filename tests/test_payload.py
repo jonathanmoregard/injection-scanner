@@ -6,7 +6,7 @@ Use:
     python3 tests/test_payload.py --stdin   # read from stdin
 
 For each payload prints the full Verdict — overall ok/reason plus the
-per-layer breakdown (unicode_sanitize / regex / secret_shapes / honeypot
+per-layer breakdown (unicode_sanitize / secret_shapes / honeypot
 per scenario). Useful for red-teaming the shim with hand-crafted
 prompt-injection attempts without paying the full research round trip
 of any consumer (research-agent, claude-cl-sync, etc.).
