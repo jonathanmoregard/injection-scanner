@@ -81,8 +81,13 @@ def check(text: str) -> LakeraResult:
       * no key configured at all -> ok=False reason "lakera_unavailable:no-key"
       * any network/HTTP/JSON/timeout error
                                  -> ok=False reason "lakera_unavailable:<ExcType>"
-      * flagged by Lakera        -> ok=False reason "lakera:<categories|flagged>"
-      * clean                    -> ok=True  reason "pass"
+      * bad/unknown response shape
+                                 -> ok=False reason "lakera_unavailable:bad-response"
+      * prompt_attack detected   -> ok=False reason "lakera:prompt_attack"
+      * flagged (fallback, no breakdown)
+                                 -> ok=False reason "lakera:flagged"
+      * clean (or only moderation/PII fired)
+                                 -> ok=True  reason "pass"
     """
     try:
         key = _lakera_key()
@@ -109,11 +114,18 @@ def check(text: str) -> LakeraResult:
         "Authorization": f"Bearer {key}",
         "Content-Type": "application/json",
     }
-    body = json.dumps({"messages": [{"role": "user", "content": text}]}).encode("utf-8")
+    # Lakera Guard v2, verified 2026: POST /v2/guard with the untrusted text as
+    # the most-recent user message; `breakdown: true` asks for per-detector
+    # detail so we can gate on the injection detector specifically rather than
+    # the top-level `flagged` (which also fires on moderation/PII). An optional
+    # LAKERA_PROJECT_ID points the request at a tuned project policy.
+    payload: dict = {"messages": [{"role": "user", "content": text}], "breakdown": True}
+    project_id = os.environ.get("LAKERA_PROJECT_ID")
+    if project_id:
+        payload["project_id"] = project_id
+    body = json.dumps(payload).encode("utf-8")
 
     try:
-        # TODO(verify-live): confirm Lakera v2 Guard request/response schema
-        # against current docs before trusting this to gate.
         data = _post(url, body, headers, timeout)
     except Exception as e:  # noqa: BLE001 — any failure fails CLOSED
         # Exception TYPE only — never str(e). Some HTTP/JSON errors embed the
@@ -124,33 +136,50 @@ def check(text: str) -> LakeraResult:
     # Parse defensively: a malformed / unexpected response shape must not
     # fail-open. Any parse error collapses to a fail-closed reject with only
     # the exception type name in the reason.
+    #
+    # Lakera Guard v2, verified 2026: the response is a dict with a top-level
+    # `flagged` bool and (because we requested it) a `breakdown` list. Each
+    # breakdown entry carries `detector_type` (str) and `detected` (bool); all
+    # other fields are optional. The prompt-injection / jailbreak detector's
+    # `detector_type` is exactly "prompt_attack".
     try:
-        # TODO(verify-live): confirm Lakera v2 Guard request/response schema
-        # against current docs before trusting this to gate.
-        flagged = bool(data.get("flagged"))
-        categories: list[str] = []
-        raw_cats = data.get("categories")
-        if isinstance(raw_cats, list):
-            for c in raw_cats:
-                if isinstance(c, str):
-                    categories.append(c)
-                elif isinstance(c, dict):
-                    name = c.get("category") or c.get("name") or c.get("type")
-                    if isinstance(name, str):
-                        categories.append(name)
-        elif isinstance(raw_cats, dict):
-            # {"category_name": true, ...} shape — collect truthy keys.
-            for name, val in raw_cats.items():
-                if isinstance(name, str) and val:
-                    categories.append(name)
+        if not isinstance(data, dict):
+            # Not even a JSON object — cannot classify. Fail closed.
+            return LakeraResult(ok=False, reason="lakera_unavailable:bad-response")
+
+        breakdown = data.get("breakdown")
+        if isinstance(breakdown, list):
+            detected = [
+                e for e in breakdown
+                if isinstance(e, dict) and e.get("detected") is True
+            ]
+            categories = sorted({
+                e["detector_type"]
+                for e in detected
+                if isinstance(e.get("detector_type"), str)
+            })
+            # Gate on the injection detector ONLY. We deliberately do NOT gate
+            # on moderation (moderated_content/*) or PII detectors — those fire
+            # on legitimate security-research prose and would over-reject.
+            # Secret-exfil is covered by the deterministic secret_shapes layer.
+            if any(e.get("detector_type") == "prompt_attack" for e in detected):
+                return LakeraResult(
+                    ok=False,
+                    flagged=True,
+                    categories=categories,
+                    reason="lakera:prompt_attack",
+                )
+            return LakeraResult(ok=True, reason="pass")
+
+        # Fallback: no usable breakdown (shouldn't happen since we request it),
+        # but a top-level bool `flagged` is present -> gate conservatively.
+        flagged = data.get("flagged")
+        if isinstance(flagged, bool):
+            if flagged:
+                return LakeraResult(ok=False, flagged=True, reason="lakera:flagged")
+            return LakeraResult(ok=True, reason="pass")
+
+        # Neither a usable breakdown nor a bool flagged -> unknown shape.
+        return LakeraResult(ok=False, reason="lakera_unavailable:bad-response")
     except Exception as e:  # noqa: BLE001 — defensive parse, fail CLOSED
         return LakeraResult(ok=False, reason=f"lakera_unavailable:{type(e).__name__}")
-
-    if flagged:
-        return LakeraResult(
-            ok=False,
-            flagged=True,
-            categories=categories,
-            reason=f"lakera:{','.join(categories) or 'flagged'}",
-        )
-    return LakeraResult(ok=True, reason="pass")
