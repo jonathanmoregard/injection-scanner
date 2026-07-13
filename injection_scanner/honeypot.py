@@ -28,10 +28,10 @@ import asyncio
 import json
 import os
 import secrets
-import subprocess
 from dataclasses import dataclass, field
 from typing import Literal
 
+from injection_scanner.keyloader import KeyConfigError, load_key
 from injection_scanner.honeypot_scenarios import (
     ALL_CANARIES,
     ALL_SCENARIOS,
@@ -79,42 +79,28 @@ class HoneypotResult:
 
 
 # ---------- secret loading ----------
-
-def _keyring_env() -> dict[str, str]:
-    """Ensure secret-tool can reach the user's D-Bus session bus. MCP-server
-    subprocesses may not inherit DBUS_SESSION_BUS_ADDRESS; fall back to the
-    systemd per-user path."""
-    import pathlib
-    env = dict(os.environ)
-    if "DBUS_SESSION_BUS_ADDRESS" not in env:
-        bus = f"/run/user/{os.getuid()}/bus"
-        if pathlib.Path(bus).exists():
-            env["DBUS_SESSION_BUS_ADDRESS"] = f"unix:path={bus}"
-    if "XDG_RUNTIME_DIR" not in env:
-        xdg = f"/run/user/{os.getuid()}"
-        if pathlib.Path(xdg).is_dir():
-            env["XDG_RUNTIME_DIR"] = xdg
-    return env
-
-
-def _keyring(key: str) -> str | None:
-    try:
-        r = subprocess.run(
-            ["secret-tool", "lookup", "app", "research-agent", "key", key],
-            capture_output=True, text=True, timeout=3,
-            env=_keyring_env(),
-        )
-        return r.stdout.strip() or None
-    except Exception:
-        return None
+#
+# Keys resolve through injection_scanner.keyloader with FILE > env > keyring
+# precedence. The FILE tier is the agenix pattern: a `*_FILE` env var points
+# at a decrypted secret file. A configured-but-broken FILE path raises
+# KeyConfigError; the adapters below catch it into a Honeypot_Skipped so the
+# fail-closed path rejects loudly rather than crashing the scan.
 
 
 def _anthropic_key() -> str | None:
-    return os.environ.get("ANTHROPIC_API_KEY") or _keyring("anthropic-api-key")
+    return load_key(
+        file_env="ANTHROPIC_API_KEY_FILE",
+        env_var="ANTHROPIC_API_KEY",
+        keyring_key="anthropic-api-key",
+    )
 
 
 def _openai_key() -> str | None:
-    return os.environ.get("OPENAI_API_KEY") or _keyring("openai-api-key")
+    return load_key(
+        file_env="OPENAI_API_KEY_FILE",
+        env_var="OPENAI_API_KEY",
+        keyring_key="openai-api-key",
+    )
 
 
 # ---------- wrap sealing ----------
@@ -352,7 +338,16 @@ async def _call_anthropic(
             signal="unavailable:anthropic-lib-missing",
             provider="anthropic", model=scenario["model"],
         )
-    key = _anthropic_key()
+    try:
+        key = _anthropic_key()
+    except KeyConfigError:
+        # A `*_FILE` path was configured but the mount is broken. Fail loud
+        # via the honeypot's fail-closed path: Skipped -> ok=False reject.
+        return ScenarioResult(
+            scenario=scenario["name"], verdict="Honeypot_Skipped",
+            signal="unavailable:key-config-error",
+            provider="anthropic", model=scenario["model"],
+        )
     if not key:
         return ScenarioResult(
             scenario=scenario["name"], verdict="Honeypot_Skipped",
@@ -428,7 +423,16 @@ async def _call_openai(
             signal="unavailable:openai-lib-missing",
             provider="openai", model=scenario["model"],
         )
-    key = _openai_key()
+    try:
+        key = _openai_key()
+    except KeyConfigError:
+        # A `*_FILE` path was configured but the mount is broken. Fail loud
+        # via the honeypot's fail-closed path: Skipped -> ok=False reject.
+        return ScenarioResult(
+            scenario=scenario["name"], verdict="Honeypot_Skipped",
+            signal="unavailable:key-config-error",
+            provider="openai", model=scenario["model"],
+        )
     if not key:
         return ScenarioResult(
             scenario=scenario["name"], verdict="Honeypot_Skipped",
