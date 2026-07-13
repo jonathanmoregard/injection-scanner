@@ -107,7 +107,7 @@ def test_orchestrator_blocks_secret():
         path = Path(f.name)
     v = scan(path, use_honeypot=False)
     assert not v.ok
-    # Either the regex layer or secret_shapes may catch it first; both acceptable.
+    # secret_shapes catches the anthropic oauth token shape.
     assert "anthropic" in v.reason or "secret_shape" in v.reason
 
 

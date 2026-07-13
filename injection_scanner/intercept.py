@@ -11,8 +11,9 @@ Order (each layer can short-circuit):
 Caller passes the cleaned path and receives a Verdict dict the server can
 use both to decide to deliver and to attach audit metadata.
 
-Honeypot is opt-in: the server toggles it with the RESEARCH_HONEYPOT env
-var so cheap local tests don't always pay the API call.
+Honeypot runs by default. The `use_honeypot` bool parameter on `scan` /
+`scan_text` toggles it — production callers leave it at its `True` default;
+unit tests pass `use_honeypot=False` so they don't pay the API call.
 
 L1a regex was removed: the previous role-swap / instruction-override /
 wrap-escape rules false-positived on legitimate research output that
@@ -24,7 +25,6 @@ zero-FP and survives any future tag rename.
 """
 from __future__ import annotations
 
-import os
 from dataclasses import asdict, dataclass
 from pathlib import Path
 
@@ -101,7 +101,7 @@ def scan_text(raw: str, use_honeypot: bool = True) -> Verdict:
     if hits:
         return Verdict(
             ok=False,
-            reason=f"secret_shape:{hits[0].name}:{hits[0].snippet[:40]}",
+            reason=f"secret_shape:{hits[0].name}",
             layers=layers,
             sanitize_stats=asdict(san),
             sanitized_text=san.text,

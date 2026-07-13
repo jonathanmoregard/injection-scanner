@@ -7,7 +7,6 @@ Layered prompt-injection / secret-exfil scanner. Extracted from `research-agent`
 | Order | Layer | Purpose |
 |------|-------|---------|
 | L0 | `unicode_sanitize` | Strip covert channels (zero-width, bidi, tag-block), NFKC normalize, flag anomalous density. |
-| L1a | `regex` | Seed patterns for role-swap, system-tag injection, exfil URLs. |
 | L1b | `secret_shapes` | High-precision API key / JWT / PEM patterns. |
 | L3 | `honeypot` | Tempt a downstream Haiku with trap tools; if the report coerces a tool call, fail. |
 

@@ -56,10 +56,10 @@ class _Canary:
 
 
 # Layout: each canary asserts both block AND that verdict.reason mentions
-# the expected detector. A regression in regex.instruction_override that
-# accidentally still gets caught by secret_shapes (because the payload
-# contains an unrelated token) would otherwise silently pass — substring
-# match catches that "wrong layer caught it" mode.
+# the expected detector. A regression in one detector that accidentally
+# still gets caught by a sibling (because the payload contains an unrelated
+# token) would otherwise silently pass — substring match catches that
+# "wrong layer caught it" mode.
 _DETERMINISTIC: tuple[_Canary, ...] = (
     # secret_shapes
     _Canary("github_token",    "leaked: ghp_" + "a" * 36, "github_token"),
