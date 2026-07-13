@@ -33,7 +33,7 @@ jobs:
       # Deterministic suite — no API keys, no network. test_payload.py
       # is a CLI tool, not a pytest target.
       - name: pytest
-        run: .venv/bin/python -m pytest tests/test_intercept.py tests/test_delivery.py tests/test_safeio.py -v
+        run: .venv/bin/python -m pytest tests/test_intercept.py tests/test_delivery.py tests/test_safeio.py tests/test_selfupdate.py -v
 
   smoke:
     name: smoke (full pipeline incl. honeypot)
