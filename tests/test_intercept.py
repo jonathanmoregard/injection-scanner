@@ -100,15 +100,27 @@ def test_orchestrator_passes_clean_report():
 
 
 def test_orchestrator_blocks_secret():
+    # Pin the structured reason shape: `secret_shape:<rule_name>` only —
+    # NO snippet bytes. Previously the reason carried up to 40 chars of
+    # the matched secret, which violated Invariant 4 (caught bytes never
+    # return to caller context).
+    secret_bytes = "sk-ant-oat01-" + "X" * 60
     with tempfile.NamedTemporaryFile("w", suffix=".md", delete=False) as f:
-        f.write(
-            "# Report\n\nLeaked key: sk-ant-oat01-" + "X" * 60 + "\n"
-        )
+        f.write("# Report\n\nLeaked key: " + secret_bytes + "\n")
         path = Path(f.name)
     v = scan(path, use_honeypot=False)
     assert not v.ok
-    # Either the regex layer or secret_shapes may catch it first; both acceptable.
-    assert "anthropic" in v.reason or "secret_shape" in v.reason
+    assert v.reason == "secret_shape:anthropic_oauth_token"
+    # No part of the secret bytes appears in reason or layers.
+    assert secret_bytes not in v.reason
+    for k, val in v.layers.items():
+        assert secret_bytes not in val, f"leaked in layers[{k}]"
+    # First 13 chars are the rule prefix and could appear in `name`;
+    # require the *unique tail* (the X*60 attacker-controlled bytes)
+    # never to leak.
+    assert "X" * 60 not in v.reason
+    for k, val in v.layers.items():
+        assert "X" * 60 not in val, f"leaked in layers[{k}]"
 
 
 def test_orchestrator_blocks_unicode_covert():

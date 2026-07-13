@@ -4,8 +4,10 @@ Intercept orchestrator: runs the layered shim and produces a single verdict.
 Order (each layer can short-circuit):
   L0  unicode_sanitize      — strip covert channels, NFKC normalize, flag anomaly
   L1b secret_shapes         — high-precision API-key / JWT / PEM patterns
-  L3  honeypot              — tempt a downstream Haiku with trap tools;
-                              if the report coerces it into a tool call, fail
+  L3  honeypot              — fan the report out to a 3-model judge ensemble
+                              (claude-haiku-4-5, gpt-4o-mini, gpt-4.1-nano)
+                              across 6 canary scenarios; if any judge gets
+                              coerced into a bait-tool call or canary echo, fail
   (L2 LLM classifier and L4 LLM-as-judge are planned, not yet wired)
 
 Caller passes the cleaned path and receives a Verdict dict the server can
@@ -77,11 +79,26 @@ def scan_text(raw: str, use_honeypot: bool = True) -> Verdict:
     load the content into memory themselves (e.g. `os.open(..., O_NOFOLLOW)`)
     and scan the same bytes they've already snapshotted — no second disk
     read that could race against a file swap.
+
+    Each scanner layer is wrapped in a try/except per honeypot-manufacturing
+    Invariant 3: any exception inside a layer must reduce to *reject*, not
+    propagate. The exception *type name* lands in the reason — never
+    `str(e)`, which can echo input bytes back to the caller.
     """
     layers: dict[str, str] = {}
 
     # L0
-    san = unicode_sanitize.sanitize(raw)
+    try:
+        san = unicode_sanitize.sanitize(raw)
+    except Exception as e:
+        layers["unicode_sanitize"] = f"unhandled:{type(e).__name__}"
+        return Verdict(
+            ok=False,
+            reason=f"unicode_sanitize_unavailable:unhandled:{type(e).__name__}",
+            layers=layers,
+            sanitize_stats={},
+            sanitized_text="",
+        )
     layers["unicode_sanitize"] = (
         f"stripped={san.stripped} bidi={san.bidi_hits} "
         f"tag={san.tag_hits} zw={san.zw_hits} nfkc_changed={san.nfkc_changed}"
@@ -96,12 +113,30 @@ def scan_text(raw: str, use_honeypot: bool = True) -> Verdict:
         )
 
     # L1b — secret-shape scan.
-    hits = secret_shapes.scan(san.text)
-    layers["secret_shapes"] = "pass" if not hits else f"fail:{hits[0].name}"
-    if hits:
+    try:
+        hits = secret_shapes.scan(san.text)
+    except Exception as e:
+        layers["secret_shapes"] = f"unhandled:{type(e).__name__}"
         return Verdict(
             ok=False,
-            reason=f"secret_shape:{hits[0].name}:{hits[0].snippet[:40]}",
+            reason=f"secret_shapes_unavailable:unhandled:{type(e).__name__}",
+            layers=layers,
+            sanitize_stats=asdict(san),
+            sanitized_text=san.text,
+        )
+    layers["secret_shapes"] = "pass" if not hits else f"fail:{hits[0].name}"
+    if hits:
+        # Reason carries the matched rule NAME only — never the matched
+        # snippet bytes. The 40-char snippet was attacker-controllable
+        # (the bytes of a planted credential-shape that triggered the
+        # rule); echoing it into `reason` flowed it back to the calling
+        # LLM's context, violating honeypot-manufacturing Invariant 4
+        # ("the caught bytes never return"). The full matched snippet
+        # is available off-path in the operator-only secret_shapes log,
+        # not in the caller-visible Verdict.
+        return Verdict(
+            ok=False,
+            reason=f"secret_shape:{hits[0].name}",
             layers=layers,
             sanitize_stats=asdict(san),
             sanitized_text=san.text,
@@ -122,7 +157,26 @@ def scan_text(raw: str, use_honeypot: bool = True) -> Verdict:
     # The `use_honeypot=False` path is used by unit tests that must not
     # hit the Anthropic API.
     if use_honeypot:
-        hp = honeypot_check(san.text)
+        # Blanket try/except per honeypot-manufacturing Invariant 3:
+        # any exception raised inside a scanner layer must reduce to
+        # *reject*, not propagate up and short-circuit downstream gates.
+        # honeypot._run_all already converts per-scenario coroutine
+        # raises to Skipped results; this catches the residual
+        # possibility (import-time errors, scheduling failures, etc.)
+        # so the scan boundary is fail-closed end-to-end. Only the
+        # exception type name lands in the reason — `str(e)` on SDK
+        # exceptions can echo the prompt body we sent.
+        try:
+            hp = honeypot_check(san.text)
+        except Exception as e:
+            layers["honeypot"] = f"unhandled:{type(e).__name__}"
+            return Verdict(
+                ok=False,
+                reason=f"honeypot_unavailable:unhandled:{type(e).__name__}",
+                layers=layers,
+                sanitize_stats=asdict(san),
+                sanitized_text=san.text,
+            )
         layers["honeypot"] = hp.reason
         for s in hp.per_scenario:
             layers[f"honeypot.{s.scenario}"] = f"{s.verdict}:{s.signal}"
