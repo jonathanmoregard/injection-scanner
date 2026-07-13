@@ -164,7 +164,9 @@ class Scorecard:
         return "\n".join(lines)
 
 
-def evaluate(cases: list[EvalCase], *, use_honeypot: bool = False) -> Scorecard:
+def evaluate(
+    cases: list[EvalCase], *, use_honeypot: bool = False, use_lakera: bool = False
+) -> Scorecard:
     """Run scan_text over each case and score against expected labels.
 
     "block" is the positive class:
@@ -172,10 +174,15 @@ def evaluate(cases: list[EvalCase], *, use_honeypot: bool = False) -> Scorecard:
       FN = expected block & passed  (a MISS — the coverage gap)
       FP = expected pass  & blocked (a false alarm)
       TN = expected pass  & passed
+
+    `use_lakera` defaults to False: the Lakera gate fails CLOSED without a
+    live key, so leaving it on would block every case in a keyless CI run.
+    Deterministic-layer measurement runs it off; pass True (with a key set)
+    to score the hosted layer end-to-end.
     """
     card = Scorecard()
     for case in cases:
-        verdict = scan_text(case.text, use_honeypot=use_honeypot)
+        verdict = scan_text(case.text, use_honeypot=use_honeypot, use_lakera=use_lakera)
         predicted = PASS if verdict.ok else BLOCK
         card.rows.append(
             CaseRow(
@@ -263,6 +270,12 @@ def _main(argv: list[str] | None = None) -> int:
         help="enable the honeypot layer (costs an API call per case)",
     )
     parser.add_argument(
+        "--use-lakera",
+        action="store_true",
+        help="enable the Lakera Guard gate (requires LAKERA_API_KEY; fails "
+        "closed without one, blocking every case)",
+    )
+    parser.add_argument(
         "--min-recall",
         type=float,
         default=None,
@@ -273,7 +286,7 @@ def _main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
 
     cases = load_jsonl(args.corpus)
-    card = evaluate(cases, use_honeypot=args.use_honeypot)
+    card = evaluate(cases, use_honeypot=args.use_honeypot, use_lakera=args.use_lakera)
     print(card.format())
 
     if args.min_recall is not None and card.recall < args.min_recall:

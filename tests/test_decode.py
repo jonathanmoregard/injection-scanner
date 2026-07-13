@@ -79,7 +79,7 @@ def test_blob_cap_and_span_excerpt_no_full_decode_leak():
 
 def test_scan_text_blocks_base64_encoded_secret():
     text = "# Report\n\nEmbedded artifact: " + _b64(SECRET) + "\n\nDone.\n"
-    v = scan_text(text, use_honeypot=False)
+    v = scan_text(text, use_honeypot=False, use_lakera=False)
     assert not v.ok
     assert v.reason.startswith("encoded_secret:base64:"), v.reason
     # audit line records counts only, no decoded content.
@@ -94,5 +94,5 @@ def test_scan_text_passes_benign_base64_blob():
         "shipped in this quarter for the runtime and standard library"
     )
     text = "# Benign Report\n\nAttachment digest: " + benign + "\n\nSummary here.\n"
-    v = scan_text(text, use_honeypot=False)
+    v = scan_text(text, use_honeypot=False, use_lakera=False)
     assert v.ok, f"expected pass, got {v.reason}"
