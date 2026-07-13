@@ -50,6 +50,67 @@ def test_benign_prose_untouched():
     assert r.text == text
 
 
+# ----- L0 invisibles expansion (Item A) -----
+
+def test_strips_variation_selector_supplement():
+    # U+E0100 — Butler/Goodside byte-smuggling channel. Counted as tag_hits.
+    dirty = "hello\U000E0100world"
+    r = unicode_sanitize.sanitize(dirty)
+    assert r.tag_hits == 1
+    assert r.stripped == 1
+    assert "\U000E0100" not in r.text
+    assert r.text == "helloworld"
+
+
+def test_strips_word_joiner_and_fmt_covert():
+    # U+2060 WORD JOINER + U+2061 (invisible math) are covert format chars.
+    dirty = "a⁠b⁡c"
+    r = unicode_sanitize.sanitize(dirty)
+    assert r.fmt_hits == 2
+    assert r.stripped == 2
+    assert r.text == "abc"
+
+
+def test_preserves_emoji_variation_selector():
+    # U+FE0F is part of the "warning" emoji ⚠️ and MUST survive intact and
+    # NOT be counted — stripping it would corrupt legitimate benign content.
+    text = "warning ⚠️ ahead"
+    r = unicode_sanitize.sanitize(text)
+    assert "️" in r.text
+    assert r.text == text
+    assert r.stripped == 0
+    assert r.fmt_hits == 0
+
+
+def test_preserves_arabic_with_lrm():
+    # U+200E LRM is legitimate in RTL text; the snippet must survive untouched.
+    text = "قال ‎(hello)‎ مرحبا"
+    r = unicode_sanitize.sanitize(text)
+    assert "‎" in r.text
+    assert r.text == text
+    assert r.stripped == 0
+
+
+# ----- anomaly-density absolute floor (Item B) -----
+
+def test_short_doc_single_zw_stripped_but_not_anomalous():
+    # A 200-char doc with a single stray zero-width: stripped, but below the
+    # ANOMALY_MIN_STRIPPED floor so NOT escalated to quarantine.
+    text = "x" * 199 + "​"
+    r = unicode_sanitize.sanitize(text)
+    assert r.stripped == 1
+    assert "​" not in r.text
+    assert unicode_sanitize.is_anomalous(r, len(text)) is False
+
+
+def test_bidi_density_smoke_still_anomalous():
+    # Many strips (well above both floor and density) still flags anomalous.
+    text = "benign ‮malicious" * 100
+    r = unicode_sanitize.sanitize(text)
+    assert r.stripped >= unicode_sanitize.ANOMALY_MIN_STRIPPED
+    assert unicode_sanitize.is_anomalous(r, len(text)) is True
+
+
 # ----- secret_shapes -----
 
 def test_finds_anthropic_key():

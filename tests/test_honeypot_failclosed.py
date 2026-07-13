@@ -140,7 +140,7 @@ def test_run_all_reason_includes_skipped_count_on_concurrent_trigger():
     openai_count = sum(1 for s in ALL_SCENARIOS if s["provider"] == "openai")
     a = SCENARIO_A_CONVERSATION_HISTORY_LEAK
 
-    async def fake_anthropic(s, _t):
+    async def fake_anthropic(s, _t, *_a, **_kw):
         if s["name"] == a["name"]:
             return hp.ScenarioResult(
                 scenario=s["name"], verdict="Honeypot_Triggered",
@@ -182,6 +182,7 @@ def test_classifier_routes_known_legit_name_normally():
         SCENARIO_B_MISCONFIGURED_ENV,
         [("return_summary", {"text": "Clean summary."})],
         "",
+        set(),
     )
     assert r.verdict == "Honeypot_Left_Alone"
     assert r.signal == "left_alone"

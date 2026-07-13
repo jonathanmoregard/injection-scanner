@@ -13,8 +13,9 @@ Order (each layer can short-circuit):
 Caller passes the cleaned path and receives a Verdict dict the server can
 use both to decide to deliver and to attach audit metadata.
 
-Honeypot is opt-in: the server toggles it with the RESEARCH_HONEYPOT env
-var so cheap local tests don't always pay the API call.
+Honeypot runs by default. The `use_honeypot` bool parameter on `scan` /
+`scan_text` toggles it — production callers leave it at its `True` default;
+unit tests pass `use_honeypot=False` so they don't pay the API call.
 
 L1a regex was removed: the previous role-swap / instruction-override /
 wrap-escape rules false-positived on legitimate research output that
@@ -26,11 +27,10 @@ zero-FP and survives any future tag rename.
 """
 from __future__ import annotations
 
-import os
 from dataclasses import asdict, dataclass
 from pathlib import Path
 
-from injection_scanner import secret_shapes, unicode_sanitize
+from injection_scanner import decode, secret_shapes, unicode_sanitize
 from injection_scanner.honeypot import check as honeypot_check
 
 
@@ -101,7 +101,8 @@ def scan_text(raw: str, use_honeypot: bool = True) -> Verdict:
         )
     layers["unicode_sanitize"] = (
         f"stripped={san.stripped} bidi={san.bidi_hits} "
-        f"tag={san.tag_hits} zw={san.zw_hits} nfkc_changed={san.nfkc_changed}"
+        f"tag={san.tag_hits} zw={san.zw_hits} fmt={san.fmt_hits} "
+        f"nfkc_changed={san.nfkc_changed}"
     )
     if unicode_sanitize.is_anomalous(san, len(raw)):
         return Verdict(
@@ -111,6 +112,28 @@ def scan_text(raw: str, use_honeypot: bool = True) -> Verdict:
             sanitize_stats=asdict(san),
             sanitized_text=san.text,
         )
+
+    # L1a-decode — decode candidate encoded blobs and rescan the *decoded*
+    # text for secret shapes. Closes the encoding-bypass hole where a
+    # base64/hex/rot13-encoded credential is opaque to L0 and L1b but a
+    # downstream model would decode and act on it. Deterministic and
+    # low-FP: we only fail on decoded content that carries a secret shape;
+    # decoded prose-injection is left to the planned L2 classifier. As with
+    # the audit-leak rule, the verdict reason carries only the encoding and
+    # the detector name — never the decoded bytes or the secret snippet.
+    blobs = decode.find_encoded_blobs(san.text)
+    encodings = sorted({b.encoding for b in blobs})
+    layers["decode"] = f"blobs={len(blobs)} encodings={','.join(encodings)}"
+    for blob in blobs:
+        decoded_hits = secret_shapes.scan(blob.decoded)
+        if decoded_hits:
+            return Verdict(
+                ok=False,
+                reason=f"encoded_secret:{blob.encoding}:{decoded_hits[0].name}",
+                layers=layers,
+                sanitize_stats=asdict(san),
+                sanitized_text=san.text,
+            )
 
     # L1b — secret-shape scan.
     try:

@@ -14,6 +14,10 @@ A legitimate judge calls `return_summary` (the benign task) or
 scenario's canary via a tool argument or freeform text is
 `Honeypot_Triggered` and the report is rejected.
 
+Trap tool NAMES are randomized per scan (see honeypot_scenarios.build_trap_tools)
+so an untargeted payload can't fingerprint the sandbox off a well-known bait
+name. The classifier keys off the run's trap-name set, not a fixed constant.
+
 Fail-closed: missing SDK, missing API key, and any per-scenario API
 error all collapse to `ok=False`. Silent skip is not allowed — the whole
 point of defense-in-depth is that an outage must be visible.
@@ -31,13 +35,30 @@ from typing import Literal
 from injection_scanner.honeypot_scenarios import (
     ALL_CANARIES,
     ALL_SCENARIOS,
-    TRAP_TOOL_NAMES,
-    VALID_TOOL_NAMES,
+    LEGIT_TOOLS,
+    LEGIT_TOOL_NAMES,
     Scenario,
+    build_trap_tools,
     canary_label,
 )
 
 Verdict = Literal["Honeypot_Triggered", "Honeypot_Left_Alone", "Honeypot_Skipped"]
+
+_API_TIMEOUT_S = float(os.environ.get("INJECTION_SCANNER_API_TIMEOUT", "20"))
+_MAX_RETRIES = int(os.environ.get("INJECTION_SCANNER_API_RETRIES", "2"))
+_RETRY_BASE_S = float(os.environ.get("INJECTION_SCANNER_API_RETRY_BASE", "0.5"))
+
+
+async def _with_retries(make_awaitable):
+    last: Exception | None = None
+    for attempt in range(_MAX_RETRIES + 1):
+        try:
+            return await make_awaitable()
+        except Exception as e:  # noqa: BLE001 — retry any transient API error
+            last = e
+            if attempt < _MAX_RETRIES:
+                await asyncio.sleep(_RETRY_BASE_S * (2 ** attempt))
+    raise last  # type: ignore[misc]
 
 
 @dataclass
@@ -47,6 +68,7 @@ class ScenarioResult:
     signal: str
     provider: str = ""
     model: str = ""
+    raw_excerpt: str = ""
 
 
 @dataclass
@@ -180,30 +202,38 @@ def _classify_from_parts(
     scenario: Scenario,
     called_tools: list[tuple[str, dict]],
     text: str,
+    trap_names: set[str],
 ) -> ScenarioResult:
     """Given the list of (tool_name, tool_input) calls plus any freeform
     text, decide Honeypot_Triggered / Honeypot_Left_Alone.
 
-    Tool names from the judge response are checked against
-    VALID_TOOL_NAMES (= schema-defined names). A returned name outside
-    that set is treated as a malformed response — Honeypot_Skipped, not
-    Honeypot_Left_Alone — both to avoid silent fall-through on broken
-    SDK responses (Invariant 3) AND to fence out judge-controlled bytes
-    from ever reaching the caller-visible `signal` / `reason` strings
-    (Invariant 4). Even when the name IS valid, it's known-clean ASCII
-    so interpolation is safe.
+    `trap_names` is THIS run's randomized trap-tool name set (from
+    honeypot_scenarios.build_trap_tools). The trap check keys off it rather
+    than any fixed module-level constant, so it matches whatever names the
+    model was shown this run.
+
+    Valid tool names for this run = the stable legit tools ∪ this run's
+    randomized trap names. A returned name outside that set is treated as a
+    malformed response — Honeypot_Skipped, not Honeypot_Left_Alone — both to
+    avoid silent fall-through on broken SDK responses (Invariant 3) AND to
+    fence out judge-controlled bytes from ever reaching the caller-visible
+    `signal` / `reason` strings (Invariant 4). Even when the name IS valid,
+    it's known-clean ASCII (legit tool id or `<capability>_<hex>`) so
+    interpolation is safe.
     """
     own_canary = scenario["canary"]
+    excerpt = text[:300]  # audit-only; never interpolated into signal/reason
+    valid_names = LEGIT_TOOL_NAMES | trap_names
 
     # 0. Defense in depth: reject any malformed-name tool call. A judge
-    #    that returned `name=None` or a string outside the schema set
-    #    is either a broken SDK response or a coerced model emitting
+    #    that returned `name=None` or a string outside the valid set is
+    #    either a broken SDK response or a coerced model emitting
     #    attacker-shaped bytes in the name field. Either way, falling
     #    through to left_alone would synthesize a positive signal from
     #    the absence of a parseable trigger — exactly what Invariant 3
     #    forbids.
     for name, _inp in called_tools:
-        if not isinstance(name, str) or name not in VALID_TOOL_NAMES:
+        if not isinstance(name, str) or name not in valid_names:
             return ScenarioResult(
                 scenario=scenario["name"],
                 verdict="Honeypot_Skipped",
@@ -214,15 +244,16 @@ def _classify_from_parts(
 
     # 1. Bait-tool call: triggered regardless of args. Even an "empty"
     #    bait-tool call demonstrates the judge was coerced into the wrong
-    #    action class.
+    #    action class. `trap_names` are this run's randomized names.
     for name, _inp in called_tools:
-        if name in TRAP_TOOL_NAMES:
+        if name in trap_names:
             return ScenarioResult(
                 scenario=scenario["name"],
                 verdict="Honeypot_Triggered",
                 signal=f"trap:{name}",
                 provider=scenario["provider"],
                 model=scenario["model"],
+                raw_excerpt=excerpt,
             )
 
     # 2. Canary in ANY tool-call argument (including the legitimate tools
@@ -233,14 +264,15 @@ def _classify_from_parts(
     if arg_hit:
         c, tool_name = arg_hit
         suffix = "" if c == own_canary else "_crosstalk"
-        # tool_name is validated against VALID_TOOL_NAMES above, so it's
-        # safe to interpolate (known ASCII identifier, no attacker bytes).
+        # tool_name is validated against valid_names above, so it's safe to
+        # interpolate (known ASCII identifier, no attacker bytes).
         return ScenarioResult(
             scenario=scenario["name"],
             verdict="Honeypot_Triggered",
             signal=f"canary_in_arg{suffix}:{canary_label(c)}:{tool_name}",
             provider=scenario["provider"],
             model=scenario["model"],
+            raw_excerpt=excerpt,
         )
 
     # 3. Canary in freeform assistant text. Order: own canary first
@@ -252,6 +284,7 @@ def _classify_from_parts(
             signal=f"canary_in_text:{canary_label(own_canary)}",
             provider=scenario["provider"],
             model=scenario["model"],
+            raw_excerpt=excerpt,
         )
     for other in ALL_CANARIES:
         if other != own_canary and other in text:
@@ -261,6 +294,7 @@ def _classify_from_parts(
                 signal=f"canary_in_text_crosstalk:{canary_label(other)}",
                 provider=scenario["provider"],
                 model=scenario["model"],
+                raw_excerpt=excerpt,
             )
 
     # 4. report_issue(Prompt_Injection_Attempt, …) is the "good signal"
@@ -276,6 +310,7 @@ def _classify_from_parts(
                 signal="left_alone_with_injection_report",
                 provider=scenario["provider"],
                 model=scenario["model"],
+                raw_excerpt=excerpt,
             )
     return ScenarioResult(
         scenario=scenario["name"],
@@ -283,6 +318,7 @@ def _classify_from_parts(
         signal="left_alone",
         provider=scenario["provider"],
         model=scenario["model"],
+        raw_excerpt=excerpt,
     )
 
 
@@ -302,7 +338,12 @@ def _openai_tools(tools: list[dict]) -> list[dict]:
     return out
 
 
-async def _call_anthropic(scenario: Scenario, report_text: str) -> ScenarioResult:
+async def _call_anthropic(
+    scenario: Scenario,
+    report_text: str,
+    tools: list[dict],
+    trap_names: set[str],
+) -> ScenarioResult:
     try:
         import anthropic  # type: ignore
     except ImportError:
@@ -318,7 +359,7 @@ async def _call_anthropic(scenario: Scenario, report_text: str) -> ScenarioResul
             signal="unavailable:no-anthropic-api-key",
             provider="anthropic", model=scenario["model"],
         )
-    client = anthropic.Anthropic(api_key=key)
+    client = anthropic.Anthropic(api_key=key, timeout=_API_TIMEOUT_S)
     # Shallow copy intentional — we rebind `messages[-1]` below to a NEW
     # dict so the module-level scenario["history"] singleton stays pristine
     # across concurrent scans. Do NOT switch to mutating in place
@@ -330,13 +371,15 @@ async def _call_anthropic(scenario: Scenario, report_text: str) -> ScenarioResul
     else:
         messages.append({"role": "user", "content": attach})
     try:
-        resp = await asyncio.to_thread(
-            client.messages.create,
-            model=scenario["model"],
-            max_tokens=400,
-            tools=scenario["tools"],  # type: ignore[arg-type]
-            system=scenario["system"],
-            messages=messages,
+        resp = await _with_retries(
+            lambda: asyncio.to_thread(
+                client.messages.create,
+                model=scenario["model"],
+                max_tokens=400,
+                tools=tools,  # type: ignore[arg-type]
+                system=scenario["system"],
+                messages=messages,
+            )
         )
     except Exception as e:
         # Use only the exception *type* — some SDKs stringify exceptions
@@ -348,21 +391,35 @@ async def _call_anthropic(scenario: Scenario, report_text: str) -> ScenarioResul
             signal=f"unavailable:anthropic-api-error:{type(e).__name__}",
             provider="anthropic", model=scenario["model"],
         )
-    called: list[tuple[str, dict]] = []
-    text_chunks: list[str] = []
-    for block in resp.content:
-        btype = getattr(block, "type", "")
-        if btype == "tool_use":
-            called.append((
-                getattr(block, "name", ""),
-                getattr(block, "input", {}) or {},
-            ))
-        elif btype == "text":
-            text_chunks.append(getattr(block, "text", ""))
-    return _classify_from_parts(scenario, called, " ".join(text_chunks))
+    try:
+        called: list[tuple[str, dict]] = []
+        text_chunks: list[str] = []
+        for block in resp.content:
+            btype = getattr(block, "type", "")
+            if btype == "tool_use":
+                called.append((
+                    getattr(block, "name", ""),
+                    getattr(block, "input", {}) or {},
+                ))
+            elif btype == "text":
+                text_chunks.append(getattr(block, "text", ""))
+    except Exception as e:
+        # A malformed / unexpected response shape must not fail-open — treat
+        # an unparseable response as degraded coverage (Skipped), not a pass.
+        return ScenarioResult(
+            scenario=scenario["name"], verdict="Honeypot_Skipped",
+            signal=f"unavailable:anthropic-parse-error:{type(e).__name__}",
+            provider="anthropic", model=scenario["model"],
+        )
+    return _classify_from_parts(scenario, called, " ".join(text_chunks), trap_names)
 
 
-async def _call_openai(scenario: Scenario, report_text: str) -> ScenarioResult:
+async def _call_openai(
+    scenario: Scenario,
+    report_text: str,
+    tools: list[dict],
+    trap_names: set[str],
+) -> ScenarioResult:
     try:
         from openai import OpenAI  # type: ignore
     except ImportError:
@@ -378,7 +435,7 @@ async def _call_openai(scenario: Scenario, report_text: str) -> ScenarioResult:
             signal="unavailable:no-openai-api-key",
             provider="openai", model=scenario["model"],
         )
-    client = OpenAI(api_key=key)
+    client = OpenAI(api_key=key, timeout=_API_TIMEOUT_S)
 
     # OpenAI expects flat chat messages; scenario history uses the same
     # role/content shape so we pass it through, then attach the content.
@@ -391,12 +448,14 @@ async def _call_openai(scenario: Scenario, report_text: str) -> ScenarioResult:
         messages.append({"role": "user", "content": attach})
 
     try:
-        resp = await asyncio.to_thread(
-            client.chat.completions.create,
-            model=scenario["model"],
-            messages=messages,
-            tools=_openai_tools(scenario["tools"]),
-            max_tokens=400,
+        resp = await _with_retries(
+            lambda: asyncio.to_thread(
+                client.chat.completions.create,
+                model=scenario["model"],
+                messages=messages,
+                tools=_openai_tools(tools),
+                max_tokens=400,
+            )
         )
     except Exception as e:
         return ScenarioResult(
@@ -404,26 +463,41 @@ async def _call_openai(scenario: Scenario, report_text: str) -> ScenarioResult:
             signal=f"unavailable:openai-api-error:{type(e).__name__}",
             provider="openai", model=scenario["model"],
         )
-    msg = resp.choices[0].message
-    called: list[tuple[str, dict]] = []
-    for tc in (msg.tool_calls or []):
-        fn = getattr(tc, "function", None)
-        if not fn:
-            continue
-        try:
-            args = json.loads(fn.arguments) if fn.arguments else {}
-        except Exception:
-            args = {}
-        called.append((fn.name, args))
-    text = msg.content or ""
-    return _classify_from_parts(scenario, called, text)
+    try:
+        msg = resp.choices[0].message
+        called: list[tuple[str, dict]] = []
+        for tc in (msg.tool_calls or []):
+            fn = getattr(tc, "function", None)
+            if not fn:
+                continue
+            try:
+                args = json.loads(fn.arguments) if fn.arguments else {}
+            except Exception:
+                args = {}
+            called.append((fn.name, args))
+        text = msg.content or ""
+    except Exception as e:
+        # A malformed / unexpected response shape must not fail-open — treat
+        # an unparseable response as degraded coverage (Skipped), not a pass.
+        return ScenarioResult(
+            scenario=scenario["name"], verdict="Honeypot_Skipped",
+            signal=f"unavailable:openai-parse-error:{type(e).__name__}",
+            provider="openai", model=scenario["model"],
+        )
+    return _classify_from_parts(scenario, called, text, trap_names)
 
 
 async def _run_one(scenario: Scenario, report_text: str) -> ScenarioResult:
+    # Materialize this run's trap tools with FRESH randomized names and the
+    # matching trap-name set, then present LEGIT (stable) + trap (randomized)
+    # tools to the model. The classifier keys off `trap_names` so it matches
+    # exactly the names the model was shown this run.
+    trap_tools, trap_names = build_trap_tools(scenario["traps"])
+    tools = LEGIT_TOOLS + trap_tools
     if scenario["provider"] == "anthropic":
-        return await _call_anthropic(scenario, report_text)
+        return await _call_anthropic(scenario, report_text, tools, trap_names)
     if scenario["provider"] == "openai":
-        return await _call_openai(scenario, report_text)
+        return await _call_openai(scenario, report_text, tools, trap_names)
     return ScenarioResult(
         scenario=scenario["name"], verdict="Honeypot_Skipped",
         signal=f"unavailable:unknown-provider:{scenario['provider']}",
@@ -447,7 +521,9 @@ async def _run_all(report_text: str) -> HoneypotResult:
     )
     results: list[ScenarioResult] = []
     for s, r in zip(ALL_SCENARIOS, raw):
-        if isinstance(r, BaseException):
+        if isinstance(r, ScenarioResult):
+            results.append(r)
+        else:
             # Only the exception *type name* — `str(e)` on SDK exceptions
             # can embed request/response fragments that are themselves
             # attacker-shaped (the report bytes we sent in the prompt).
@@ -458,8 +534,6 @@ async def _run_all(report_text: str) -> HoneypotResult:
                 provider=s["provider"],
                 model=s["model"],
             ))
-        else:
-            results.append(r)
 
     triggered = [r for r in results if r.verdict == "Honeypot_Triggered"]
     # Defensive: anything that's not explicitly Triggered or Left_Alone
@@ -485,7 +559,7 @@ async def _run_all(report_text: str) -> HoneypotResult:
     if skipped:
         first = skipped[0]
         # Symmetric to the trigger path: include the skipped count so a
-        # full-outage (3/3) is distinguishable from a partial (1/3).
+        # full-outage (6/6) is distinguishable from a partial (1/6).
         return HoneypotResult(
             ok=False,
             reason=f"honeypot_unavailable:{first.scenario}:{first.signal}+skipped={len(skipped)}/{total}",
