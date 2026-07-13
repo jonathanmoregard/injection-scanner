@@ -56,18 +56,20 @@ jobs:
           uv venv --python 3.12
           uv pip install -e .
 
-      # Live e2e: 6 deterministic canaries (no API) + 1 honeypot
-      # liveness probe that hits Anthropic + OpenAI. Costs ~3 API
-      # calls per run. Runs against the SHA being merged so a PR
-      # that breaks honeypot integration (broken scenario file,
-      # SDK incompat, etc.) cannot reach main.
+      # Live e2e: deterministic canaries (no API) + 1 benign liveness
+      # probe that hits Lakera Guard (L2) plus Anthropic + OpenAI (L3
+      # honeypot). Runs against the SHA being merged so a PR that breaks
+      # L2/L3 integration (broken scenario file, SDK incompat, Lakera
+      # schema drift, etc.) cannot reach main. Because the Lakera gate
+      # fails closed on a missing key, LAKERA_API_KEY is now required.
       - name: run_smoke
         env:
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          LAKERA_API_KEY: ${{ secrets.LAKERA_API_KEY }}
         run: |
-          if [ -z "$ANTHROPIC_API_KEY" ] || [ -z "$OPENAI_API_KEY" ]; then
-            echo "::error::Missing ANTHROPIC_API_KEY or OPENAI_API_KEY secret. Add via: gh secret set <NAME> -R jonathanmoregard/injection-scanner"
+          if [ -z "$ANTHROPIC_API_KEY" ] || [ -z "$OPENAI_API_KEY" ] || [ -z "$LAKERA_API_KEY" ]; then
+            echo "::error::Missing ANTHROPIC_API_KEY, OPENAI_API_KEY, or LAKERA_API_KEY secret. Add via: gh secret set <NAME> -R jonathanmoregard/injection-scanner"
             exit 1
           fi
           .venv/bin/python -c "

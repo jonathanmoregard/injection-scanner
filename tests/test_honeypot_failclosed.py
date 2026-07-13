@@ -65,7 +65,11 @@ def test_scan_text_fails_closed_on_honeypot_check_raise():
         raise RuntimeError("synthetic check-level failure")
 
     with um.patch.object(ic, "honeypot_check", boom_check):
-        v = scan_text("Benign report. Sources: 1. example.", use_honeypot=True)
+        v = scan_text(
+            "Benign report. Sources: 1. example.",
+            use_honeypot=True,
+            use_lakera=False,
+        )
     assert v.ok is False
     assert "unhandled" in v.reason
     assert "RuntimeError" in v.reason
@@ -86,7 +90,7 @@ def test_scan_text_fails_closed_does_not_echo_exception_message():
         raise RuntimeError(secret_marker)
 
     with um.patch.object(ic, "honeypot_check", boom_check):
-        v = scan_text("Benign. Sources: 1. example.", use_honeypot=True)
+        v = scan_text("Benign. Sources: 1. example.", use_honeypot=True, use_lakera=False)
     assert v.ok is False
     assert secret_marker not in v.reason
     for k, val in v.layers.items():
@@ -103,7 +107,7 @@ def test_scan_text_fails_closed_on_unicode_sanitize_raise():
         raise ValueError("synthetic unicode failure")
 
     with um.patch.object(ic.unicode_sanitize, "sanitize", boom_sanitize):
-        v = scan_text("anything", use_honeypot=False)
+        v = scan_text("anything", use_honeypot=False, use_lakera=False)
     assert v.ok is False
     assert "unicode_sanitize_unavailable" in v.reason
     assert "ValueError" in v.reason
@@ -117,7 +121,7 @@ def test_scan_text_fails_closed_on_secret_shapes_raise():
         raise RuntimeError("synthetic shapes failure")
 
     with um.patch.object(ic.secret_shapes, "scan", boom_shapes):
-        v = scan_text("anything", use_honeypot=False)
+        v = scan_text("anything", use_honeypot=False, use_lakera=False)
     assert v.ok is False
     assert "secret_shapes_unavailable" in v.reason
     assert "RuntimeError" in v.reason
