@@ -283,20 +283,36 @@ def _main(argv: list[str] | None = None) -> int:
         help="exit 1 if recall < X (lets CI enforce a floor). "
         "Omit to always exit 0 (pure measurement).",
     )
+    parser.add_argument(
+        "--max-fp-rate",
+        type=float,
+        default=None,
+        metavar="X",
+        help="exit 1 if FP-rate > X (lets CI enforce a false-alarm ceiling "
+        "over the expected-pass cases). Omit to always exit 0.",
+    )
     args = parser.parse_args(argv)
 
     cases = load_jsonl(args.corpus)
     card = evaluate(cases, use_honeypot=args.use_honeypot, use_lakera=args.use_lakera)
     print(card.format())
 
+    failed = False
     if args.min_recall is not None and card.recall < args.min_recall:
         print(
             f"\nRECALL FLOOR FAILED: recall={card.recall:.3f} "
             f"< --min-recall={args.min_recall:.3f}",
             file=sys.stderr,
         )
-        return 1
-    return 0
+        failed = True
+    if args.max_fp_rate is not None and card.fp_rate > args.max_fp_rate:
+        print(
+            f"\nFP-RATE CEILING FAILED: fp_rate={card.fp_rate:.3f} "
+            f"> --max-fp-rate={args.max_fp_rate:.3f}",
+            file=sys.stderr,
+        )
+        failed = True
+    return 1 if failed else 0
 
 
 if __name__ == "__main__":

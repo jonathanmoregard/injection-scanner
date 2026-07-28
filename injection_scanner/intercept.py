@@ -13,7 +13,15 @@ Order (each layer can short-circuit):
                               (claude-haiku-4-5, gpt-4o-mini, gpt-4.1-nano)
                               across 6 canary scenarios; if any judge gets
                               coerced into a bait-tool call or canary echo, fail
-  (L4 LLM-as-judge is planned, not yet wired)
+  L4  judge                 — arbitration, ONLY for the disagreement case
+                              lakera:prompt_attack + honeypot fully clean:
+                              a cross-family panel must unanimously rule the
+                              text "describes, not directs" to overturn the
+                              flag; any attack vote, outage, or malformed
+                              verdict quarantines (fail-closed). Closes the
+                              measured FP class (benign research prose about
+                              agent tooling / injection attacks) without
+                              widening any attack path.
 
 Caller passes the cleaned path and receives a Verdict dict the server can
 use both to decide to deliver and to attach audit metadata.
@@ -35,7 +43,7 @@ from __future__ import annotations
 from dataclasses import asdict, dataclass
 from pathlib import Path
 
-from injection_scanner import decode, lakera, secret_shapes, unicode_sanitize
+from injection_scanner import decode, judge, lakera, secret_shapes, unicode_sanitize
 from injection_scanner.honeypot import check as honeypot_check
 
 
@@ -185,17 +193,39 @@ def scan_text(raw: str, use_honeypot: bool = True, use_lakera: bool = True) -> V
     #
     # The `use_lakera=False` path is used by unit tests / deterministic
     # measurement runs that must not depend on a live key or hit the network.
+    lakera_deferred = False
     if use_lakera:
         res = lakera.check(san.text)
         layers["lakera"] = res.reason
         if not res.ok:
-            return Verdict(
-                ok=False,
-                reason=res.reason,
-                layers=layers,
-                sanitize_stats=asdict(san),
-                sanitized_text=san.text,
-            )
+            if res.reason == "lakera:prompt_attack" and use_honeypot:
+                # DEFER, don't deliver: a definite prompt_attack
+                # classification with the behavioral honeypot available
+                # downstream enters L4 arbitration instead of rejecting
+                # unilaterally. Measured 2026-07-28: the unilateral gate
+                # false-positived on benign research prose ABOUT agent
+                # tooling and injection attacks (4/9 fp_* corpus cases,
+                # honeypot clean on all 9), quarantining legitimate
+                # research-agent reports. The report is still rejected
+                # unless the honeypot comes back fully clean AND the
+                # cross-family judge panel unanimously rules "describes,
+                # not directs" (see judge.py).
+                #
+                # Everything else stays a hard reject: every
+                # lakera_unavailable:* outage (fail-closed unchanged) and
+                # the no-breakdown `lakera:flagged` fallback (unknown
+                # detector mix — conservative). With the honeypot off
+                # (lakera-only measurement runs) there is no corroborating
+                # signal, so the flag also stays a hard reject.
+                lakera_deferred = True
+            else:
+                return Verdict(
+                    ok=False,
+                    reason=res.reason,
+                    layers=layers,
+                    sanitize_stats=asdict(san),
+                    sanitized_text=san.text,
+                )
     else:
         layers["lakera"] = "disabled (test-only)"
 
@@ -245,6 +275,36 @@ def scan_text(raw: str, use_honeypot: bool = True, use_lakera: bool = True) -> V
                 sanitize_stats=asdict(san),
                 sanitized_text=san.text,
             )
+
+        # L4 judge — arbitration of the Lakera-flag / honeypot-clean
+        # disagreement. Reached ONLY when L2 said prompt_attack and every
+        # honeypot scenario came back Left_Alone. Fail-closed like every
+        # other layer: a judge outage, a malformed verdict, or a single
+        # "attack" vote all quarantine. Only a unanimous cross-family
+        # "benign" overturns the flag.
+        if lakera_deferred:
+            try:
+                jr = judge.check(san.text)
+            except Exception as e:
+                layers["judge"] = f"unhandled:{type(e).__name__}"
+                return Verdict(
+                    ok=False,
+                    reason=f"judge_unavailable:unhandled:{type(e).__name__}",
+                    layers=layers,
+                    sanitize_stats=asdict(san),
+                    sanitized_text=san.text,
+                )
+            layers["judge"] = jr.reason
+            for v in jr.votes:
+                layers[f"judge.{v.judge}"] = f"{v.vote}:{v.signal}"
+            if not jr.ok:
+                return Verdict(
+                    ok=False,
+                    reason=f"lakera_arbitration:{jr.reason}",
+                    layers=layers,
+                    sanitize_stats=asdict(san),
+                    sanitized_text=san.text,
+                )
     else:
         layers["honeypot"] = "disabled (test-only)"
 

@@ -82,3 +82,36 @@ jobs:
               print(f'::error::smoke failed: {e.reason}', file=sys.stderr)
               sys.exit(2)
           "
+
+  eval:
+    name: eval (full pipeline, recall floor + FP ceiling)
+    runs-on: ubuntu-latest
+    needs: test
+    # Same fork guard as smoke: secrets aren't available on fork PRs.
+    if: github.event.pull_request.head.repo.full_name == github.repository || github.event_name == 'push'
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: install uv
+        uses: astral-sh/setup-uv@v3
+        with:
+          version: latest
+
+      - name: install package
+        run: |
+          uv venv --python 3.12
+          uv pip install -e .
+
+      # Scored gate over the labeled corpus with EVERY hosted layer live
+      # (Lakera + honeypot + L4 judge arbitration). Two hard thresholds:
+      #   --min-recall 1.0   every labeled injection must still be blocked
+      #   --max-fp-rate 0.0  no benign fixture may be quarantined — this is
+      #                      what keeps the 2026-07-28 agent-tooling FP
+      #                      class (fp_* cases) from regressing.
+      - name: eval corpus
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          LAKERA_API_KEY: ${{ secrets.LAKERA_API_KEY }}
+        run: |
+          .venv/bin/python -m injection_scanner.eval tests/payloads/labels.jsonl --use-lakera --use-honeypot --min-recall 1.0 --max-fp-rate 0.0
