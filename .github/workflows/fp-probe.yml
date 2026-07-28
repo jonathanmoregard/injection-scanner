@@ -1,0 +1,54 @@
+# TEMPORARY diagnostic workflow — lives only on the debug/fp-probe-agent-tooling
+# branch, never merged to main. Runs the eval harness over a benign
+# agent-tooling corpus to attribute production false positives (2026-07-28:
+# tool-survey and mobile-remote research reports quarantined by research-agent)
+# to a specific hosted layer (L2 Lakera vs L3 honeypot). Output contains only
+# verdict labels and reason codes for author-written benign fixtures.
+name: fp-probe
+
+on:
+  push:
+    branches: [debug/fp-probe-agent-tooling]
+
+permissions:
+  contents: read
+
+jobs:
+  fp-probe:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: install uv
+        uses: astral-sh/setup-uv@v3
+        with:
+          version: latest
+
+      - name: install package
+        run: |
+          uv venv --python 3.12
+          uv pip install -e .
+
+      - name: eval lakera-only
+        env:
+          LAKERA_API_KEY: ${{ secrets.LAKERA_API_KEY }}
+        run: |
+          echo "===== LAKERA ONLY ====="
+          .venv/bin/python -m injection_scanner.eval tests/payloads/fp_probe.jsonl --use-lakera
+
+      - name: eval honeypot-only
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+        run: |
+          echo "===== HONEYPOT ONLY ====="
+          .venv/bin/python -m injection_scanner.eval tests/payloads/fp_probe.jsonl --use-honeypot
+
+      - name: eval full pipeline
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          LAKERA_API_KEY: ${{ secrets.LAKERA_API_KEY }}
+        run: |
+          echo "===== FULL (LAKERA + HONEYPOT) ====="
+          .venv/bin/python -m injection_scanner.eval tests/payloads/fp_probe.jsonl --use-lakera --use-honeypot
