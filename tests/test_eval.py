@@ -45,11 +45,12 @@ def _card() -> Scorecard:
 
 def test_harness_runs_over_seed_corpus() -> None:
     cases = load_jsonl(LABELS)
-    # 8 fixtures: 1 benign + 7 malicious.
-    assert len(cases) == 8
+    # 16 fixtures: 7 malicious + 1 benign + 8 benign-hard fp_* cases
+    # (2026-07-28 agent-tooling false-positive corpus).
+    assert len(cases) == 16
     card = evaluate(cases, use_honeypot=False)
-    assert card.total == 8
-    assert card.tp + card.fn + card.fp + card.tn == 8
+    assert card.total == 16
+    assert card.tp + card.fn + card.fp + card.tn == 16
 
 
 def test_deterministic_fixtures_are_caught() -> None:
@@ -90,11 +91,12 @@ def test_prose_injections_are_the_known_gap() -> None:
 
 def test_confusion_matrix_and_metrics() -> None:
     card = _card()
-    # 2 deterministic blocks caught, 5 prose blocks missed, 1 benign passes.
+    # 2 deterministic blocks caught, 5 prose blocks missed, 9 benign pass
+    # (benign.md + the 8 fp_* benign-hard agent-tooling cases).
     assert card.tp == 2
     assert card.fn == 5
     assert card.fp == 0
-    assert card.tn == 1
+    assert card.tn == 9
     # Precision is perfect (no false alarms); recall is the honest low number.
     assert card.precision == 1.0
     assert abs(card.recall - 2 / 7) < 1e-9
@@ -117,8 +119,11 @@ def test_load_jsonl_round_trips_inline_corpus(tmp_path: Path) -> None:
 
 def test_load_corpus_dir_reads_labels_file() -> None:
     cases = load_corpus_dir(PAYLOADS)
-    assert len(cases) == 8
-    assert {c.id for c in cases} == {
+    assert len(cases) == 16
+    fp_cases = {c.id for c in cases if c.id.startswith("fp_")}
+    assert len(fp_cases) == 8
+    assert all(c.expected == PASS for c in cases if c.id.startswith("fp_"))
+    assert {c.id for c in cases if not c.id.startswith("fp_")} == {
         "benign.md",
         *DETERMINISTIC_BLOCKS,
         *PROSE_INJECTIONS,

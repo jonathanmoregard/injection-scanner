@@ -203,3 +203,99 @@ def test_orchestrator_strips_but_passes_single_zw():
     v = scan(path, use_honeypot=False, use_lakera=False)
     assert v.ok
     assert "\u200B" not in v.sanitized_text
+
+
+# ----- L4 arbitration wiring (lakera flag + honeypot clean -> judge) -----
+
+def _flagged(_text):
+    from injection_scanner.lakera import LakeraResult
+    return LakeraResult(ok=False, flagged=True, reason="lakera:prompt_attack")
+
+
+def _hp_clean(_text):
+    from injection_scanner.honeypot import HoneypotResult
+    return HoneypotResult(ok=True, reason="pass")
+
+
+def test_lakera_flag_honeypot_clean_judge_benign_delivers(monkeypatch):
+    from injection_scanner import intercept, judge, lakera
+    from injection_scanner.judge import JudgeResult, JudgeVote
+    monkeypatch.setattr(lakera, "check", _flagged)
+    monkeypatch.setattr(intercept, "honeypot_check", _hp_clean)
+    monkeypatch.setattr(judge, "check", lambda _t: JudgeResult(
+        ok=True, reason="benign-unanimous",
+        votes=[JudgeVote("anthropic_haiku45", "benign", "verdict")],
+    ))
+    v = intercept.scan_text("prose about agent tooling", use_honeypot=True, use_lakera=True)
+    assert v.ok
+    assert v.layers["lakera"] == "lakera:prompt_attack"
+    assert v.layers["judge"] == "benign-unanimous"
+
+
+def test_lakera_flag_judge_attack_rejects(monkeypatch):
+    from injection_scanner import intercept, judge, lakera
+    from injection_scanner.judge import JudgeResult
+    monkeypatch.setattr(lakera, "check", _flagged)
+    monkeypatch.setattr(intercept, "honeypot_check", _hp_clean)
+    monkeypatch.setattr(judge, "check", lambda _t: JudgeResult(
+        ok=False, reason="attack:openai_4o_mini"))
+    v = intercept.scan_text("x", use_honeypot=True, use_lakera=True)
+    assert not v.ok
+    assert v.reason == "lakera_arbitration:attack:openai_4o_mini"
+
+
+def test_lakera_flag_honeypot_triggered_rejects_without_judge(monkeypatch):
+    from injection_scanner import intercept, judge, lakera
+    from injection_scanner.honeypot import HoneypotResult
+    monkeypatch.setattr(lakera, "check", _flagged)
+    monkeypatch.setattr(intercept, "honeypot_check", lambda _t: HoneypotResult(
+        ok=False, reason="honeypot:scn:trap:x"))
+    monkeypatch.setattr(judge, "check", lambda _t: (_ for _ in ()).throw(
+        AssertionError("judge must not run when honeypot triggers")))
+    v = intercept.scan_text("x", use_honeypot=True, use_lakera=True)
+    assert not v.ok
+    assert v.reason.startswith("honeypot:")
+
+
+def test_lakera_outage_hard_rejects_without_judge(monkeypatch):
+    from injection_scanner import intercept, judge, lakera
+    from injection_scanner.lakera import LakeraResult
+    monkeypatch.setattr(lakera, "check", lambda _t: LakeraResult(
+        ok=False, reason="lakera_unavailable:no-key"))
+    monkeypatch.setattr(judge, "check", lambda _t: (_ for _ in ()).throw(
+        AssertionError("judge must not run on lakera outage")))
+    v = intercept.scan_text("x", use_honeypot=True, use_lakera=True)
+    assert not v.ok
+    assert v.reason == "lakera_unavailable:no-key"
+
+
+def test_lakera_flag_without_honeypot_hard_rejects(monkeypatch):
+    from injection_scanner import intercept, lakera
+    monkeypatch.setattr(lakera, "check", _flagged)
+    v = intercept.scan_text("x", use_honeypot=False, use_lakera=True)
+    assert not v.ok
+    assert v.reason == "lakera:prompt_attack"
+
+
+def test_lakera_clean_never_calls_judge(monkeypatch):
+    from injection_scanner import intercept, judge, lakera
+    from injection_scanner.lakera import LakeraResult
+    monkeypatch.setattr(lakera, "check", lambda _t: LakeraResult(ok=True, reason="pass"))
+    monkeypatch.setattr(intercept, "honeypot_check", _hp_clean)
+    monkeypatch.setattr(judge, "check", lambda _t: (_ for _ in ()).throw(
+        AssertionError("judge must not run when lakera passes")))
+    v = intercept.scan_text("clean text", use_honeypot=True, use_lakera=True)
+    assert v.ok
+    assert v.reason == "pass"
+
+
+def test_judge_crash_fails_closed(monkeypatch):
+    from injection_scanner import intercept, judge, lakera
+    monkeypatch.setattr(lakera, "check", _flagged)
+    monkeypatch.setattr(intercept, "honeypot_check", _hp_clean)
+    monkeypatch.setattr(judge, "check", lambda _t: (_ for _ in ()).throw(
+        RuntimeError("judge infra down")))
+    v = intercept.scan_text("x", use_honeypot=True, use_lakera=True)
+    assert not v.ok
+    assert v.reason == "judge_unavailable:unhandled:RuntimeError"
+    assert "infra down" not in v.reason
