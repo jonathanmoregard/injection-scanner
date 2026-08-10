@@ -70,13 +70,22 @@ class ScenarioResult:
     signal: str
     provider: str = ""
     model: str = ""
-    raw_excerpt: str = ""
+    # AUDIT-ONLY. First 300 chars of the judge's freeform response, i.e.
+    # model output produced while reading attacker-controlled report bytes.
+    # `repr=False`: the default dataclass repr renders every field, so a bare
+    # `print(result)`, a log line, an f-string, or a pytest assertion diff
+    # would spill these bytes into whatever context is rendering them —
+    # including an interactive LLM session. Excluding them from the repr
+    # means the only way out is an explicit attribute read.
+    raw_excerpt: str = field(default="", repr=False)
     # AUDIT-ONLY. Structured detail from a provider API failure (see
     # `_error_detail`). Deliberately NOT part of `signal` — it flows only to
     # the quarantine audit record, which already carries full report text and
     # is never read back into an interactive session. Never interpolate this
-    # into `signal`, `reason`, or `Verdict.layers`.
-    api_error_detail: str = ""
+    # into `signal`, `reason`, or `Verdict.layers`. `repr=False` for the same
+    # reason as `raw_excerpt` above: a provider error message can echo request
+    # fragments derived from the report body.
+    api_error_detail: str = field(default="", repr=False)
 
 
 @dataclass
@@ -86,8 +95,9 @@ class HoneypotResult:
     per_scenario: list[ScenarioResult] = field(default_factory=list)
     # AUDIT-ONLY, scenario name -> `ScenarioResult.api_error_detail`. Only
     # scenarios that actually hit a provider error appear. Same containment
-    # rule as the per-scenario field: audit record only.
-    api_error_details: dict[str, str] = field(default_factory=dict)
+    # rule as the per-scenario field: audit record only, and `repr=False` so
+    # it cannot ride a default repr out of the audit channel.
+    api_error_details: dict[str, str] = field(default_factory=dict, repr=False)
 
 
 # ---------- provider API-error diagnostics (audit-only) ----------
