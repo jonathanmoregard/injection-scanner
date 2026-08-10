@@ -18,9 +18,13 @@ Trap tool NAMES are randomized per scan (see honeypot_scenarios.build_trap_tools
 so an untargeted payload can't fingerprint the sandbox off a well-known bait
 name. The classifier keys off the run's trap-name set, not a fixed constant.
 
-Fail-closed: missing SDK, missing API key, and any per-scenario API
-error all collapse to `ok=False`. Silent skip is not allowed — the whole
-point of defense-in-depth is that an outage must be visible.
+Fail-closed: missing SDK, missing API key, any per-scenario API error,
+and any tool call this layer cannot READ — a name outside the valid set,
+arguments that are not a parseable JSON object, or a call with no
+readable function object at all — all collapse to `ok=False`. Silent skip is not allowed, and neither is silent pass: the
+whole point of defense-in-depth is that an outage must be visible, and a
+scan that could not be performed must never be reported as a scan that
+found nothing.
 """
 from __future__ import annotations
 
@@ -421,8 +425,164 @@ def _seal(report_text: str) -> str:
 # ---------- common classification ----------
 
 
+# Stand-in NAME for a tool call whose function object could not be read at
+# all, so there is no name to report. Library-synthesized, never judge
+# bytes, and angle-bracketed so it cannot collide with a real tool name
+# (`return_summary` / `report_issue` / `<capability>_<hex>`) — the same
+# convention `containment.QuarantineOnly._UNCOERCED_KEY` uses, and the
+# reason this constant is safe to interpolate into `signal`.
+#
+# It is matched by IDENTITY, not equality, so a judge that literally names
+# a tool `<unreadable-tool-call>` is not mistaken for the library's own
+# marker. That collision is harmless either way: an equal-but-distinct
+# string is simply not in `valid_names`, so it fails closed one branch
+# earlier as `unavailable:malformed-tool-call`.
+_UNREADABLE_TOOL_CALL = "<unreadable-tool-call>"
+
+
+class _UnparsedArgs:
+    """One tool call's arguments as the provider sent them, unparsed.
+
+    The OpenAI adapter used to collapse a `json.loads` failure to `{}`.
+    That is the fail-OPEN this type exists to remove: the canary scan then
+    read an empty dict, found nothing, and the scenario classified as
+    `Honeypot_Left_Alone` — the report was not merely un-scanned, it was
+    affirmatively reported clean. With `max_tokens=400` a truncated tool
+    call is routine, so the hole was reachable with no attacker
+    cleverness at all, and trivially reachable by padding the arguments
+    until they stop parsing.
+
+    Carrying the raw string instead of discarding it buys the salvage in
+    `_arg_blob`: a canary is a literal substring, and a truncated JSON
+    blob is still a string, so the most damning case — the exfiltration
+    itself — is still DETECTED rather than degrading to an outage. What
+    cannot be salvaged then fails closed in `_classify_from_parts`.
+
+    The payload is judge output produced while reading attacker-controlled
+    report bytes, so it gets the same treatment as everything else in that
+    trust class, minus the holder: it never lands on a result object, is
+    never interpolated into `signal` / `reason` / `layers`, and is never
+    recorded anywhere. It lives in a local for the length of one
+    classification and is dropped. A `QuarantineOnlyText` would be the
+    right wrapper if it were ever recorded — and would then need a
+    `reveal_for_quarantine_record()` call site to be scannable, widening
+    the audited set of unwraps for a value we deliberately do not keep.
+    `__repr__` still redacts, because a local reaches a log line or a
+    pytest diff just as easily as a field does.
+    """
+
+    __slots__ = ("raw",)
+
+    def __init__(self, raw: object) -> None:
+        # Normalized to `str` at construction: the SDK types `arguments` as
+        # a string, and anything else is a broken response that must not
+        # turn into a `TypeError` later, deep inside the classifier.
+        self.raw: str = raw if isinstance(raw, str) else ""
+
+    def __repr__(self) -> str:
+        return f"_UnparsedArgs(<{len(self.raw)} chars unparsed, redacted>)"
+
+    __str__ = __repr__
+
+
+def _arg_blob(inp: object) -> str | None:
+    """One tool call's arguments as searchable text, or None if unrenderable.
+
+    SUBSTRING SCANNING ONLY. The return value is attacker-shaped and must
+    not be recorded, logged, or interpolated into any caller-visible
+    string; callers use it to answer a yes/no canary question and drop it.
+
+    `None` means "the arguments could not be rendered at all", which is
+    NOT the same as "no canary": it means the scan that would have cleared
+    this call never ran, so `_classify_from_parts` fails closed on it. A
+    dict of objects whose `__repr__` raises is the realistic shape — the
+    right type, and still unscannable.
+    """
+    if isinstance(inp, _UnparsedArgs):
+        return inp.raw
+    try:
+        return json.dumps(inp, ensure_ascii=False)
+    except Exception:  # noqa: BLE001 — non-serializable values are expected
+        pass
+    try:
+        return str(inp)
+    except Exception:  # noqa: BLE001 — a raising __str__ must not be an outage
+        return None
+
+
+def _unhandled_block_text(block: object) -> str:
+    """Scan-surface contribution of a response block this adapter does not model.
+
+    `_call_anthropic` walks `resp.content` looking for `tool_use` and
+    `text`. The SDK's `ContentBlock` union has TWELVE members
+    (`ThinkingBlock`, `RedactedThinkingBlock`, `ServerToolUseBlock`,
+    `WebSearchToolResultBlock`, `CodeExecutionToolResultBlock`, …), and an
+    `if/elif` with no `else` silently discards the other ten. A canary
+    echoed inside one would never be scanned and the scenario would read
+    clean — the same "unknown shape, conclude clean" fault as the tool-call
+    defects above, one layer out.
+
+    NOT reachable under the current request shape: we send no `thinking`
+    parameter and offer no server or MCP tools, so the API returns only
+    `text` and `tool_use`. This exists so that enabling either does not
+    silently open the hole — a config change should not be able to create
+    a detection gap.
+
+    FOLD IN, DO NOT FAIL CLOSED. Quarantining on the mere presence of an
+    unknown block would turn "someone switched thinking on" into a total
+    outage misattributed to the scanner, which is exactly the failure this
+    module has now fixed three times. Scanning more content costs nothing
+    and is strictly more detection: if the judge echoes the canary in its
+    reasoning, we want to catch it, not to refuse to look AND refuse to
+    proceed.
+
+    A block that exposes no readable content simply contributes nothing.
+    That is NOT grounds to quarantine, and it must not be "fixed" into a
+    fail-closed later: absence of readable content in a block we never
+    asked for is not evidence that a scan was missed.
+
+    The rendering is untrusted judge output. It joins the same freeform
+    text surface the `text` blocks feed, which is canary-scanned and
+    sliced into the audit-only `raw_excerpt`; it reaches no signal,
+    reason, or layer, and opens no new channel.
+    """
+    if getattr(block, "type", "") == "redacted_thinking":
+        # Ciphertext by construction, so a canary cannot be a literal
+        # substring of it — and at a few hundred characters per block it
+        # would push real judge text out of the 300-char audit excerpt.
+        # The type marker still goes in, so the block stays VISIBLE to an
+        # operator reading the excerpt; only the opaque payload is left
+        # out. Skipping the block entirely would be the special case worth
+        # avoiding.
+        return "redacted_thinking"
+    return _arg_blob(block) or ""
+
+
+def _args_are_readable(inp: object) -> bool:
+    """Whether a canary scan of these arguments proves anything.
+
+    Two conditions, and both are needed:
+
+      * the arguments are a JSON OBJECT. `json.loads` happily returns a
+        list, string or number (`'["x"]'` parses fine) and anthropic types
+        `block.input` as `object`, so the shape was never guaranteed. Step
+        4's `inp.get("category")` assumed it, and the resulting
+        `AttributeError` escaped the adapter — both of its try/except
+        blocks sit upstream of the classify call — to be recorded by the
+        gather as `unavailable:unhandled:AttributeError`, i.e. blamed on
+        the provider.
+      * they can be rendered to text, so the canary scan actually looked
+        at them.
+
+    An EMPTY dict is readable and clean: a tool with no parameters is a
+    legitimate call, and treating it as malformed would quarantine every
+    report a judge answers with a bare `return_summary()`.
+    """
+    return isinstance(inp, dict) and _arg_blob(inp) is not None
+
+
 def _scan_args_for_canary(
-    called_tools: list[tuple[str, dict]],
+    called_tools: list[tuple[str, object]],
     own_canary: str,
 ) -> tuple[str, str] | None:
     """If any tool-call argument blob contains a known canary substring,
@@ -434,6 +594,13 @@ def _scan_args_for_canary(
     leaking — name-based trap-tool detection alone misses these. See
     LivePI / EchoLeak (CVE-2025-32711) for the published attack class.
 
+    Runs BEFORE any judgement about whether the arguments were parseable,
+    via `_arg_blob`, so it covers three shapes with one pass: a parsed
+    dict, a parsed non-dict, and a raw `_UnparsedArgs` string that never
+    parsed. The last is the truncation case, and salvaging it is what
+    keeps a `max_tokens` cut-off from converting a real exfiltration into
+    a mere coverage outage.
+
     Scan order: own_canary first across all tools, then the rest of
     ALL_CANARIES. If a coerced judge leaks BOTH its own canary and an
     attacker-supplied cross-canary in the same arg blob, the more
@@ -442,18 +609,11 @@ def _scan_args_for_canary(
     """
     # Pass 1: own canary across all tools.
     for tool_name, inp in called_tools:
-        try:
-            blob = json.dumps(inp, ensure_ascii=False)
-        except Exception:
-            blob = str(inp)
-        if own_canary in blob:
+        if own_canary in (_arg_blob(inp) or ""):
             return (own_canary, tool_name)
     # Pass 2: any other canary (crosstalk).
     for tool_name, inp in called_tools:
-        try:
-            blob = json.dumps(inp, ensure_ascii=False)
-        except Exception:
-            blob = str(inp)
+        blob = _arg_blob(inp) or ""
         for c in ALL_CANARIES:
             if c != own_canary and c in blob:
                 return (c, tool_name)
@@ -462,12 +622,18 @@ def _scan_args_for_canary(
 
 def _classify_from_parts(
     scenario: Scenario,
-    called_tools: list[tuple[str, dict]],
+    called_tools: list[tuple[str, object]],
     text: str,
     trap_names: set[str],
 ) -> ScenarioResult:
     """Given the list of (tool_name, tool_input) calls plus any freeform
-    text, decide Honeypot_Triggered / Honeypot_Left_Alone.
+    text, decide Honeypot_Triggered / Honeypot_Left_Alone / Honeypot_Skipped.
+
+    `tool_input` is typed `object`, not `dict`, because that is what the
+    providers actually hand over: `json.loads` returns any JSON value,
+    anthropic types `block.input` as `object`, and a tool call whose
+    arguments never parsed arrives as `_UnparsedArgs`. Step 4 is where
+    that becomes a dict — before then, nothing may assume it.
 
     `trap_names` is THIS run's randomized trap-tool name set (from
     honeypot_scenarios.build_trap_tools). The trap check keys off it rather
@@ -500,6 +666,12 @@ def _classify_from_parts(
     #    the absence of a parseable trigger — exactly what Invariant 3
     #    forbids.
     for name, _inp in called_tools:
+        if name is _UNREADABLE_TOOL_CALL:
+            # A tool call with no readable function object. There is no
+            # name to fence here — this one is the LIBRARY's marker, not
+            # judge bytes — so it is deferred to step 4, after the canary
+            # salvage below has had its chance at the raw rendering.
+            continue
         if not isinstance(name, str) or name not in valid_names:
             return ScenarioResult(
                 scenario=scenario["name"],
@@ -531,7 +703,8 @@ def _classify_from_parts(
     if arg_hit:
         c, tool_name = arg_hit
         suffix = "" if c == own_canary else "_crosstalk"
-        # tool_name is validated against valid_names above, so it's safe to
+        # tool_name is either validated against valid_names above or the
+        # library's own `_UNREADABLE_TOOL_CALL` constant, so it's safe to
         # interpolate (known ASCII identifier, no attacker bytes).
         return ScenarioResult(
             scenario=scenario["name"],
@@ -564,11 +737,73 @@ def _classify_from_parts(
                 raw_excerpt=excerpt,
             )
 
-    # 4. report_issue(Prompt_Injection_Attempt, …) is the "good signal"
+    # 4. Arguments we could not read. Everything below this line concludes
+    #    the ABSENCE of a leak, and absence is precisely what an unreadable
+    #    argument blob cannot establish — so the fail-closed gate goes
+    #    HERE, at the last moment before a clean verdict, rather than at
+    #    the top of the function.
+    #
+    #    That is deliberately later than the malformed-NAME check in step
+    #    0, and the asymmetry is principled rather than incidental. A name
+    #    is fenced first because a valid name is interpolated into
+    #    `signal` (Invariant 4), so judge-controlled name bytes must never
+    #    get that far. Nothing from the ARGUMENTS ever reaches `signal` —
+    #    only `canary_label(c)` and the already-validated tool name do —
+    #    so the arguments can be scanned first and gated afterwards. Every
+    #    detection above therefore still fires on a truncated response:
+    #    a bait-tool call (step 1), a canary salvaged from the raw blob
+    #    (step 2), a canary in freeform text (step 3). Only the
+    #    conclusion of cleanliness is blocked.
+    #
+    #    `Honeypot_Skipped`, not `Honeypot_Triggered`. Both reject the
+    #    report, so the security outcome is identical and the choice is
+    #    about which one is TRUE. At `max_tokens=400` a truncated-but-
+    #    benign `return_summary(text=...)` is an ordinary event, and
+    #    labelling it as a caught exfiltration would file a legitimate
+    #    report as an attack, poison any downstream trigger-rate metric,
+    #    and point an operator at an attacker who isn't there. "We could
+    #    not tell" is exactly what the `unavailable:` bucket means, it is
+    #    where the malformed-NAME path one branch over already lands, and
+    #    it aggregates into `+skipped=N/total` so a systematic truncation
+    #    problem surfaces as degraded coverage to fix rather than as a
+    #    wave of phantom detections. The genuinely damning case is not
+    #    lost to the weaker label: step 2 already caught it.
+    #
+    #    The signal is a fixed string. The raw argument bytes are judge
+    #    output shaped by the attacker's report and are not recorded here
+    #    or anywhere else — no second diagnostic channel is invented for
+    #    them (see `_UnparsedArgs`).
+    for name, inp in called_tools:
+        if name is _UNREADABLE_TOOL_CALL:
+            # Not even a name survived — a distinct signal from
+            # `malformed-tool-args`, because the operator is looking for a
+            # different fault: an SDK response shape this adapter does not
+            # understand (an openai `type="custom"` tool call, say),
+            # rather than a judge that emitted bad JSON.
+            return ScenarioResult(
+                scenario=scenario["name"],
+                verdict="Honeypot_Skipped",
+                signal="unavailable:unreadable-tool-call",
+                provider=scenario["provider"],
+                model=scenario["model"],
+            )
+        if not _args_are_readable(inp):
+            return ScenarioResult(
+                scenario=scenario["name"],
+                verdict="Honeypot_Skipped",
+                signal="unavailable:malformed-tool-args",
+                provider=scenario["provider"],
+                model=scenario["model"],
+            )
+
+    # 5. report_issue(Prompt_Injection_Attempt, …) is the "good signal"
     #    path — only valid if no canary leaked in arg/text above. Steps
     #    1-3 already ran, so we know no exfil happened. A judge that
     #    flags the attack without executing it is exactly the behaviour
     #    we want from a non-flipped downstream model.
+    #
+    #    `inp.get` is safe here and only here: step 4 has established that
+    #    every argument object is a dict.
     for name, inp in called_tools:
         if name == "report_issue" and inp.get("category") == "Prompt_Injection_Attempt":
             return ScenarioResult(
@@ -672,17 +907,35 @@ async def _call_anthropic(
             api_error_detail=_error_detail(e),
         )
     try:
-        called: list[tuple[str, dict]] = []
+        called: list[tuple[str, object]] = []
         text_chunks: list[str] = []
+        # Kept separate from `text_chunks` only for ORDER: the judge's own
+        # prose leads the joined surface, so the 300-char `raw_excerpt` an
+        # operator reads still opens with the response rather than with a
+        # rendered `ThinkingBlock`. Both halves are scanned identically.
+        other_chunks: list[str] = []
         for block in resp.content:
             btype = getattr(block, "type", "")
             if btype == "tool_use":
+                # NOT `or {}`. The SDK annotates `input` as `object`, and
+                # rewriting a falsy value to an empty dict is the same
+                # fail-open the OpenAI adapter had: `None` means the
+                # arguments did not reach us, which is indistinguishable
+                # from arguments that carried the canary. `{}` (a genuine
+                # no-argument call) is already a dict and still passes;
+                # anything else is judged malformed in
+                # `_classify_from_parts`.
                 called.append((
                     getattr(block, "name", ""),
-                    getattr(block, "input", {}) or {},
+                    getattr(block, "input", None),
                 ))
             elif btype == "text":
                 text_chunks.append(getattr(block, "text", ""))
+            else:
+                # Every other block type in the union — see
+                # `_unhandled_block_text` for why this folds in rather
+                # than failing closed.
+                other_chunks.append(_unhandled_block_text(block))
     except Exception as e:
         # A malformed / unexpected response shape must not fail-open — treat
         # an unparseable response as degraded coverage (Skipped), not a pass.
@@ -691,7 +944,9 @@ async def _call_anthropic(
             signal=f"unavailable:anthropic-parse-error:{type(e).__name__}",
             provider="anthropic", model=scenario["model"],
         )
-    return _classify_from_parts(scenario, called, " ".join(text_chunks), trap_names)
+    return _classify_from_parts(
+        scenario, called, " ".join(text_chunks + other_chunks), trap_names
+    )
 
 
 async def _call_openai(
@@ -756,18 +1011,83 @@ async def _call_openai(
             api_error_detail=_error_detail(e),
         )
     try:
+        # `choices[0]` only. We never pass `n`, so the API returns exactly
+        # one choice and there is nothing here to miss today. Scanning
+        # alternatives is NOT a one-liner and is deliberately not attempted:
+        # separate choices are alternative completions, so merging their
+        # tool calls into one `called` list would invent a response the
+        # model never produced, and keeping them apart needs a rule for
+        # combining per-choice verdicts (any-triggers-wins? majority?)
+        # that nothing in the ensemble currently defines. If `n` is ever
+        # set, that rule has to be decided first.
         msg = resp.choices[0].message
-        called: list[tuple[str, dict]] = []
+        called: list[tuple[str, object]] = []
         for tc in (msg.tool_calls or []):
             fn = getattr(tc, "function", None)
-            if not fn:
+            if fn is None:
+                # `continue` here was the same fail-open one level up: a
+                # tool call whose function object is missing was DROPPED
+                # from `called`, so a response consisting only of such
+                # calls arrived at the classifier as "no tool calls" and
+                # classified as `Honeypot_Left_Alone`. Reachable with the
+                # installed SDK, not just in theory — openai 2.x defines
+                # `ChatCompletionMessageCustomToolCall` (`type="custom"`,
+                # payload under `.custom`, no `.function` at all), so a
+                # judge emitting one could exfiltrate the canary and read
+                # as clean.
+                #
+                # Salvage the same way as unparseable arguments: the whole
+                # tool-call object renders to text (the SDK models are
+                # pydantic, so `str(tc)` includes the payload fields), and
+                # the canary is a literal substring of that rendering. If
+                # nothing is readable, step 4 fails closed as
+                # `unavailable:unreadable-tool-call`.
+                #
+                # `is None` rather than `not fn`: a truthiness test also
+                # swallows a function object that is merely empty, which
+                # is a different fault and is handled below.
+                called.append((_UNREADABLE_TOOL_CALL, _UnparsedArgs(_arg_blob(tc))))
                 continue
-            try:
-                args = json.loads(fn.arguments) if fn.arguments else {}
-            except Exception:
+            raw_args = getattr(fn, "arguments", None)
+            args: object
+            if isinstance(raw_args, str) and not raw_args.strip():
+                # `""` is how OpenAI encodes a call to a tool with no
+                # parameters, and it is the one empty shape that is not a
+                # judgement call: an empty (or all-whitespace) string
+                # PROVABLY carries no canary, so reading it as "no
+                # arguments" concedes nothing. A missing/non-string
+                # `arguments` is a different thing entirely — that is the
+                # arguments failing to reach us — and falls through to the
+                # parse below, where it fails closed.
                 args = {}
+            else:
+                try:
+                    args = json.loads(raw_args)
+                except Exception:  # noqa: BLE001 — malformed JSON is routine
+                    # THE FAIL-OPEN THIS BRANCH USED TO BE. `args = {}`
+                    # here handed the classifier an empty argument object,
+                    # which found no canary and returned
+                    # `Honeypot_Left_Alone` — a report that exfiltrated the
+                    # canary through unparseable arguments was delivered as
+                    # clean. Truncation at `max_tokens=400` makes malformed
+                    # JSON ordinary, and padding the arguments until they
+                    # break is a one-byte attack.
+                    #
+                    # Keep the raw string instead: `_scan_args_for_canary`
+                    # substring-scans it (the canary survives truncation),
+                    # and whatever that cannot settle fails closed as
+                    # `unavailable:malformed-tool-args`.
+                    args = _UnparsedArgs(raw_args)
             called.append((fn.name, args))
         text = msg.content or ""
+        # `refusal` is a SEPARATE model-authored string: when the model
+        # declines, the prose lands here and `content` is None. It is
+        # judge output like any other, so it joins the canary scan surface
+        # rather than being discarded — a refusal that quotes what it was
+        # asked to exfiltrate is still an exfiltration.
+        refusal = getattr(msg, "refusal", None)
+        if isinstance(refusal, str) and refusal:
+            text = f"{text} {refusal}".strip()
     except Exception as e:
         # A malformed / unexpected response shape must not fail-open — treat
         # an unparseable response as degraded coverage (Skipped), not a pass.
