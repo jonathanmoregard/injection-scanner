@@ -50,6 +50,67 @@ def test_benign_prose_untouched():
     assert r.text == text
 
 
+# ----- L0 invisibles expansion (Item A) -----
+
+def test_strips_variation_selector_supplement():
+    # U+E0100 — Butler/Goodside byte-smuggling channel. Counted as tag_hits.
+    dirty = "hello\U000E0100world"
+    r = unicode_sanitize.sanitize(dirty)
+    assert r.tag_hits == 1
+    assert r.stripped == 1
+    assert "\U000E0100" not in r.text
+    assert r.text == "helloworld"
+
+
+def test_strips_word_joiner_and_fmt_covert():
+    # U+2060 WORD JOINER + U+2061 (invisible math) are covert format chars.
+    dirty = "a⁠b⁡c"
+    r = unicode_sanitize.sanitize(dirty)
+    assert r.fmt_hits == 2
+    assert r.stripped == 2
+    assert r.text == "abc"
+
+
+def test_preserves_emoji_variation_selector():
+    # U+FE0F is part of the "warning" emoji ⚠️ and MUST survive intact and
+    # NOT be counted — stripping it would corrupt legitimate benign content.
+    text = "warning ⚠️ ahead"
+    r = unicode_sanitize.sanitize(text)
+    assert "️" in r.text
+    assert r.text == text
+    assert r.stripped == 0
+    assert r.fmt_hits == 0
+
+
+def test_preserves_arabic_with_lrm():
+    # U+200E LRM is legitimate in RTL text; the snippet must survive untouched.
+    text = "قال ‎(hello)‎ مرحبا"
+    r = unicode_sanitize.sanitize(text)
+    assert "‎" in r.text
+    assert r.text == text
+    assert r.stripped == 0
+
+
+# ----- anomaly-density absolute floor (Item B) -----
+
+def test_short_doc_single_zw_stripped_but_not_anomalous():
+    # A 200-char doc with a single stray zero-width: stripped, but below the
+    # ANOMALY_MIN_STRIPPED floor so NOT escalated to quarantine.
+    text = "x" * 199 + "​"
+    r = unicode_sanitize.sanitize(text)
+    assert r.stripped == 1
+    assert "​" not in r.text
+    assert unicode_sanitize.is_anomalous(r, len(text)) is False
+
+
+def test_bidi_density_smoke_still_anomalous():
+    # Many strips (well above both floor and density) still flags anomalous.
+    text = "benign ‮malicious" * 100
+    r = unicode_sanitize.sanitize(text)
+    assert r.stripped >= unicode_sanitize.ANOMALY_MIN_STRIPPED
+    assert unicode_sanitize.is_anomalous(r, len(text)) is True
+
+
 # ----- secret_shapes -----
 
 def test_finds_anthropic_key():
@@ -94,21 +155,33 @@ def test_orchestrator_passes_clean_report():
             "# Python 3.13\n\n*Sources: 1*\n\n## Summary\nReleased October 2024.\n"
         )
         path = Path(f.name)
-    v = scan(path, use_honeypot=False)
+    v = scan(path, use_honeypot=False, use_lakera=False)
     assert v.ok, f"expected pass, got {v.reason}"
     assert v.layers["secret_shapes"] == "pass"
 
 
 def test_orchestrator_blocks_secret():
+    # Pin the structured reason shape: `secret_shape:<rule_name>` only —
+    # NO snippet bytes. Previously the reason carried up to 40 chars of
+    # the matched secret, which violated Invariant 4 (caught bytes never
+    # return to caller context).
+    secret_bytes = "sk-ant-oat01-" + "X" * 60
     with tempfile.NamedTemporaryFile("w", suffix=".md", delete=False) as f:
-        f.write(
-            "# Report\n\nLeaked key: sk-ant-oat01-" + "X" * 60 + "\n"
-        )
+        f.write("# Report\n\nLeaked key: " + secret_bytes + "\n")
         path = Path(f.name)
-    v = scan(path, use_honeypot=False)
+    v = scan(path, use_honeypot=False, use_lakera=False)
     assert not v.ok
-    # Either the regex layer or secret_shapes may catch it first; both acceptable.
-    assert "anthropic" in v.reason or "secret_shape" in v.reason
+    assert v.reason == "secret_shape:anthropic_oauth_token"
+    # No part of the secret bytes appears in reason or layers.
+    assert secret_bytes not in v.reason
+    for k, val in v.layers.items():
+        assert secret_bytes not in val, f"leaked in layers[{k}]"
+    # First 13 chars are the rule prefix and could appear in `name`;
+    # require the *unique tail* (the X*60 attacker-controlled bytes)
+    # never to leak.
+    assert "X" * 60 not in v.reason
+    for k, val in v.layers.items():
+        assert "X" * 60 not in val, f"leaked in layers[{k}]"
 
 
 def test_orchestrator_blocks_unicode_covert():
@@ -116,7 +189,7 @@ def test_orchestrator_blocks_unicode_covert():
     with tempfile.NamedTemporaryFile("w", suffix=".md", delete=False) as f:
         f.write("benign \u202Emalicious" * 100)
         path = Path(f.name)
-    v = scan(path, use_honeypot=False)
+    v = scan(path, use_honeypot=False, use_lakera=False)
     assert not v.ok
     assert "unicode_anomaly" in v.reason
 
@@ -127,6 +200,102 @@ def test_orchestrator_strips_but_passes_single_zw():
     with tempfile.NamedTemporaryFile("w", suffix=".md", delete=False) as f:
         f.write("clean text " * 500 + "\u200Bcontaminated")
         path = Path(f.name)
-    v = scan(path, use_honeypot=False)
+    v = scan(path, use_honeypot=False, use_lakera=False)
     assert v.ok
     assert "\u200B" not in v.sanitized_text
+
+
+# ----- L4 arbitration wiring (lakera flag + honeypot clean -> judge) -----
+
+def _flagged(_text):
+    from injection_scanner.lakera import LakeraResult
+    return LakeraResult(ok=False, flagged=True, reason="lakera:prompt_attack")
+
+
+def _hp_clean(_text):
+    from injection_scanner.honeypot import HoneypotResult
+    return HoneypotResult(ok=True, reason="pass")
+
+
+def test_lakera_flag_honeypot_clean_judge_benign_delivers(monkeypatch):
+    from injection_scanner import intercept, judge, lakera
+    from injection_scanner.judge import JudgeResult, JudgeVote
+    monkeypatch.setattr(lakera, "check", _flagged)
+    monkeypatch.setattr(intercept, "honeypot_check", _hp_clean)
+    monkeypatch.setattr(judge, "check", lambda _t: JudgeResult(
+        ok=True, reason="benign-unanimous",
+        votes=[JudgeVote("anthropic_haiku45", "benign", "verdict")],
+    ))
+    v = intercept.scan_text("prose about agent tooling", use_honeypot=True, use_lakera=True)
+    assert v.ok
+    assert v.layers["lakera"] == "lakera:prompt_attack"
+    assert v.layers["judge"] == "benign-unanimous"
+
+
+def test_lakera_flag_judge_attack_rejects(monkeypatch):
+    from injection_scanner import intercept, judge, lakera
+    from injection_scanner.judge import JudgeResult
+    monkeypatch.setattr(lakera, "check", _flagged)
+    monkeypatch.setattr(intercept, "honeypot_check", _hp_clean)
+    monkeypatch.setattr(judge, "check", lambda _t: JudgeResult(
+        ok=False, reason="attack:openai_4o_mini"))
+    v = intercept.scan_text("x", use_honeypot=True, use_lakera=True)
+    assert not v.ok
+    assert v.reason == "lakera_arbitration:attack:openai_4o_mini"
+
+
+def test_lakera_flag_honeypot_triggered_rejects_without_judge(monkeypatch):
+    from injection_scanner import intercept, judge, lakera
+    from injection_scanner.honeypot import HoneypotResult
+    monkeypatch.setattr(lakera, "check", _flagged)
+    monkeypatch.setattr(intercept, "honeypot_check", lambda _t: HoneypotResult(
+        ok=False, reason="honeypot:scn:trap:x"))
+    monkeypatch.setattr(judge, "check", lambda _t: (_ for _ in ()).throw(
+        AssertionError("judge must not run when honeypot triggers")))
+    v = intercept.scan_text("x", use_honeypot=True, use_lakera=True)
+    assert not v.ok
+    assert v.reason.startswith("honeypot:")
+
+
+def test_lakera_outage_hard_rejects_without_judge(monkeypatch):
+    from injection_scanner import intercept, judge, lakera
+    from injection_scanner.lakera import LakeraResult
+    monkeypatch.setattr(lakera, "check", lambda _t: LakeraResult(
+        ok=False, reason="lakera_unavailable:no-key"))
+    monkeypatch.setattr(judge, "check", lambda _t: (_ for _ in ()).throw(
+        AssertionError("judge must not run on lakera outage")))
+    v = intercept.scan_text("x", use_honeypot=True, use_lakera=True)
+    assert not v.ok
+    assert v.reason == "lakera_unavailable:no-key"
+
+
+def test_lakera_flag_without_honeypot_hard_rejects(monkeypatch):
+    from injection_scanner import intercept, lakera
+    monkeypatch.setattr(lakera, "check", _flagged)
+    v = intercept.scan_text("x", use_honeypot=False, use_lakera=True)
+    assert not v.ok
+    assert v.reason == "lakera:prompt_attack"
+
+
+def test_lakera_clean_never_calls_judge(monkeypatch):
+    from injection_scanner import intercept, judge, lakera
+    from injection_scanner.lakera import LakeraResult
+    monkeypatch.setattr(lakera, "check", lambda _t: LakeraResult(ok=True, reason="pass"))
+    monkeypatch.setattr(intercept, "honeypot_check", _hp_clean)
+    monkeypatch.setattr(judge, "check", lambda _t: (_ for _ in ()).throw(
+        AssertionError("judge must not run when lakera passes")))
+    v = intercept.scan_text("clean text", use_honeypot=True, use_lakera=True)
+    assert v.ok
+    assert v.reason == "pass"
+
+
+def test_judge_crash_fails_closed(monkeypatch):
+    from injection_scanner import intercept, judge, lakera
+    monkeypatch.setattr(lakera, "check", _flagged)
+    monkeypatch.setattr(intercept, "honeypot_check", _hp_clean)
+    monkeypatch.setattr(judge, "check", lambda _t: (_ for _ in ()).throw(
+        RuntimeError("judge infra down")))
+    v = intercept.scan_text("x", use_honeypot=True, use_lakera=True)
+    assert not v.ok
+    assert v.reason == "judge_unavailable:unhandled:RuntimeError"
+    assert "infra down" not in v.reason

@@ -12,8 +12,6 @@ Each rule has:
   name: short id for the verdict
   pattern: compiled regex
   description: short rationale
-
-These are OR'd with injection_scanner/regex.py; both run over the same text.
 """
 from __future__ import annotations
 

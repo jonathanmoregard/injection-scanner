@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "injection-scanner"
 version = "0.1.0"
-description = "Layered prompt-injection / secret-exfil scanner: unicode sanitize, regex, secret-shape, honeypot."
+description = "Layered prompt-injection / secret-exfil scanner: unicode sanitize, secret-shape, honeypot."
 readme = "README.md"
 requires-python = ">=3.12"
 authors = [{ name = "Jonathan Moregard" }]
