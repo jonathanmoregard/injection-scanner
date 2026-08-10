@@ -250,6 +250,80 @@ def test_quarantine_only_documents_its_single_reveal_destination():
     assert "leak" in doc
 
 
+# ---------- consolidator: the reveal has exactly one call site ----------
+
+def _reveal_reach_sites() -> list[str]:
+    """Every place in the package source that names the reveal method.
+
+    Parsed, not grepped, so the answer survives reformatting, and reported
+    as `module:enclosing.scope` so it survives line-number churn too. Any
+    ATTRIBUTE reference counts, not just a call — binding the bound method
+    to a local (`f = v.honeypot_api_errors.reveal_for_quarantine_record`)
+    and invoking it elsewhere is the same escape with an extra hop.
+    """
+    import ast
+    import pathlib
+
+    import injection_scanner
+
+    class _Finder(ast.NodeVisitor):
+        def __init__(self, module: str) -> None:
+            self.module = module
+            self.scope: list[str] = []
+            self.sites: list[str] = []
+
+        def _scoped(self, node) -> None:
+            self.scope.append(node.name)
+            self.generic_visit(node)
+            self.scope.pop()
+
+        visit_ClassDef = _scoped
+        visit_FunctionDef = _scoped
+        visit_AsyncFunctionDef = _scoped
+
+        def visit_Attribute(self, node: ast.Attribute) -> None:
+            if node.attr == "reveal_for_quarantine_record":
+                where = ".".join(self.scope) or "<module>"
+                self.sites.append(f"{self.module}:{where}")
+            self.generic_visit(node)
+
+        def visit_Name(self, node: ast.Name) -> None:
+            if node.id == "reveal_for_quarantine_record":
+                where = ".".join(self.scope) or "<module>"
+                self.sites.append(f"{self.module}:{where}")
+
+    sites: list[str] = []
+    pkg = pathlib.Path(injection_scanner.__file__).parent
+    for py in sorted(pkg.rglob("*.py")):
+        finder = _Finder(py.relative_to(pkg).as_posix())
+        finder.visit(ast.parse(py.read_text(encoding="utf-8")))
+        sites.extend(finder.sites)
+    return sorted(sites)
+
+
+def test_the_reveal_has_exactly_one_call_site_in_the_package():
+    """Containment must not rest on a reviewer noticing a second caller.
+
+    `reveal_for_quarantine_record()` unwraps attacker-derived bytes. The
+    method is deliberately awkward to type so a second caller reads badly
+    in a diff — but "reads badly" only helps if somebody reads it. This
+    pins the reach mechanically: exactly one unwrap, inside `to_audit()`,
+    whose own contract names the quarantine audit file as the only legal
+    destination.
+
+    If this fails on a legitimate new consumer, the fix is NOT to widen the
+    expected set casually — a second unwrap is a new egress path for report
+    bytes and needs the same deny-listed-directory argument to_audit() has.
+    """
+    assert _reveal_reach_sites() == ["intercept.py:Verdict.to_audit"]
+
+
+def test_the_call_site_scan_would_notice_a_second_caller():
+    """Guard the guard: a scan that silently matches nothing proves nothing."""
+    sites = _reveal_reach_sites()
+    assert sites, "the scanner found no reveal at all — it has stopped working"
+
+
 # ---------- finding 4: to_audit() is an allow-list ----------
 
 def test_new_verdict_field_does_not_auto_flow_into_the_audit_record():
