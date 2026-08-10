@@ -31,10 +31,16 @@ from __future__ import annotations
 import json
 import re
 import types
+import typing
 
 import pytest
 
-from injection_scanner.containment import QuarantineFieldsCoerced, QuarantineOnlyText
+from injection_scanner import containment
+from injection_scanner.containment import (
+    QuarantineFieldsCoerced,
+    QuarantineOnlyText,
+    _OpaqueHolder,
+)
 from injection_scanner.honeypot import HoneypotResult, ScenarioResult
 from injection_scanner.intercept import (
     _AUDIT_QUARANTINE_ONLY_FIELDS,
@@ -757,12 +763,48 @@ def test_a_broken_repr_on_a_field_does_not_break_construction():
     assert "BOOM-CANARY" not in json.dumps(v.to_audit())
 
 
-# name -> holder class, keyed by the annotation as written in the source
-# (`from __future__ import annotations` makes `field.type` a string).
-_HOLDER_ANNOTATIONS = {
-    "QuarantineOnly": QuarantineOnly,
-    "QuarantineOnlyText": QuarantineOnlyText,
-}
+def _holder_in(hint: object) -> type | None:
+    """The holder class inside an annotation, however it is nested.
+
+    Recurses through `get_args`, so `QuarantineOnly | None`,
+    `Optional[...]` and `Annotated[...]` all resolve to the holder they
+    contain rather than being skipped.
+    """
+    if isinstance(hint, type) and issubclass(hint, _OpaqueHolder):
+        return hint
+    for arg in typing.get_args(hint):
+        found = _holder_in(arg)
+        if found is not None:
+            return found
+    return None
+
+
+def _holder_typed_fields(cls) -> dict[str, type]:
+    """Field name -> holder class, for every holder-typed field on `cls`.
+
+    Resolves annotations to OBJECTS via `typing.get_type_hints` instead of
+    string-matching `field.type`. Under `from __future__ import
+    annotations` every annotation is a string, so the earlier bare-name
+    table (`{"QuarantineOnly": ...}`) silently skipped any other spelling:
+    a field annotated `containment.QuarantineOnly`, or
+    `QuarantineOnlyText | None`, was left uncoerced while this guard
+    reported green. A guard that passes when the invariant is broken is
+    worse than no guard, because it is the thing a reviewer trusts instead
+    of checking.
+
+    Matching is against `_OpaqueHolder` rather than an enumerated pair, so
+    a third holder added later is covered without editing this list — the
+    same drift the guard exists to catch, one level up.
+    """
+    import dataclasses
+
+    hints = typing.get_type_hints(cls)
+    found = {}
+    for f in dataclasses.fields(cls):
+        holder = _holder_in(hints.get(f.name))
+        if holder is not None:
+            found[f.name] = holder
+    return found
 
 
 @pytest.mark.parametrize(
@@ -778,15 +820,71 @@ def test_every_holder_typed_field_is_declared_for_coercion(cls):
     (an entry naming a field that no longer exists) is dead weight that
     hides the same gap.
     """
-    import dataclasses
-
-    annotated = {
-        f.name: _HOLDER_ANNOTATIONS[f.type]
-        for f in dataclasses.fields(cls)
-        if f.type in _HOLDER_ANNOTATIONS
-    }
+    annotated = _holder_typed_fields(cls)
     assert annotated, f"{cls.__name__} has no holder-typed field to guard"
     assert annotated == dict(cls._QUARANTINE_FIELDS)
+
+
+@pytest.mark.parametrize("spelling", ["qualified", "union", "optional",
+                                      "annotated"])
+def test_the_drift_guard_sees_every_spelling_of_the_annotation(spelling):
+    """Guard the guard, with the spellings that used to slip past it.
+
+    Each class below declares a holder-typed field and deliberately omits
+    it from `_QUARANTINE_FIELDS`. The guard must FAIL on all of them; the
+    bare-name version passed every one, reporting green over a field that
+    stayed a bare `str` and leaked through `repr()`.
+    """
+    import dataclasses
+
+    if spelling == "qualified":
+        @dataclasses.dataclass
+        class Sample(QuarantineFieldsCoerced):
+            _QUARANTINE_FIELDS = {}
+            detail: containment.QuarantineOnlyText = dataclasses.field(
+                default_factory=QuarantineOnlyText
+            )
+    elif spelling == "union":
+        @dataclasses.dataclass
+        class Sample(QuarantineFieldsCoerced):  # noqa: F811
+            _QUARANTINE_FIELDS = {}
+            detail: QuarantineOnlyText | None = None
+    elif spelling == "optional":
+        @dataclasses.dataclass
+        class Sample(QuarantineFieldsCoerced):  # noqa: F811
+            _QUARANTINE_FIELDS = {}
+            detail: typing.Optional[QuarantineOnlyText] = None  # noqa: UP045
+    else:
+        @dataclasses.dataclass
+        class Sample(QuarantineFieldsCoerced):  # noqa: F811
+            _QUARANTINE_FIELDS = {}
+            detail: typing.Annotated[QuarantineOnlyText, "audit"] = (
+                dataclasses.field(default_factory=QuarantineOnlyText)
+            )
+
+    # The raw string the old guard matched on never equals a bare holder
+    # name for any of these — which is exactly why it passed.
+    raw = {f.type for f in dataclasses.fields(Sample)}
+    assert not raw & {"QuarantineOnly", "QuarantineOnlyText"}
+
+    assert _holder_typed_fields(Sample) == {"detail": QuarantineOnlyText}
+    with pytest.raises(AssertionError):
+        test_every_holder_typed_field_is_declared_for_coercion(Sample)
+
+
+def test_the_drift_guard_matches_any_holder_not_an_enumerated_pair():
+    """A third holder must be covered without editing the guard."""
+    class ThirdHolder(_OpaqueHolder):
+        __slots__ = ()
+
+        def _redaction(self) -> str:
+            return "ThirdHolder(<redacted>)"
+
+    assert _holder_in(ThirdHolder) is ThirdHolder
+    assert _holder_in(ThirdHolder | None) is ThirdHolder
+    # And a non-holder annotation is still ignored.
+    assert _holder_in(str) is None
+    assert _holder_in(dict[str, str]) is None
 
 
 def test_the_coercion_declaration_is_not_itself_a_dataclass_field():
