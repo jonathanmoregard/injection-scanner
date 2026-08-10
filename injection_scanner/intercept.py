@@ -267,9 +267,13 @@ def scan_text(raw: str, use_honeypot: bool = True, use_lakera: bool = True) -> V
     layers: dict[str, str] = {}
     # Audit-only provider diagnostics from L3; stays empty unless a honeypot
     # probe hit a provider API error. Populated after the honeypot runs and
-    # threaded into every Verdict reachable from that point onwards. Held in
-    # the QuarantineOnly wrapper from the moment it exists, so there is no
-    # window in which it is a bare dict that could be logged by accident.
+    # threaded into every Verdict reachable from that point onwards. THIS
+    # LOCAL is a QuarantineOnly from its first binding and is never rebound
+    # to a bare dict, so no code path in this function can render the payload
+    # by accident. That is a claim about this variable only: the same payload
+    # exists unwrapped on `HoneypotResult.api_error_details` — guarded by
+    # `repr=False`, which is weaker — from the moment honeypot_check returns
+    # until it is copied into the wrapper below.
     hp_api_errors = QuarantineOnly()
 
     # L0
