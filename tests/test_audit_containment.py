@@ -22,6 +22,7 @@ accident.
 from __future__ import annotations
 
 import json
+import re
 
 import pytest
 
@@ -208,6 +209,22 @@ def _norm_doc(obj) -> str:
     return " ".join((obj.__doc__ or "").split()).lower()
 
 
+# A retired phrase is only leak-authorizing as an AFFIRMATIVE claim. The
+# same words under a negation ("not safe to persist anywhere else", "never
+# safe to forward") are the wording we want, so a bare substring test would
+# fail on correct docs with a message saying the opposite of what happened.
+_NEGATED = re.compile(r"(?:\bnot|\bnever|\bno longer)\s+$")
+
+
+def _affirmative_hits(doc: str, phrase: str) -> list[str]:
+    """Occurrences of `phrase` in `doc` that are not immediately negated."""
+    return [
+        doc[max(0, m.start() - 30):m.end()]
+        for m in re.finditer(re.escape(phrase), doc)
+        if not _NEGATED.search(doc[:m.start()])
+    ]
+
+
 def test_to_audit_contract_names_one_destination_and_forbids_the_rest():
     """The docstring IS the containment control for a human caller.
 
@@ -220,14 +237,15 @@ def test_to_audit_contract_names_one_destination_and_forbids_the_rest():
     """
     doc = _norm_doc(Verdict.to_audit)
 
-    # Retired wording that licensed the leak.
+    # Retired wording that licensed the leak, as an affirmative claim only.
     for phrase in (
         "safe to persist",
         "forward to an operator context",
         "safe to forward",
         "never includes any report text",
     ):
-        assert phrase not in doc, f"leak-authorizing wording is back: {phrase}"
+        hits = _affirmative_hits(doc, phrase)
+        assert not hits, f"leak-authorizing wording is back: {hits}"
 
     # The destination has to be stated, and stated as exclusive.
     assert "quarantine" in doc
@@ -242,6 +260,29 @@ def test_to_audit_contract_names_one_destination_and_forbids_the_rest():
 
     # The laundering path a caller has to understand to stay out of trouble.
     assert "echo" in doc
+
+
+def test_retired_phrase_check_fires_on_the_leak_not_on_the_fix():
+    """Both directions of the negation handling, pinned.
+
+    "not safe to persist anywhere else" contains "safe to persist" and is
+    precisely the wording this module wants; a plain substring test would
+    fail it, with a message asserting the opposite of the truth.
+    """
+    for doc, phrase in (
+        ("this record is not safe to persist anywhere else", "safe to persist"),
+        ("it is never safe to forward this record", "safe to forward"),
+        ("the record no longer forward to an operator context",
+         "forward to an operator context"),
+    ):
+        assert not _affirmative_hits(doc, phrase), phrase
+
+    # The regression protection itself is unchanged: an affirmative claim,
+    # anywhere in the docstring, still trips.
+    assert _affirmative_hits("the record is safe to persist to disk",
+                             "safe to persist")
+    assert _affirmative_hits("cannot-negate prefix: safe to forward to ops",
+                             "safe to forward")
 
 
 def test_quarantine_only_documents_its_single_reveal_destination():
