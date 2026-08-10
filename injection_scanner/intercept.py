@@ -44,102 +44,21 @@ zero-FP and survives any future tag rename.
 """
 from __future__ import annotations
 
-from collections.abc import Mapping
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 
 from injection_scanner import decode, judge, lakera, secret_shapes, unicode_sanitize
+from injection_scanner.containment import QuarantineOnly
 from injection_scanner.honeypot import check as honeypot_check
 
-
-class QuarantineOnly:
-    """Opaque holder for values that may embed attacker-controlled bytes.
-
-    A `Verdict` mixes two trust classes. Most fields (`ok`, `reason`,
-    `layers`) are synthesized by the scanner from a fixed vocabulary and
-    are safe anywhere. A few carry text that ultimately originates in the
-    scanned report — directly, or laundered through a provider error body
-    that echoes request fragments back at us.
-
-    A plain `dict[str, str]` annotation makes those two classes look
-    identical at the call site, so a new consumer cannot tell which is
-    which without reading honeypot.py. This type is the marker: any field
-    annotated `QuarantineOnly` is cleared for the quarantine audit file
-    and nothing else.
-
-    It is also a guard, not just a label:
-
-      * `repr` / `str` redact, so `print(verdict)`, an f-string, a log
-        line, or a pytest assertion diff cannot spill the contents — and
-        unlike `field(repr=False)`, that holds even after the value has
-        been pulled off the dataclass into a local.
-      * `json.dumps(..., default=str)` — the exact call the audit writer
-        uses — serializes the redaction, not the payload. A structure
-        that reaches a JSON encoder by some path other than
-        `Verdict.to_audit()` fails closed.
-      * It is deliberately NOT a Mapping: no `__iter__`, no `__getitem__`,
-        no `.items()`. Reading the payload requires naming
-        `reveal_for_quarantine_record()`, which is unpleasant enough to
-        read in a diff that it cannot happen by reflex.
-      * It is deliberately NOT a dataclass, so `dataclasses.asdict()` on
-        a containing dataclass cannot flatten it back into raw strings.
-
-    What it does NOT protect against — known, accepted, and listed here so
-    nobody mistakes this type for a hard boundary:
-
-      * `pickle.dumps(wrapper)` emits the payload as plaintext in the
-        pickle stream, and `copy.deepcopy` reads it the same way, both via
-        `__reduce_ex__`. Anything that serializes objects generically — a
-        cache, a task queue, `multiprocessing`, a crash dumper — therefore
-        carries the raw bytes. Blocking `__reduce__` would close this, but
-        it would also make `dataclasses.asdict()` on a containing `Verdict`
-        raise instead of yielding an opaque wrapper, i.e. it would trade a
-        rare exotic path for the common one the tests pin. Not worth it.
-      * `wrapper._values` is a plain attribute read. `__slots__` blocks new
-        attributes, not access to this one; Python has no private state.
-
-    So the guarantee is narrow and worth stating exactly: this type stops
-    the payload riding an INCIDENTAL rendering or serialization path — a
-    repr, an f-string, a log line, a pytest diff, a `json.dumps`. It cannot
-    stop code that deliberately goes after the payload. Deciding where the
-    bytes are allowed to go is still the caller's job; `to_audit()` is the
-    one place in this package that has made that decision.
-    """
-
-    __slots__ = ("_values",)
-
-    def __init__(self, values: Mapping[str, str] | None = None) -> None:
-        self._values: dict[str, str] = dict(values) if values else {}
-
-    def reveal_for_quarantine_record(self) -> dict[str, str]:
-        """Return the raw mapping. ONE legal destination.
-
-        That destination is the quarantine audit file written by
-        `safeio.write_rejection_audit` — a file in a directory the
-        consuming agent's file-reading tools are deny-listed from, which
-        already carries the full report bytes. Anywhere an LLM can read
-        the result back is a leak, not a diagnostic.
-        """
-        return dict(self._values)
-
-    def __repr__(self) -> str:
-        n = len(self._values)
-        return f"QuarantineOnly(<{n} entr{'y' if n == 1 else 'ies'} redacted>)"
-
-    __str__ = __repr__
-
-    def __bool__(self) -> bool:
-        return bool(self._values)
-
-    def __len__(self) -> int:
-        return len(self._values)
-
-    def __eq__(self, other: object) -> bool:
-        if isinstance(other, QuarantineOnly):
-            return self._values == other._values
-        return NotImplemented
-
-    __hash__ = None  # type: ignore[assignment]  # mutable payload
+# `QuarantineOnly` is defined in `injection_scanner.containment`, not here.
+# It has to be importable by `honeypot.py` — the layer that first touches
+# provider bytes — so the payload can be wrapped at the point of
+# construction rather than here, several hops later. Re-exported under the
+# original name because that is where consumers already import it from; see
+# the containment module docstring for what the holder does and does not
+# guarantee.
+__all__ = ["QuarantineOnly", "Verdict", "scan", "scan_text"]
 
 
 # ---------- to_audit() allow-lists ----------
@@ -291,10 +210,11 @@ def scan_text(raw: str, use_honeypot: bool = True, use_lakera: bool = True) -> V
     # threaded into every Verdict reachable from that point onwards. THIS
     # LOCAL is a QuarantineOnly from its first binding and is never rebound
     # to a bare dict, so no code path in this function can render the payload
-    # by accident. That is a claim about this variable only: the same payload
-    # exists unwrapped on `HoneypotResult.api_error_details` — guarded by
-    # `repr=False`, which is weaker — from the moment honeypot_check returns
-    # until it is copied into the wrapper below.
+    # by accident — and the same now holds upstream: `honeypot.py` wraps at
+    # the point of construction, so `HoneypotResult.api_error_details` is
+    # already a QuarantineOnly and this local is simply that same holder.
+    # There is no longer a window in which the payload is a bare dict on a
+    # public object.
     hp_api_errors = QuarantineOnly()
 
     # L0
@@ -465,7 +385,12 @@ def scan_text(raw: str, use_honeypot: bool = True, use_lakera: bool = True) -> V
         # `hp_api_errors` -> `Verdict.honeypot_api_errors` -> to_audit().
         for s in hp.per_scenario:
             layers[f"honeypot.{s.scenario}"] = f"{s.verdict}:{s.signal}"
-        hp_api_errors = QuarantineOnly(hp.api_error_details)
+        # Already a QuarantineOnly (wrapped in honeypot._run_all). Passed
+        # through as-is: unwrapping to re-wrap here would recreate the bare
+        # dict this channel is built to avoid. The holder exposes no
+        # mutation API, so sharing the object between HoneypotResult and
+        # Verdict cannot let one alias mutate the other.
+        hp_api_errors = hp.api_error_details
         if not hp.ok:
             return Verdict(
                 ok=False,

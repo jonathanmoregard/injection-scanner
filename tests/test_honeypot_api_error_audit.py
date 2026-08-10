@@ -8,9 +8,9 @@ investigation followed.
 
 The fix adds a dedicated audit-only channel:
 
-    ScenarioResult.api_error_detail   (str)
-      -> HoneypotResult.api_error_details   (scenario name -> detail)
-      -> Verdict.honeypot_api_errors        (same mapping)
+    ScenarioResult.api_error_detail   (QuarantineOnlyText)
+      -> HoneypotResult.api_error_details   (QuarantineOnly: name -> detail)
+      -> Verdict.honeypot_api_errors        (the same holder)
       -> Verdict.to_audit()["honeypot_api_errors"]
 
 Containment is unchanged and is pinned here:
@@ -20,6 +20,12 @@ Containment is unchanged and is pinned here:
   * The detail is capped and passed through `unicode_sanitize`.
   * Fail-closed is unchanged: an API error is still Honeypot_Skipped and
     still quarantines the report.
+
+Every hop is an opaque holder, so the payload is only ever a plain string
+inside `_error_detail` and behind an explicit
+`reveal_for_quarantine_record()`. `_detail()` below is this module's one
+place to spell that unwrap; `test_audit_containment.py` pins the holders
+themselves.
 """
 from __future__ import annotations
 
@@ -29,6 +35,7 @@ import httpx
 import pytest
 
 from injection_scanner import honeypot
+from injection_scanner.containment import QuarantineOnlyText
 from injection_scanner.honeypot import ScenarioResult, _run_all
 from injection_scanner.honeypot_scenarios import (
     ALL_SCENARIOS,
@@ -151,6 +158,16 @@ def _call_openai(monkeypatch, exc) -> ScenarioResult:
     return asyncio.run(honeypot._call_openai(SCEN_OPENAI, "report body", [], set()))
 
 
+def _detail(r: ScenarioResult) -> str:
+    """Unwrap the audit-only holder for assertions.
+
+    A test IS the quarantine-side reader, so the unwrap is legitimate here.
+    Kept to one helper so the reveal does not get sprinkled around.
+    """
+    assert isinstance(r.api_error_detail, QuarantineOnlyText)
+    return r.api_error_detail.reveal_for_quarantine_record()
+
+
 # ---------- (a) signal string byte-identical ----------
 
 def test_anthropic_api_error_signal_unchanged(monkeypatch):
@@ -178,7 +195,7 @@ def test_api_error_body_never_reaches_signal(monkeypatch):
 
 def test_anthropic_audit_detail_carries_structured_body(monkeypatch):
     r = _call_anthropic(monkeypatch, _anthropic_bad_request())
-    d = r.api_error_detail
+    d = _detail(r)
     assert "BadRequestError" in d
     assert "invalid_request_error" in d
     assert "credit balance is too low" in d
@@ -189,7 +206,7 @@ def test_anthropic_audit_detail_carries_structured_body(monkeypatch):
 
 def test_openai_audit_detail_carries_structured_body(monkeypatch):
     r = _call_openai(monkeypatch, _openai_bad_request())
-    d = r.api_error_detail
+    d = _detail(r)
     assert "BadRequestError" in d
     assert "insufficient_quota" in d
     assert "exceeded your current quota" in d
@@ -213,7 +230,7 @@ def test_audit_detail_truncated_and_sanitized(monkeypatch, caller):
         r = _call_anthropic(monkeypatch, _anthropic_bad_request(hostile))
     else:
         r = _call_openai(monkeypatch, _openai_bad_request(hostile))
-    d = r.api_error_detail
+    d = _detail(r)
     assert 0 < len(d) <= 300, f"detail not capped: {len(d)}"
     # Covert channels stripped by unicode_sanitize.
     for ch in _COVERT:
@@ -231,8 +248,8 @@ def test_no_structured_body_degrades_to_type_name(monkeypatch):
     marker = "RAW_EXCEPTION_TEXT_KEEPOUT_5150"
     r = _call_anthropic(monkeypatch, RuntimeError(marker))
     assert r.signal == "unavailable:anthropic-api-error:RuntimeError"
-    assert r.api_error_detail == "RuntimeError"
-    assert marker not in r.api_error_detail
+    assert _detail(r) == "RuntimeError"
+    assert marker not in _detail(r)
 
 
 def test_connection_error_without_body_degrades(monkeypatch):
@@ -242,7 +259,7 @@ def test_connection_error_without_body_degrades(monkeypatch):
     exc = anthropic.APIConnectionError(request=request)
     r = _call_anthropic(monkeypatch, exc)
     assert r.signal == "unavailable:anthropic-api-error:APIConnectionError"
-    assert r.api_error_detail == "APIConnectionError"
+    assert _detail(r) == "APIConnectionError"
 
 
 # ---------- aggregation onto HoneypotResult ----------
@@ -256,8 +273,10 @@ def test_run_all_aggregates_api_error_details(monkeypatch):
                 scenario=scenario["name"], verdict="Honeypot_Skipped",
                 signal="unavailable:anthropic-api-error:BadRequestError",
                 provider=scenario["provider"], model=scenario["model"],
-                api_error_detail="BadRequestError type=invalid_request_error "
-                                 "message=credit balance is too low",
+                api_error_detail=QuarantineOnlyText(
+                    "BadRequestError type=invalid_request_error "
+                    "message=credit balance is too low"
+                ),
             )
         return ScenarioResult(
             scenario=scenario["name"], verdict="Honeypot_Left_Alone",
@@ -268,11 +287,16 @@ def test_run_all_aggregates_api_error_details(monkeypatch):
     monkeypatch.setattr(honeypot, "_run_one", fake_run_one)
     res = asyncio.run(_run_all("report"))
     assert res.ok is False  # fail-closed unchanged
-    assert res.api_error_details[target["name"]].startswith("BadRequestError")
+    # The aggregate is a holder, not a bare dict — unwrap once, deliberately.
+    details = res.api_error_details.reveal_for_quarantine_record()
+    assert details[target["name"]].startswith("BadRequestError")
     # Only scenarios that actually errored appear.
-    assert list(res.api_error_details) == [target["name"]]
+    assert list(details) == [target["name"]]
     # Containment: the aggregated reason still carries the type name only.
     assert "credit balance" not in res.reason
+    # ...and the holder itself renders nothing, even for the errored scenario.
+    assert "credit balance" not in repr(res)
+    assert "credit balance" not in repr(res.api_error_details)
 
 
 # ---------- (d) + (e) end-to-end through intercept / to_audit ----------

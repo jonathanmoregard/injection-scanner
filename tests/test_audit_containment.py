@@ -3,9 +3,9 @@
 Commit 9842816 added a deliberate side channel that carries provider
 API-error bodies to the quarantine audit record:
 
-    ScenarioResult.api_error_detail
-      -> HoneypotResult.api_error_details
-      -> Verdict.honeypot_api_errors
+    ScenarioResult.api_error_detail    (QuarantineOnlyText)
+      -> HoneypotResult.api_error_details   (QuarantineOnly)
+      -> Verdict.honeypot_api_errors        (the same holder, passed through)
       -> Verdict.to_audit()["honeypot_api_errors"]
 
 Those bodies are UNTRUSTED: a provider can echo request fragments
@@ -18,6 +18,13 @@ escape through any INCIDENTAL rendering path — a default dataclass repr, a
 `print()`, an f-string, a pytest assertion diff, a `json.dumps` of a
 containing structure — nor through `to_audit()` growing a new field by
 accident.
+
+Every link in the chain is held opaque, including the first two. An
+earlier revision protected only `Verdict.honeypot_api_errors`, leaving the
+payload a bare `dict[str, str]` / `str` on the honeypot result objects —
+`field(repr=False)` hides those from a repr but does nothing about
+`json.dumps(honeypot.check(...).api_error_details)` or a log line. The
+holder is now applied at the point of construction instead.
 """
 from __future__ import annotations
 
@@ -26,6 +33,7 @@ import re
 
 import pytest
 
+from injection_scanner.containment import QuarantineOnlyText
 from injection_scanner.honeypot import HoneypotResult, ScenarioResult
 from injection_scanner.intercept import (
     _AUDIT_QUARANTINE_ONLY_FIELDS,
@@ -52,7 +60,7 @@ def _scenario_result() -> ScenarioResult:
         provider="anthropic",
         model="claude-haiku-4-5",
         raw_excerpt=JUDGE_EXCERPT,
-        api_error_detail=(
+        api_error_detail=QuarantineOnlyText(
             f"BadRequestError status=400 type=invalid_request_error "
             f"message={ECHOED_REQUEST_FRAGMENT}"
         ),
@@ -65,9 +73,9 @@ def _honeypot_result() -> HoneypotResult:
         reason="honeypot_unavailable:A_conversation_history_leak:"
                "unavailable:anthropic-api-error:BadRequestError",
         per_scenario=[_scenario_result()],
-        api_error_details={
+        api_error_details=QuarantineOnly({
             "A_conversation_history_leak": ECHOED_REQUEST_FRAGMENT
-        },
+        }),
     )
 
 
@@ -102,17 +110,105 @@ def test_honeypot_result_repr_hides_untrusted_fields():
 
 
 def test_untrusted_fields_are_still_readable_for_the_audit_record():
-    """repr=False hides, it does not delete. The audit channel still works."""
+    """Containment hides, it does not delete. The audit channel still works."""
     r = _scenario_result()
-    assert ECHOED_REQUEST_FRAGMENT in r.api_error_detail
+    assert ECHOED_REQUEST_FRAGMENT in r.api_error_detail.reveal_for_quarantine_record()
     assert r.raw_excerpt == JUDGE_EXCERPT
     hp = _honeypot_result()
-    assert hp.api_error_details["A_conversation_history_leak"] == (
-        ECHOED_REQUEST_FRAGMENT
+    revealed = hp.api_error_details.reveal_for_quarantine_record()
+    assert revealed["A_conversation_history_leak"] == ECHOED_REQUEST_FRAGMENT
+    # And what comes out of the reveal is plain JSON-serializable data, so
+    # the quarantine writer can still persist it.
+    assert "TAINT-CANARY-9f3a1c" in json.dumps(revealed)
+
+
+# ---------- cross-vendor finding: hold at construction, not at Verdict ----------
+#
+# `field(repr=False)` on a bare `dict[str, str]` / `str` only suppresses the
+# DEFAULT DATACLASS REPR. The value itself stays a plain builtin, so any
+# caller holding a `HoneypotResult` can dump it. `honeypot.check()` is public
+# and its result is not confined to the quarantine channel, so the window
+# between "provider error parsed" and "Verdict assembled" was a real egress
+# path, not a theoretical one.
+
+def test_honeypot_result_api_errors_is_not_a_bare_dict():
+    """The repro: `json.dumps(honeypot.check(...).api_error_details)`."""
+    errors = _honeypot_result().api_error_details
+
+    assert not isinstance(errors, dict)
+    assert isinstance(errors, QuarantineOnly)
+    # The leak as it was written, now redacted.
+    blob = json.dumps(errors, default=str)
+    assert "TAINT-CANARY-9f3a1c" not in blob
+    assert "redacted" in blob
+    # Without `default=`, an accidental dump raises rather than leaking.
+    with pytest.raises(TypeError):
+        json.dumps(errors)
+    # Every silent read path a dict would have offered is closed.
+    for attr in ("items", "keys", "values", "get", "__getitem__", "__iter__"):
+        assert not hasattr(errors, attr), f"{attr} is a silent read path"
+    for rendered in (repr(errors), str(errors), f"{errors}"):
+        assert "TAINT-CANARY-9f3a1c" not in rendered
+    # Truthiness/size still answer "did any scenario error?" with no unwrap.
+    assert bool(errors) is True
+    assert len(errors) == 1
+
+
+def test_scenario_result_api_error_detail_is_not_a_bare_str():
+    """Same exposure one level down, on the per-scenario field."""
+    detail = _scenario_result().api_error_detail
+
+    assert not isinstance(detail, str)
+    assert isinstance(detail, QuarantineOnlyText)
+    for rendered in (repr(detail), str(detail), f"{detail}", "{}".format(detail)):  # noqa: UP032
+        assert "TAINT-CANARY-9f3a1c" not in rendered
+        assert "redacted" in rendered
+    assert "TAINT-CANARY-9f3a1c" not in json.dumps({"d": detail}, default=str)
+    with pytest.raises(TypeError):
+        json.dumps({"d": detail})
+    # Not a str subclass: it cannot be concatenated or interpolated into a
+    # signal/reason string by reflex.
+    with pytest.raises(TypeError):
+        "prefix " + detail  # type: ignore[operator]
+    # `==` against a raw string is not an unwrap oracle either.
+    assert detail != ECHOED_REQUEST_FRAGMENT
+    assert bool(detail) is True
+    assert bool(QuarantineOnlyText()) is False
+
+
+def test_the_holder_is_applied_where_the_provider_bytes_are_parsed():
+    """Pin the boundary's LOCATION, not just its existence.
+
+    If a future refactor moves the wrap back out to `intercept`, the
+    unwrapped window returns while every other test here still passes.
+    """
+    from injection_scanner.honeypot import _error_detail
+
+    class _Err(Exception):
+        status_code = 400
+        body = {
+            "type": "error",
+            "error": {"type": "invalid_request_error",
+                      "message": ECHOED_REQUEST_FRAGMENT},
+        }
+
+    detail = _error_detail(_Err("unused str(e)"))
+    assert isinstance(detail, QuarantineOnlyText)
+    assert "TAINT-CANARY-9f3a1c" in detail.reveal_for_quarantine_record()
+    assert "TAINT-CANARY-9f3a1c" not in repr(detail)
+
+
+def test_verdict_reuses_the_honeypot_holder_without_a_bare_dict_hop():
+    """intercept must pass the holder through, not unwrap and re-wrap."""
+    import inspect
+
+    from injection_scanner import intercept
+
+    src = inspect.getsource(intercept.scan_text)
+    assert "hp_api_errors = hp.api_error_details" in src, (
+        "scan_text no longer passes the honeypot holder straight through"
     )
-    # And it is plain JSON-serializable data, so the quarantine writer can
-    # still persist it.
-    assert "TAINT-CANARY-9f3a1c" in json.dumps(hp.api_error_details)
+    assert "QuarantineOnly(hp." not in src, "re-wrapping implies an unwrap"
 
 
 # ---------- finding 3: Verdict.honeypot_api_errors ----------
@@ -285,8 +381,11 @@ def test_retired_phrase_check_fires_on_the_leak_not_on_the_fix():
                              "safe to forward")
 
 
-def test_quarantine_only_documents_its_single_reveal_destination():
-    doc = _norm_doc(QuarantineOnly.reveal_for_quarantine_record)
+@pytest.mark.parametrize(
+    "holder", [QuarantineOnly, QuarantineOnlyText], ids=["mapping", "text"]
+)
+def test_quarantine_only_documents_its_single_reveal_destination(holder):
+    doc = _norm_doc(holder.reveal_for_quarantine_record)
     assert "quarantine" in doc
     assert "leak" in doc
 
@@ -342,21 +441,42 @@ def _reveal_reach_sites() -> list[str]:
     return sorted(sites)
 
 
-def test_the_reveal_has_exactly_one_call_site_in_the_package():
+# The complete inventory of unwraps in the package. Enumerated, never a
+# wildcard or a count: each entry is an egress path for attacker-derived
+# bytes and has to earn its place individually.
+#
+#   containment.py:QuarantineOnly.from_texts
+#       Holder-to-holder transfer, inside the containment module. Reads the
+#       per-scenario `QuarantineOnlyText` payloads only to re-key them into
+#       one `QuarantineOnly`; the raw strings never leave the expression,
+#       and what the caller gets back is wrapped again. The alternative —
+#       having honeypot._run_all unwrap each detail into a plain dict — is
+#       the very window the holders were introduced to remove.
+#   intercept.py:Verdict.to_audit
+#       The one unwrap that produces raw bytes for a consumer, and the only
+#       one whose destination (the deny-listed quarantine audit file) is
+#       argued for in its own docstring.
+_EXPECTED_REVEAL_SITES = [
+    "containment.py:QuarantineOnly.from_texts",
+    "intercept.py:Verdict.to_audit",
+]
+
+
+def test_the_reveal_has_exactly_the_expected_call_sites_in_the_package():
     """Containment must not rest on a reviewer noticing a second caller.
 
     `reveal_for_quarantine_record()` unwraps attacker-derived bytes. The
-    method is deliberately awkward to type so a second caller reads badly
-    in a diff — but "reads badly" only helps if somebody reads it. This
-    pins the reach mechanically: exactly one unwrap, inside `to_audit()`,
-    whose own contract names the quarantine audit file as the only legal
-    destination.
+    method is deliberately awkward to type so a new caller reads badly in a
+    diff — but "reads badly" only helps if somebody reads it. This pins the
+    reach mechanically against a named list.
 
     If this fails on a legitimate new consumer, the fix is NOT to widen the
-    expected set casually — a second unwrap is a new egress path for report
-    bytes and needs the same deny-listed-directory argument to_audit() has.
+    expected set casually, and never to relax it to a wildcard or a count —
+    each unwrap is an egress path for report bytes and needs the same
+    deny-listed-directory argument to_audit() has, written down next to its
+    entry above.
     """
-    assert _reveal_reach_sites() == ["intercept.py:Verdict.to_audit"]
+    assert _reveal_reach_sites() == _EXPECTED_REVEAL_SITES
 
 
 def test_the_call_site_scan_would_notice_a_second_caller():

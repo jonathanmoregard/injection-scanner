@@ -33,6 +33,7 @@ from dataclasses import dataclass, field
 from typing import Literal
 
 from injection_scanner import unicode_sanitize
+from injection_scanner.containment import QuarantineOnly, QuarantineOnlyText
 from injection_scanner.keyloader import KeyConfigError, load_key
 from injection_scanner.honeypot_scenarios import (
     ALL_CANARIES,
@@ -82,10 +83,17 @@ class ScenarioResult:
     # `_error_detail`). Deliberately NOT part of `signal` — it flows only to
     # the quarantine audit record, which already carries full report text and
     # is never read back into an interactive session. Never interpolate this
-    # into `signal`, `reason`, or `Verdict.layers`. `repr=False` for the same
-    # reason as `raw_excerpt` above: a provider error message can echo request
-    # fragments derived from the report body.
-    api_error_detail: str = field(default="", repr=False)
+    # into `signal`, `reason`, or `Verdict.layers`.
+    #
+    # Typed `QuarantineOnlyText`, not `str`, and wrapped by `_error_detail`
+    # at the moment the provider bytes are first read: a bare `str` here is
+    # a payload that any caller can log, f-string or `json.dumps` straight
+    # out of the audit channel, and `repr=False` does not follow the value
+    # once it has been pulled off the dataclass. `repr=False` is kept on top
+    # of the holder purely to keep the default repr terse.
+    api_error_detail: QuarantineOnlyText = field(
+        default_factory=QuarantineOnlyText, repr=False
+    )
 
 
 @dataclass
@@ -95,9 +103,14 @@ class HoneypotResult:
     per_scenario: list[ScenarioResult] = field(default_factory=list)
     # AUDIT-ONLY, scenario name -> `ScenarioResult.api_error_detail`. Only
     # scenarios that actually hit a provider error appear. Same containment
-    # rule as the per-scenario field: audit record only, and `repr=False` so
-    # it cannot ride a default repr out of the audit channel.
-    api_error_details: dict[str, str] = field(default_factory=dict, repr=False)
+    # rule and the same holder as the per-scenario field: audit record only.
+    # This is the object `intercept` hands straight to
+    # `Verdict.honeypot_api_errors` — no unwrap/re-wrap in between, so there
+    # is no window anywhere on the public result objects where the payload
+    # is a bare dict.
+    api_error_details: QuarantineOnly = field(
+        default_factory=QuarantineOnly, repr=False
+    )
 
 
 # ---------- provider API-error diagnostics (audit-only) ----------
@@ -124,7 +137,10 @@ class HoneypotResult:
 # Even the structured body is treated as untrusted: a provider can echo
 # request fragments back (`messages.0.content: ...`), so the extracted text
 # is control-stripped, whitespace-flattened, run through the L0
-# `unicode_sanitize` covert-channel stripper, and hard-capped.
+# `unicode_sanitize` covert-channel stripper, and hard-capped. It is also
+# wrapped in a `QuarantineOnlyText` holder before it lands on any result
+# object, so it cannot ride a print/log/`json.dumps` out of the audit
+# channel — see `injection_scanner.containment`.
 
 _API_ERROR_DETAIL_MAX = 300
 _REQUEST_ID_MAX = 64
@@ -164,8 +180,15 @@ def _clean_request_id(value: object) -> str | None:
     return v
 
 
-def _error_detail(e: BaseException) -> str:
-    """Audit-only diagnostic string for a provider API failure.
+def _error_detail(e: BaseException) -> QuarantineOnlyText:
+    """Audit-only diagnostic for a provider API failure.
+
+    Returns a `QuarantineOnlyText`, never a bare `str`: this function is
+    the point of construction for provider-derived bytes, so it is where
+    the trust boundary has to be applied. Handing back a plain string —
+    even one destined for a `repr=False` field — would leave the payload
+    freely printable on the way there and freely printable again for any
+    caller that reads the field back off the dataclass.
 
     Reads the SDK exception's structured attributes only. Two body shapes
     are handled, both verified against the installed SDKs:
@@ -224,7 +247,7 @@ def _error_detail(e: BaseException) -> str:
     detail = " ".join(parts)
     if len(detail) > _API_ERROR_DETAIL_MAX:
         detail = detail[: _API_ERROR_DETAIL_MAX - 3] + "..."
-    return detail
+    return QuarantineOnlyText(detail)
 
 
 # ---------- secret loading ----------
@@ -697,9 +720,13 @@ async def _run_all(report_text: str) -> HoneypotResult:
 
     # AUDIT-ONLY side channel. Keyed by scenario name; only scenarios that
     # actually hit a provider error contribute. Never folded into `reason`.
-    api_error_details = {
+    #
+    # `from_texts` re-keys the per-scenario holders into one holder without
+    # the payload ever becoming a bare `str` in this scope — the truthiness
+    # filter reads `QuarantineOnlyText.__bool__`, not the string.
+    api_error_details = QuarantineOnly.from_texts({
         r.scenario: r.api_error_detail for r in results if r.api_error_detail
-    }
+    })
 
     triggered = [r for r in results if r.verdict == "Honeypot_Triggered"]
     # Defensive: anything that's not explicitly Triggered or Left_Alone
