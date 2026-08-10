@@ -242,6 +242,122 @@ def test_audit_detail_truncated_and_sanitized(monkeypatch, caller):
     assert "messages.0.content" in d
 
 
+# ---------- cross-vendor finding: the cap must follow the scrub ----------
+#
+# The cap used to be applied to the RAW message, before scrubbing. Every
+# character the scrubber later deletes therefore cost budget, so an echoed
+# prefix of invisible characters — free to send, and derived from the
+# attacker's own report text — could burn the entire allowance and truncate
+# the real provider diagnostic away. The report bytes silenced the
+# diagnostic without ever appearing in it.
+
+# One representative of each class `_scrub` removes: zero-width space, tag
+# block, variation-selector supplement, bidi override, word joiner, and a
+# C0 control.
+_STRIPPED_CLASSES = "​\U000e0041\U000e0100‮⁠\x01"
+
+
+@pytest.mark.parametrize("caller", ["anthropic", "openai"])
+def test_stripped_prefix_cannot_burn_the_content_budget(monkeypatch, caller):
+    """The repro, at four times the old pre-scrub slice."""
+    from injection_scanner.honeypot import _API_ERROR_DETAIL_MAX
+
+    real = "Your credit balance is too low to access the Anthropic API."
+    burner = _STRIPPED_CLASSES * (_API_ERROR_DETAIL_MAX * 4)
+    assert len(burner) > _API_ERROR_DETAIL_MAX * 4  # the old budget, exhausted
+
+    if caller == "anthropic":
+        r = _call_anthropic(monkeypatch, _anthropic_bad_request(burner + real))
+    else:
+        r = _call_openai(monkeypatch, _openai_bad_request(burner + real))
+    d = _detail(r)
+
+    assert "credit balance is too low" in d, (
+        "an invisible prefix truncated the real diagnostic away"
+    )
+    assert len(d) <= _API_ERROR_DETAIL_MAX
+    for ch in _STRIPPED_CLASSES:
+        assert ch not in d
+
+
+def test_scrub_leaves_no_whitespace_residue_from_stripped_characters():
+    """The subtler half of the same bug, pinned directly on `_scrub`.
+
+    Deleting covert characters from between whitespace, or folding NBSP to
+    U+0020, both manufacture blanks. If the whitespace collapse has already
+    run by then, those blanks survive and an all-covert prefix still eats
+    the content budget — just as spaces instead of invisibles.
+    """
+    from injection_scanner.honeypot import _scrub
+
+    out = _scrub("before" + _STRIPPED_CLASSES * 100 + "after")
+    assert out == "before after"
+    assert "  " not in out
+    # NBSP folds to U+0020 under NFKC; that has to be collapsed too.
+    assert _scrub("a   b") == "a b"
+    # A run with nothing but strippable content leaves nothing behind.
+    assert _scrub(_STRIPPED_CLASSES * 50) == ""
+
+
+def test_scrub_input_stays_bounded_for_an_oversized_body(monkeypatch):
+    """The pre-slice is a DoS bound, so it must still bound.
+
+    Reordering must not have turned "scrub then cap" into "normalize an
+    arbitrarily large provider body".
+    """
+    from injection_scanner.honeypot import _API_ERROR_DETAIL_MAX, _SCRUB_INPUT_MAX
+
+    assert _SCRUB_INPUT_MAX > _API_ERROR_DETAIL_MAX  # bound, not budget
+
+    past_the_bound = "PAST-THE-DOS-BOUND-MARKER-4d1e"
+    huge = "​" * (_SCRUB_INPUT_MAX * 4) + past_the_bound
+    r = _call_anthropic(monkeypatch, _anthropic_bad_request(huge))
+    d = _detail(r)
+
+    assert past_the_bound not in d
+    assert len(d) <= _API_ERROR_DETAIL_MAX
+    # Degrades to the cheap high-value fields, exactly like a body-less error.
+    assert d.startswith("BadRequestError")
+    assert ANTHROPIC_REQUEST_ID in d
+
+
+def test_cap_cannot_split_a_multibyte_sequence(monkeypatch):
+    """Slicing is by code point, so the UTF-8 encoding stays well-formed."""
+    from injection_scanner.honeypot import _API_ERROR_DETAIL_MAX
+
+    # Astral (4-byte) and BMP 3-byte characters, so the cap lands mid-run
+    # whichever offset it falls at.
+    hostile = ("𝔘𝔫𝔦𝔠𝔬𝔡𝔢 ⚠ 日本語 " * 200)
+    r = _call_anthropic(monkeypatch, _anthropic_bad_request(hostile))
+    d = _detail(r)
+
+    assert len(d) == _API_ERROR_DETAIL_MAX  # truncation actually happened
+    assert d.endswith("...")
+    # Well-formed both ways, and no replacement character was manufactured.
+    assert d.encode("utf-8").decode("utf-8") == d
+    assert "�" not in d
+    # And it survives the audit writer's encoder unchanged.
+    import json
+    assert json.loads(json.dumps({"d": d}))["d"] == d
+
+
+def test_no_line_break_survives_into_the_jsonl_audit_row(monkeypatch):
+    """A raw newline would split one audit record into two JSONL rows."""
+    import json
+
+    breaks = "\n\r\r\n\v\f\x1c\x1d\x1e\x85  "
+    hostile = f"line one{breaks}line two: quota exceeded"
+    r = _call_anthropic(monkeypatch, _anthropic_bad_request(hostile))
+    d = _detail(r)
+
+    for ch in breaks:
+        assert ch not in d, f"line break {ch!r} survived the scrub"
+    assert "line one line two" in d  # flattened, not deleted
+    # The writer emits one `json.dumps(...) + "\n"` per record.
+    row = json.dumps({"honeypot_api_errors": {"A": d}}, default=str)
+    assert "\n" not in row
+
+
 # ---------- graceful degradation: no structured body ----------
 
 def test_no_structured_body_degrades_to_type_name(monkeypatch):

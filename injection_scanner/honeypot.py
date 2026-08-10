@@ -142,8 +142,28 @@ class HoneypotResult:
 # object, so it cannot ride a print/log/`json.dumps` out of the audit
 # channel — see `injection_scanner.containment`.
 
+# CONTENT budget: how much surviving, scrubbed provider text each field
+# may contribute, and the cap on the assembled detail line.
 _API_ERROR_DETAIL_MAX = 300
 _REQUEST_ID_MAX = 64
+
+# DoS bound, NOT a content bound — the two must not be confused, because
+# the ordering between them is exactly what this constant exists to fix.
+#
+# `_scrub` walks the fragment one code point at a time and then
+# NFKC-normalizes it, so an adversarially long provider body must not buy
+# an unbounded pass; anything past this is dropped before scrubbing. The
+# CONTENT budget above is then applied to what SURVIVES the scrub.
+#
+# Deliberately far above `_API_ERROR_DETAIL_MAX`. Spending the content
+# budget first is the bug: an echoed prefix made of characters the scrubber
+# deletes (zero-width marks, tag-block bytes, control chars) costs nothing
+# to send and would burn the whole allowance, leaving the genuinely useful
+# provider diagnostic truncated away — the report bytes silence the
+# diagnostic without ever appearing in it. Real provider messages run to a
+# few hundred characters; 16 KiB is far past any of them and is still
+# trivially bounded work.
+_SCRUB_INPUT_MAX = 16384
 
 
 def _scrub(text: str) -> str:
@@ -153,14 +173,40 @@ def _scrub(text: str) -> str:
       1. C0/C1 control characters (NUL, ESC, ...) -> space. These are outside
          `unicode_sanitize`'s remit but would corrupt a terminal or log
          viewer rendering the audit record.
-      2. Collapse all whitespace runs so the detail stays a single audit line.
-      3. `unicode_sanitize.sanitize` — strips the tag block, variation
+      2. `unicode_sanitize.sanitize` — strips the tag block, variation
          selectors, bidi overrides and zero-width marks, and NFKC-normalizes,
          exactly as L0 does to the report body itself.
+      3. Collapse all whitespace runs so the detail stays a single audit line.
+
+    The collapse goes LAST on purpose. Run before the strip, it collapses
+    the whitespace that exists at the time and then pass 2 removes covert
+    characters from between the survivors — leaving behind the separator
+    spaces of an all-covert run, and NFKC-derived spaces (NBSP and friends
+    fold to U+0020) uncollapsed on top. An attacker-echoed prefix would
+    then still reach the caller as hundreds of blanks, spending the content
+    budget on characters that carry no diagnostic. Collapsing after every
+    deletion and every normalization means whitespace runs are collapsed
+    once, at the end, over the final text.
+
+    `str.split()` covers every Unicode whitespace class, so U+2028/U+2029
+    and U+0085 go the same way as `\\n` — nothing that could break the
+    one-line JSONL audit row survives pass 3, and nothing downstream can
+    reintroduce one.
     """
     flat = "".join(" " if unicodedata.category(ch) == "Cc" else ch for ch in text)
-    flat = " ".join(flat.split())
-    return unicode_sanitize.sanitize(flat).text
+    cleaned = unicode_sanitize.sanitize(flat).text
+    return " ".join(cleaned.split())
+
+
+def _scrub_capped(text: str, keep: int) -> str:
+    """Scrub first, cap second — the content budget buys surviving characters.
+
+    The pre-slice is the DoS bound only (`_SCRUB_INPUT_MAX`); `keep` is the
+    content budget and is spent on post-scrub output. Slicing is by code
+    point, so the cap can never split a multi-byte UTF-8 sequence: the
+    encode happens later, on the whole string.
+    """
+    return _scrub(text[:_SCRUB_INPUT_MAX])[:keep]
 
 
 def _clean_request_id(value: object) -> str | None:
@@ -224,12 +270,13 @@ def _error_detail(e: BaseException) -> QuarantineOnlyText:
         node = inner if isinstance(inner, dict) else body
         raw_type = node.get("type")
         raw_message = node.get("message")
+        # Scrub, then cap. A fragment that scrubs away to nothing is left
+        # falsy and simply omitted below, rather than occupying the line
+        # with an empty `type=` / `message=`.
         if isinstance(raw_type, str) and raw_type:
-            err_type = _scrub(raw_type[:_API_ERROR_DETAIL_MAX])
+            err_type = _scrub_capped(raw_type, _API_ERROR_DETAIL_MAX)
         if isinstance(raw_message, str) and raw_message:
-            # Slice before scrubbing: an adversarially long message
-            # shouldn't cost a full-length sanitize pass.
-            err_message = _scrub(raw_message[: _API_ERROR_DETAIL_MAX * 4])
+            err_message = _scrub_capped(raw_message, _API_ERROR_DETAIL_MAX)
 
     if err_type:
         parts.append(f"type={err_type}")
