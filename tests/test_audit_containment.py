@@ -402,6 +402,30 @@ def test_audit_record_keys_are_exactly_the_classified_set():
     }
 
 
+def test_sanitize_stat_allow_list_tracks_SanitizeResult():
+    """The allow-list is a copy of another module's field list.
+
+    Copies drift. A counter added to `SanitizeResult` would vanish from
+    every audit record with nothing failing, so pin the roster to its
+    source: exactly the dataclass's fields, minus `text` — the report body,
+    which is excluded by construction and must stay excluded.
+    """
+    import dataclasses
+
+    from injection_scanner.intercept import _AUDIT_SANITIZE_STAT_KEYS
+    from injection_scanner.unicode_sanitize import SanitizeResult
+
+    expected = {f.name for f in dataclasses.fields(SanitizeResult)} - {"text"}
+    assert set(_AUDIT_SANITIZE_STAT_KEYS) == expected, (
+        "_AUDIT_SANITIZE_STAT_KEYS has drifted from SanitizeResult. Add the "
+        "new counter here on purpose (or add it to the exclusion above if it "
+        "carries report bytes rather than a count)."
+    )
+    # No duplicates: the tuple is the record's key order, not a bag.
+    assert len(_AUDIT_SANITIZE_STAT_KEYS) == len(set(_AUDIT_SANITIZE_STAT_KEYS))
+    assert "text" not in _AUDIT_SANITIZE_STAT_KEYS
+
+
 def test_sanitize_stats_allow_list_drops_unknown_keys():
     """Same inversion one level down: `text` is excluded by construction."""
     v = _verdict(sanitize_stats={
