@@ -26,7 +26,12 @@ import json
 import pytest
 
 from injection_scanner.honeypot import HoneypotResult, ScenarioResult
-from injection_scanner.intercept import QuarantineOnly, Verdict
+from injection_scanner.intercept import (
+    _AUDIT_QUARANTINE_ONLY_FIELDS,
+    _AUDIT_SAFE_FIELDS,
+    QuarantineOnly,
+    Verdict,
+)
 
 # Bytes shaped like the real threat: a provider echoing a request fragment
 # that is really the attacker's own report text.
@@ -266,6 +271,53 @@ def test_new_verdict_field_does_not_auto_flow_into_the_audit_record():
     ).to_audit()
     assert "new_untrusted_field" not in audit
     assert "FUTURE-TAINT-5150" not in json.dumps(audit, default=str)
+
+
+# Verdict fields that to_audit() reaches through NEITHER allow-list, on
+# purpose: `sanitize_stats` is filtered one level down by
+# `_AUDIT_SANITIZE_STAT_KEYS`, and `sanitized_text` contributes only its
+# length, as `sanitized_len`. Anything else must be classified.
+_KNOWN_UNLISTED_VERDICT_FIELDS = frozenset({"sanitize_stats", "sanitized_text"})
+
+
+def test_every_verdict_field_is_classified_exactly_once():
+    """Fail-closed must not also mean fail-silent.
+
+    Dropping an unrecognised field is the right behaviour, but it happens
+    with no signal: a contributor who adds a field to `Verdict` gets a
+    green suite and an audit record that quietly lost the field, and the
+    only thing standing between that and production is someone noticing
+    the absence of a diff on `to_audit()`. This test is that signal — a
+    new field fails here until it is named in one of the two allow-lists
+    or in the known-remainder set above.
+    """
+    import dataclasses
+
+    names = [f.name for f in dataclasses.fields(Verdict)]
+    safe = set(_AUDIT_SAFE_FIELDS)
+    quarantine = set(_AUDIT_QUARANTINE_ONLY_FIELDS)
+
+    # "Exactly one" bucket, not "at least one": a QuarantineOnly field that
+    # also counted as safe would be copied through unwrapped by the first
+    # loop in to_audit().
+    assert not safe & quarantine
+    assert not (safe | quarantine) & _KNOWN_UNLISTED_VERDICT_FIELDS
+
+    classified = safe | quarantine | _KNOWN_UNLISTED_VERDICT_FIELDS
+    unclassified = sorted(set(names) - classified)
+    assert not unclassified, (
+        f"unclassified Verdict field(s) {unclassified}: to_audit() drops "
+        "them silently. Add each to _AUDIT_SAFE_FIELDS (scanner-synthesized, "
+        "no report- or provider-derived bytes), to "
+        "_AUDIT_QUARANTINE_ONLY_FIELDS (wrapped in QuarantineOnly), or to "
+        "_KNOWN_UNLISTED_VERDICT_FIELDS here with the reason it is handled "
+        "some other way."
+    )
+
+    # The mirror image: an allow-list that outlives the field it names would
+    # blow up to_audit() with AttributeError at write time.
+    stale = sorted(classified - set(names))
+    assert not stale, f"allow-list names non-existent Verdict field(s): {stale}"
 
 
 def test_audit_record_keys_are_exactly_the_classified_set():
