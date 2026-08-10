@@ -40,11 +40,81 @@ zero-FP and survives any future tag rename.
 """
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 
 from injection_scanner import decode, judge, lakera, secret_shapes, unicode_sanitize
 from injection_scanner.honeypot import check as honeypot_check
+
+
+class QuarantineOnly:
+    """Opaque holder for values that may embed attacker-controlled bytes.
+
+    A `Verdict` mixes two trust classes. Most fields (`ok`, `reason`,
+    `layers`) are synthesized by the scanner from a fixed vocabulary and
+    are safe anywhere. A few carry text that ultimately originates in the
+    scanned report — directly, or laundered through a provider error body
+    that echoes request fragments back at us.
+
+    A plain `dict[str, str]` annotation makes those two classes look
+    identical at the call site, so a new consumer cannot tell which is
+    which without reading honeypot.py. This type is the marker: any field
+    annotated `QuarantineOnly` is cleared for the quarantine audit file
+    and nothing else.
+
+    It is also a guard, not just a label:
+
+      * `repr` / `str` redact, so `print(verdict)`, an f-string, a log
+        line, or a pytest assertion diff cannot spill the contents — and
+        unlike `field(repr=False)`, that holds even after the value has
+        been pulled off the dataclass into a local.
+      * `json.dumps(..., default=str)` — the exact call the audit writer
+        uses — serializes the redaction, not the payload. A structure
+        that reaches a JSON encoder by some path other than
+        `Verdict.to_audit()` fails closed.
+      * It is deliberately NOT a Mapping: no `__iter__`, no `__getitem__`,
+        no `.items()`. Reading the payload requires naming
+        `reveal_for_quarantine_record()`, which is unpleasant enough to
+        read in a diff that it cannot happen by reflex.
+      * It is deliberately NOT a dataclass, so `dataclasses.asdict()` on
+        a containing dataclass cannot flatten it back into raw strings.
+    """
+
+    __slots__ = ("_values",)
+
+    def __init__(self, values: Mapping[str, str] | None = None) -> None:
+        self._values: dict[str, str] = dict(values) if values else {}
+
+    def reveal_for_quarantine_record(self) -> dict[str, str]:
+        """Return the raw mapping. ONE legal destination.
+
+        That destination is the quarantine audit file written by
+        `safeio.write_rejection_audit` — a file in a directory the
+        consuming agent's file-reading tools are deny-listed from, which
+        already carries the full report bytes. Anywhere an LLM can read
+        the result back is a leak, not a diagnostic.
+        """
+        return dict(self._values)
+
+    def __repr__(self) -> str:
+        n = len(self._values)
+        return f"QuarantineOnly(<{n} entr{'y' if n == 1 else 'ies'} redacted>)"
+
+    __str__ = __repr__
+
+    def __bool__(self) -> bool:
+        return bool(self._values)
+
+    def __len__(self) -> int:
+        return len(self._values)
+
+    def __eq__(self, other: object) -> bool:
+        if isinstance(other, QuarantineOnly):
+            return self._values == other._values
+        return NotImplemented
+
+    __hash__ = None  # type: ignore[assignment]  # mutable payload
 
 
 @dataclass
@@ -54,13 +124,18 @@ class Verdict:
     layers: dict[str, str]         # per-layer outcome for audit
     sanitize_stats: dict           # unicode_sanitize stats
     sanitized_text: str            # cleaned text the server should deliver
-    # AUDIT-ONLY: honeypot scenario name -> structured provider API-error
-    # detail (see honeypot._error_detail). Empty unless a honeypot probe hit
-    # a provider error. Deliberately kept OUT of `reason` and `layers`, which
-    # stay type-name-only so no provider-echoed request fragment can ride
-    # them back into a caller's context. This field is for the quarantine
-    # audit record only.
-    honeypot_api_errors: dict[str, str] = field(default_factory=dict)
+    # UNTRUSTED / audit-file-only, and typed to say so: honeypot scenario
+    # name -> structured provider API-error detail (see
+    # honeypot._error_detail). Empty unless a honeypot probe hit a provider
+    # error. Deliberately kept OUT of `reason` and `layers`, which stay
+    # type-name-only so no provider-echoed request fragment can ride them
+    # back into a caller's context.
+    #
+    # The `QuarantineOnly` wrapper is the trust boundary made visible: every
+    # other field on this dataclass is scanner-synthesized and safe to render
+    # anywhere, this one is not, and the annotation is what tells a new
+    # consumer which is which. See the class docstring above.
+    honeypot_api_errors: QuarantineOnly = field(default_factory=QuarantineOnly)
 
     def to_audit(self) -> dict:
         """Return an audit record safe to persist to disk or forward to an
@@ -80,6 +155,14 @@ class Verdict:
             d["sanitize_stats"] = {
                 k: v for k, v in d["sanitize_stats"].items() if k != "text"
             }
+        # The one sanctioned unwrap of the QuarantineOnly payload. `asdict`
+        # leaves the wrapper object in place (it is not a dataclass), so
+        # without this the record would carry the redaction placeholder
+        # rather than the diagnostic — deliberately fail-closed if some
+        # other path ever serializes a Verdict.
+        d["honeypot_api_errors"] = (
+            self.honeypot_api_errors.reveal_for_quarantine_record()
+        )
         return d
 
 
@@ -114,8 +197,10 @@ def scan_text(raw: str, use_honeypot: bool = True, use_lakera: bool = True) -> V
     layers: dict[str, str] = {}
     # Audit-only provider diagnostics from L3; stays empty unless a honeypot
     # probe hit a provider API error. Populated after the honeypot runs and
-    # threaded into every Verdict reachable from that point onwards.
-    hp_api_errors: dict[str, str] = {}
+    # threaded into every Verdict reachable from that point onwards. Held in
+    # the QuarantineOnly wrapper from the moment it exists, so there is no
+    # window in which it is a bare dict that could be logged by accident.
+    hp_api_errors = QuarantineOnly()
 
     # L0
     try:
@@ -285,7 +370,7 @@ def scan_text(raw: str, use_honeypot: bool = True, use_lakera: bool = True) -> V
         # `hp_api_errors` -> `Verdict.honeypot_api_errors` -> to_audit().
         for s in hp.per_scenario:
             layers[f"honeypot.{s.scenario}"] = f"{s.verdict}:{s.signal}"
-        hp_api_errors = dict(hp.api_error_details)
+        hp_api_errors = QuarantineOnly(hp.api_error_details)
         if not hp.ok:
             return Verdict(
                 ok=False,
