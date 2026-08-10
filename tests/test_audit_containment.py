@@ -197,6 +197,54 @@ def test_reveal_returns_a_copy():
     assert errors.reveal_for_quarantine_record() == {"A": "x"}
 
 
+# ---------- finding 1: the to_audit() contract ----------
+
+def _norm_doc(obj) -> str:
+    return " ".join((obj.__doc__ or "").split()).lower()
+
+
+def test_to_audit_contract_names_one_destination_and_forbids_the_rest():
+    """The docstring IS the containment control for a human caller.
+
+    It previously read "safe to persist to disk or forward to an operator
+    context ... never includes any report text". Since 9842816 the record
+    can carry provider-echoed request fragments derived from the report,
+    and in this deployment an "operator context" can be an interactive LLM
+    session — so that wording authorized exactly the leak the rest of this
+    module prevents. Pin the replacement so it cannot regress silently.
+    """
+    doc = _norm_doc(Verdict.to_audit)
+
+    # Retired wording that licensed the leak.
+    for phrase in (
+        "safe to persist",
+        "forward to an operator context",
+        "safe to forward",
+        "never includes any report text",
+    ):
+        assert phrase not in doc, f"leak-authorizing wording is back: {phrase}"
+
+    # The destination has to be stated, and stated as exclusive.
+    assert "quarantine" in doc
+    assert "only" in doc
+
+    # And the forbidden destinations have to be spelled out, including the
+    # interactive-session case that makes "operator" ambiguous here.
+    assert "not safe to" in doc
+    for forbidden in ("print", "log", "tool call"):
+        assert forbidden in doc
+    assert "interactive" in doc or "llm" in doc
+
+    # The laundering path a caller has to understand to stay out of trouble.
+    assert "echo" in doc
+
+
+def test_quarantine_only_documents_its_single_reveal_destination():
+    doc = _norm_doc(QuarantineOnly.reveal_for_quarantine_record)
+    assert "quarantine" in doc
+    assert "leak" in doc
+
+
 # ---------- finding 4: to_audit() is an allow-list ----------
 
 def test_new_verdict_field_does_not_auto_flow_into_the_audit_record():

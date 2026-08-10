@@ -23,8 +23,12 @@ Order (each layer can short-circuit):
                               agent tooling / injection attacks) without
                               widening any attack path.
 
-Caller passes the cleaned path and receives a Verdict dict the server can
-use both to decide to deliver and to attach audit metadata.
+Caller passes the cleaned path and receives a Verdict the server can use
+both to decide to deliver and to build an audit record. Those two uses sit
+at different trust levels: `verdict.ok` / `verdict.reason` / `verdict.layers`
+are scanner-synthesized and safe to render anywhere, while
+`verdict.to_audit()` is cleared for the quarantine audit file and nothing
+else. See `Verdict.to_audit` before routing it anywhere new.
 
 Honeypot runs by default. The `use_honeypot` bool parameter on `scan` /
 `scan_text` toggles it — production callers leave it at its `True` default;
@@ -170,15 +174,39 @@ class Verdict:
     honeypot_api_errors: QuarantineOnly = field(default_factory=QuarantineOnly)
 
     def to_audit(self) -> dict:
-        """Return an audit record safe to persist to disk or forward to an
-        operator context. Never includes any report text — the whole point
-        of a quarantine is that the bytes stay out of any interactive
-        session. Callers needing the raw bytes must read the quarantined
-        file directly outside the session.
+        """Build the QUARANTINE-FILE-ONLY audit record.
 
-        `honeypot_api_errors` IS included: it is capped, sanitized,
-        structured-body-derived provider diagnostics, and the quarantine
-        audit record is the one surface cleared to carry it.
+        ONE legal destination: a quarantine audit file, written by
+        `safeio.write_rejection_audit` into a directory that the consuming
+        agent's file-reading tools are deny-listed from. That file already
+        carries the full rejected report bytes, which is exactly why this
+        record is cleared to sit next to them.
+
+        NOT safe to: print, log, return from a tool call, embed in an error
+        message, attach to a trace/metric/OTel tag, render into a chat
+        transcript, or hand to any "operator context" that an LLM can read
+        back. An operator here may be an interactive model session, so
+        "an operator will see it" is not a safety argument.
+
+        The reason is `honeypot_api_errors`. Provider error bodies echo
+        request fragments (`messages.0.content: ...`) that originate in
+        attacker-controlled report text, so the record carries laundered
+        report bytes even though it carries no report field. They are
+        capped, control-stripped and `unicode_sanitize`d
+        (see `honeypot._error_detail`) — that bounds the blast radius, it
+        does not make them trusted.
+
+        What is excluded, by construction rather than by pop: the report
+        body in either form. `sanitized_text` never appears (only
+        `sanitized_len`), and `sanitize_stats` is filtered to its numeric
+        counters, so `sanitize_stats["text"]` cannot ride along. Anyone
+        needing the raw bytes reads the quarantined file directly, from a
+        terminal, outside any session.
+
+        Construction is an allow-list (`_AUDIT_SAFE_FIELDS` /
+        `_AUDIT_QUARANTINE_ONLY_FIELDS`). A `Verdict` field named in
+        neither is dropped: new fields fail closed and must be classified
+        before they can reach this record.
         """
         d: dict = {}
 
