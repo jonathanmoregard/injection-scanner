@@ -83,6 +83,27 @@ class QuarantineOnly:
         read in a diff that it cannot happen by reflex.
       * It is deliberately NOT a dataclass, so `dataclasses.asdict()` on
         a containing dataclass cannot flatten it back into raw strings.
+
+    What it does NOT protect against — known, accepted, and listed here so
+    nobody mistakes this type for a hard boundary:
+
+      * `pickle.dumps(wrapper)` emits the payload as plaintext in the
+        pickle stream, and `copy.deepcopy` reads it the same way, both via
+        `__reduce_ex__`. Anything that serializes objects generically — a
+        cache, a task queue, `multiprocessing`, a crash dumper — therefore
+        carries the raw bytes. Blocking `__reduce__` would close this, but
+        it would also make `dataclasses.asdict()` on a containing `Verdict`
+        raise instead of yielding an opaque wrapper, i.e. it would trade a
+        rare exotic path for the common one the tests pin. Not worth it.
+      * `wrapper._values` is a plain attribute read. `__slots__` blocks new
+        attributes, not access to this one; Python has no private state.
+
+    So the guarantee is narrow and worth stating exactly: this type stops
+    the payload riding an INCIDENTAL rendering or serialization path — a
+    repr, an f-string, a log line, a pytest diff, a `json.dumps`. It cannot
+    stop code that deliberately goes after the payload. Deciding where the
+    bytes are allowed to go is still the caller's job; `to_audit()` is the
+    one place in this package that has made that decision.
     """
 
     __slots__ = ("_values",)
