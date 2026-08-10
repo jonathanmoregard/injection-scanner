@@ -165,13 +165,22 @@ class _OpaqueHolder:
             payload intact;
           * anything else -> `_adopt_foreign`, which renders it inside the
             holder.
+
+        Natural adoption is itself guarded. `isinstance(value, Mapping)`
+        says the value claims the protocol, not that iterating it works: a
+        `Mapping` whose `__iter__` raises would make this function raise and
+        break the totality above. Such a value falls back to
+        `_adopt_foreign`, whose rendering cannot raise either.
         """
         if isinstance(value, cls):
             return value
         if value is None:
             return cls()  # type: ignore[call-arg]
         if cls._BARE_TYPES and isinstance(value, cls._BARE_TYPES):
-            return cls(value)  # type: ignore[call-arg]
+            try:
+                return cls(value)  # type: ignore[call-arg]
+            except Exception:  # noqa: BLE001 — totality outranks fidelity here
+                pass
         return cls._adopt_foreign(value)
 
     def __repr__(self) -> str:
@@ -258,7 +267,31 @@ class QuarantineOnly(_OpaqueHolder):
     _UNCOERCED_KEY = "<uncoerced>"
 
     def __init__(self, values: Mapping[str, str] | None = None) -> None:
-        self._values: dict[str, str] = dict(values) if values else {}
+        # Normalize to `dict[str, str]` on the way in, which is what the
+        # annotation has always claimed and what `to_audit()` promises its
+        # caller. A mapping adopted verbatim could carry a non-`str` KEY
+        # straight through `reveal_for_quarantine_record()` into the audit
+        # record, and `json.dumps(..., default=str)` — the exact call the
+        # audit writer makes — then raises `TypeError`, because `default` is
+        # consulted for values only, never for keys. So the record we are
+        # trying to preserve is the thing that fails to be written: a crash
+        # in place of a leak, which is not the trade this module makes
+        # anywhere else. Values get the same treatment so the record stays
+        # serializable with no `default=` hook at all, as `to_audit()`'s
+        # contract says and its tests pin.
+        #
+        # Normalization is per-item and cannot raise; a `str` is kept
+        # verbatim so a real diagnostic never picks up `repr()` quotes.
+        self._values: dict[str, str] = (
+            {self._as_text(k): self._as_text(v) for k, v in values.items()}
+            if values
+            else {}
+        )
+
+    @classmethod
+    def _as_text(cls, value: object) -> str:
+        """A `str` unchanged; anything else rendered inside the holder."""
+        return value if isinstance(value, str) else cls._render_unexpected(value)
 
     @classmethod
     def _adopt_foreign(cls, value: object) -> QuarantineOnly:

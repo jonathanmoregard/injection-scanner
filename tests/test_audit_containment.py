@@ -663,6 +663,90 @@ def test_honeypot_dataclasses_wrap_a_value_of_an_unexpected_type(value):
         assert "PASSTHROUGH-CANARY-4d21ef" not in rendered
 
 
+# ---------- adversarial finding: an adopted mapping must stay dict[str, str] ----------
+#
+# `coerce()` adopted any Mapping verbatim, so a non-`str` KEY rode
+# `reveal_for_quarantine_record()` into the audit record. `json.dumps(...,
+# default=str)` — the exact call the audit writer makes — then raises,
+# because `default` is consulted for values only, never for keys. The
+# record this whole change exists to preserve is what fails to be written:
+# a crash substituted for a leak, which is not the trade made anywhere else
+# here.
+
+class _KeyObj:
+    def __repr__(self) -> str:
+        return "KEY-CANARY-8e21"
+
+
+@pytest.mark.parametrize(
+    "key", [_KeyObj(), ("a", "b"), 7, None, frozenset({"a"})],
+    ids=["object", "tuple", "int", "none", "frozenset"],
+)
+def test_a_non_str_key_cannot_break_the_audit_write(key):
+    """The repro: `json.dumps(v.to_audit(), default=str)`."""
+    v = _verdict(honeypot_api_errors={key: ECHOED_REQUEST_FRAGMENT})
+    audit = v.to_audit()
+
+    assert all(isinstance(k, str) for k in audit["honeypot_api_errors"])
+    # The write the audit writer actually performs.
+    json.dumps(audit, default=str)
+    # And the stricter contract to_audit() states: no hook needed at all.
+    json.dumps(audit)
+    # Normalizing the key must not have cost the diagnostic it was keying.
+    assert ECHOED_REQUEST_FRAGMENT in json.dumps(audit)
+
+
+def test_a_non_str_value_keeps_the_record_serializable_without_a_hook():
+    v = _verdict(honeypot_api_errors={"A": _KeyObj()})
+    audit = v.to_audit()
+    assert audit["honeypot_api_errors"] == {"A": "KEY-CANARY-8e21"}
+    json.dumps(audit)
+
+
+def test_normalization_leaves_real_str_keys_and_values_verbatim():
+    """A `str` must not pick up `repr()` quotes on the way through.
+
+    The scenario names and provider messages that make up every real
+    payload are strings; rendering them would corrupt the diagnostic and
+    silently change every existing audit record.
+    """
+    revealed = QuarantineOnly(
+        {"A_conversation_history_leak": ECHOED_REQUEST_FRAGMENT}
+    ).reveal_for_quarantine_record()
+    assert revealed == {"A_conversation_history_leak": ECHOED_REQUEST_FRAGMENT}
+    assert "'" not in "".join(revealed)
+
+
+def test_a_mapping_that_cannot_be_iterated_does_not_break_coerce():
+    """`isinstance(x, Mapping)` is a claim about protocol, not about working.
+
+    Natural adoption is guarded, so a hostile mapping degrades to the
+    foreign-adoption path instead of making `coerce()` raise and breaking
+    its totality.
+    """
+    from collections.abc import Mapping
+
+    class _Hostile(Mapping):
+        def __iter__(self):
+            raise RuntimeError("iteration blew up")
+
+        def __len__(self):
+            return 1
+
+        def __getitem__(self, k):
+            raise KeyError(k)
+
+        def __repr__(self) -> str:
+            return f"_Hostile({_ECHOED_IN_A_LIST!r})"
+
+    wrapped = QuarantineOnly.coerce(_Hostile())
+    assert isinstance(wrapped, QuarantineOnly)
+    assert "PASSTHROUGH-CANARY-4d21ef" not in repr(wrapped)
+    assert set(wrapped.reveal_for_quarantine_record()) == {"<uncoerced>"}
+    # Still writable.
+    json.dumps(_verdict(honeypot_api_errors=_Hostile()).to_audit())
+
+
 def test_a_broken_repr_on_a_field_does_not_break_construction():
     """Fail-closed means the scanner keeps running, including on junk."""
     v = _verdict(honeypot_api_errors=_Exploding())
