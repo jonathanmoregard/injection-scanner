@@ -30,10 +30,11 @@ from __future__ import annotations
 
 import json
 import re
+import types
 
 import pytest
 
-from injection_scanner.containment import QuarantineOnlyText
+from injection_scanner.containment import QuarantineFieldsCoerced, QuarantineOnlyText
 from injection_scanner.honeypot import HoneypotResult, ScenarioResult
 from injection_scanner.intercept import (
     _AUDIT_QUARANTINE_ONLY_FIELDS,
@@ -289,6 +290,85 @@ def test_to_audit_still_carries_the_real_detail():
     assert isinstance(audit["honeypot_api_errors"], dict)
     # Still JSON-serializable for the audit writer.
     assert "TAINT-CANARY-9f3a1c" in json.dumps(audit, default=str)
+
+
+# ---------- the coercion machinery, on its own ----------
+#
+# Exercised here against a throwaway dataclass so the mechanism is pinned
+# independently of the three real fields that use it. If these pass and the
+# per-field tests below fail, the wiring is wrong; if these fail, the
+# mechanism is.
+
+@pytest.mark.parametrize(
+    "holder, bare, expected",
+    [
+        (QuarantineOnlyText, ECHOED_REQUEST_FRAGMENT, QuarantineOnlyText),
+        (QuarantineOnly, {"A": ECHOED_REQUEST_FRAGMENT}, QuarantineOnly),
+        # Any Mapping, not just dict — a mapping proxy carries the payload
+        # just as well.
+        (QuarantineOnly,
+         types.MappingProxyType({"A": ECHOED_REQUEST_FRAGMENT}),
+         QuarantineOnly),
+    ],
+    ids=["text", "dict", "mapping-proxy"],
+)
+def test_coerce_wraps_a_bare_payload(holder, bare, expected):
+    wrapped = holder.coerce(bare)
+    assert isinstance(wrapped, expected)
+    assert "TAINT-CANARY-9f3a1c" not in repr(wrapped)
+
+
+def test_coerce_passes_an_existing_holder_through_untouched():
+    """Idempotent, and no defensive copy: `is`, not `==`.
+
+    `intercept.scan_text` hands the honeypot's holder straight to the
+    Verdict; a coercion that rebuilt it would be a pointless unwrap.
+    """
+    original = QuarantineOnly({"A": ECHOED_REQUEST_FRAGMENT})
+    assert QuarantineOnly.coerce(original) is original
+    text = QuarantineOnlyText(ECHOED_REQUEST_FRAGMENT)
+    assert QuarantineOnlyText.coerce(text) is text
+
+
+@pytest.mark.parametrize("value", [None, 7, ["A"], object()],
+                         ids=["none", "int", "list", "object"])
+def test_coerce_does_not_raise_on_an_uncoercible_value(value):
+    """Coerce, never reject.
+
+    Raising would turn a wrong type into a crash in the consuming server —
+    trading a silent leak for an outage in a fail-closed scanner. A value
+    it cannot wrap passes through and fails closed later, at `to_audit()`.
+    """
+    assert QuarantineOnly.coerce(value) is value
+    assert QuarantineOnlyText.coerce(value) is value
+
+
+def test_uncoercible_value_still_fails_closed_at_the_audit_boundary():
+    v = _verdict(honeypot_api_errors=None)
+    with pytest.raises(AttributeError):
+        v.to_audit()
+
+
+def test_mixin_coerces_only_the_declared_fields():
+    import dataclasses
+
+    @dataclasses.dataclass
+    class Sample(QuarantineFieldsCoerced):
+        _QUARANTINE_FIELDS = {"guarded": QuarantineOnlyText}
+
+        guarded: QuarantineOnlyText = dataclasses.field(
+            default_factory=QuarantineOnlyText
+        )
+        plain: str = ""
+
+    s = Sample(guarded=ECHOED_REQUEST_FRAGMENT, plain=ECHOED_REQUEST_FRAGMENT)
+    assert isinstance(s.guarded, QuarantineOnlyText)
+    # An undeclared field is left exactly as assigned — this is a targeted
+    # guard, not a blanket rewrite of every attribute.
+    assert s.plain == ECHOED_REQUEST_FRAGMENT
+
+    s.plain = "still a plain str"
+    assert s.plain == "still a plain str"
 
 
 def test_reveal_returns_a_copy():
