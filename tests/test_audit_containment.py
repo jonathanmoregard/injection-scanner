@@ -197,6 +197,77 @@ def test_reveal_returns_a_copy():
     assert errors.reveal_for_quarantine_record() == {"A": "x"}
 
 
+# ---------- finding 4: to_audit() is an allow-list ----------
+
+def test_new_verdict_field_does_not_auto_flow_into_the_audit_record():
+    """The regression this inversion exists to prevent.
+
+    Under the old `asdict()` + deny-list-pops construction, a field added
+    to Verdict later appeared in the record automatically — with no diff on
+    to_audit() for a reviewer to catch.
+    """
+    import dataclasses
+
+    @dataclasses.dataclass
+    class FutureVerdict(Verdict):
+        # A field a future contributor adds without reading to_audit().
+        new_untrusted_field: str = "FUTURE-TAINT-5150"
+
+    audit = FutureVerdict(
+        ok=False, reason="r", layers={}, sanitize_stats={}, sanitized_text="",
+    ).to_audit()
+    assert "new_untrusted_field" not in audit
+    assert "FUTURE-TAINT-5150" not in json.dumps(audit, default=str)
+
+
+def test_audit_record_keys_are_exactly_the_classified_set():
+    audit = _verdict().to_audit()
+    assert set(audit) == {
+        "ok", "reason", "layers", "sanitize_stats",
+        "sanitized_len", "honeypot_api_errors",
+    }
+
+
+def test_sanitize_stats_allow_list_drops_unknown_keys():
+    """Same inversion one level down: `text` is excluded by construction."""
+    v = _verdict(sanitize_stats={
+        "text": "SANITIZED-BODY-CANARY-c0ffee",
+        "stripped": 4,
+        "nfkc_changed": True,
+        "future_stat_carrying_bytes": "FUTURE-STAT-TAINT-abc123",
+    })
+    stats = v.to_audit()["sanitize_stats"]
+    assert stats == {"stripped": 4, "nfkc_changed": True}
+    assert "SANITIZED-BODY-CANARY-c0ffee" not in json.dumps(v.to_audit())
+    assert "FUTURE-STAT-TAINT-abc123" not in json.dumps(v.to_audit())
+
+
+def test_audit_record_does_not_alias_live_verdict_state():
+    v = _verdict()
+    audit = v.to_audit()
+    audit["layers"]["honeypot"] = "TAMPERED"
+    audit["layers"]["injected"] = "TAMPERED"
+    audit["sanitize_stats"]["stripped"] = 999
+    audit["honeypot_api_errors"]["A"] = "TAMPERED"
+    assert v.layers == {"honeypot": "honeypot_unavailable:A"}
+    assert v.sanitize_stats["text"] == "SANITIZED-BODY-CANARY-c0ffee"
+    assert v.honeypot_api_errors == QuarantineOnly({"A": ECHOED_REQUEST_FRAGMENT})
+
+
+def test_report_body_never_reaches_the_audit_record():
+    """Pinned across both carriers: the field and the stats dict."""
+    audit = _verdict().to_audit()
+    assert "sanitized_text" not in audit
+    assert audit["sanitized_len"] == len("SANITIZED-BODY-CANARY-c0ffee")
+    assert "SANITIZED-BODY-CANARY-c0ffee" not in json.dumps(audit, default=str)
+
+
+def test_audit_record_is_json_serializable_without_a_default_hook():
+    """No opaque wrapper survives into the record — the writer must not
+    have to lean on `default=str` to avoid a TypeError."""
+    json.dumps(_verdict().to_audit())
+
+
 def test_default_verdict_has_an_empty_wrapper():
     v = Verdict(ok=True, reason="pass", layers={}, sanitize_stats={},
                 sanitized_text="")

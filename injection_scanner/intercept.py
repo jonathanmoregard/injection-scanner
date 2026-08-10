@@ -117,6 +117,38 @@ class QuarantineOnly:
     __hash__ = None  # type: ignore[assignment]  # mutable payload
 
 
+# ---------- to_audit() allow-lists ----------
+#
+# `to_audit()` used to build with `asdict(self)` and then pop the known-bad
+# keys. That is a deny-list: ANY field added to `Verdict` later would flow
+# straight into a record billed as publishable, silently, with no diff on
+# `to_audit()` to catch a reviewer's eye. These allow-lists invert it — a
+# name absent from both tuples is dropped, so a new field fails closed and
+# has to be classified deliberately before it appears in the record.
+#
+# Scanner-synthesized, fixed vocabulary, no report- or provider-derived
+# bytes. Copied through as-is.
+_AUDIT_SAFE_FIELDS = ("ok", "reason", "layers")
+
+# Fields typed `QuarantineOnly`; unwrapped into the record because the
+# quarantine audit file is the one surface cleared to carry them.
+_AUDIT_QUARANTINE_ONLY_FIELDS = ("honeypot_api_errors",)
+
+# `sanitize_stats` gets the same inversion one level down: previously a
+# `k != "text"` deny-list, now an explicit roster of the numeric/bool
+# counters from `unicode_sanitize.SanitizeResult`. `text` (the full
+# sanitized report body) is excluded by construction rather than by
+# remembering to pop it, and a future stat is dropped until it is added
+# here on purpose.
+_AUDIT_SANITIZE_STAT_KEYS = (
+    "stripped", "bidi_hits", "tag_hits", "zw_hits", "fmt_hits", "nfkc_changed",
+)
+
+# Deliberately in NO list, recorded here so the omission reads as a decision
+# rather than an oversight: `sanitized_text` is the report body itself; only
+# its length reaches the record, as `sanitized_len`.
+
+
 @dataclass
 class Verdict:
     ok: bool                       # True  -> deliver
@@ -148,21 +180,31 @@ class Verdict:
         structured-body-derived provider diagnostics, and the quarantine
         audit record is the one surface cleared to carry it.
         """
-        d = asdict(self)
-        d.pop("sanitized_text", None)
-        d["sanitized_len"] = len(self.sanitized_text)
-        if isinstance(d.get("sanitize_stats"), dict):
-            d["sanitize_stats"] = {
-                k: v for k, v in d["sanitize_stats"].items() if k != "text"
-            }
-        # The one sanctioned unwrap of the QuarantineOnly payload. `asdict`
-        # leaves the wrapper object in place (it is not a dataclass), so
-        # without this the record would carry the redaction placeholder
-        # rather than the diagnostic — deliberately fail-closed if some
-        # other path ever serializes a Verdict.
-        d["honeypot_api_errors"] = (
-            self.honeypot_api_errors.reveal_for_quarantine_record()
+        d: dict = {}
+
+        # Allow-list, not `asdict()` minus pops: an unclassified field is
+        # simply never reached.
+        for name in _AUDIT_SAFE_FIELDS:
+            value = getattr(self, name)
+            # Shallow-copy the containers so the record can't alias — and
+            # later mutate — live Verdict state.
+            d[name] = dict(value) if isinstance(value, dict) else value
+
+        stats = self.sanitize_stats
+        d["sanitize_stats"] = (
+            {k: stats[k] for k in _AUDIT_SANITIZE_STAT_KEYS if k in stats}
+            if isinstance(stats, dict)
+            else {}
         )
+
+        # The report body never appears; only its length.
+        d["sanitized_len"] = len(self.sanitized_text)
+
+        # The one sanctioned unwrap of a QuarantineOnly payload, reached
+        # only for fields explicitly classified as such.
+        for name in _AUDIT_QUARANTINE_ONLY_FIELDS:
+            d[name] = getattr(self, name).reveal_for_quarantine_record()
+
         return d
 
 
