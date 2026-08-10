@@ -28,9 +28,11 @@ import asyncio
 import json
 import os
 import secrets
+import unicodedata
 from dataclasses import dataclass, field
 from typing import Literal
 
+from injection_scanner import unicode_sanitize
 from injection_scanner.keyloader import KeyConfigError, load_key
 from injection_scanner.honeypot_scenarios import (
     ALL_CANARIES,
@@ -69,6 +71,12 @@ class ScenarioResult:
     provider: str = ""
     model: str = ""
     raw_excerpt: str = ""
+    # AUDIT-ONLY. Structured detail from a provider API failure (see
+    # `_error_detail`). Deliberately NOT part of `signal` — it flows only to
+    # the quarantine audit record, which already carries full report text and
+    # is never read back into an interactive session. Never interpolate this
+    # into `signal`, `reason`, or `Verdict.layers`.
+    api_error_detail: str = ""
 
 
 @dataclass
@@ -76,6 +84,137 @@ class HoneypotResult:
     ok: bool
     reason: str
     per_scenario: list[ScenarioResult] = field(default_factory=list)
+    # AUDIT-ONLY, scenario name -> `ScenarioResult.api_error_detail`. Only
+    # scenarios that actually hit a provider error appear. Same containment
+    # rule as the per-scenario field: audit record only.
+    api_error_details: dict[str, str] = field(default_factory=dict)
+
+
+# ---------- provider API-error diagnostics (audit-only) ----------
+#
+# Motivating incident (2026-08-10): a report was quarantined with the audit
+# line `unavailable:anthropic-api-error:BadRequestError` and nothing else.
+# The real cause was in the SDK exception's structured body —
+# `invalid_request_error: Your credit balance is too low ...` — and had been
+# discarded. Diagnosis took four rounds.
+#
+# The fix keeps the containment and adds a SEPARATE audit-only channel:
+#
+#   * `signal` is unchanged: exception TYPE NAME only. Everything that
+#     already reads `signal` / `reason` / `Verdict.layers` sees the exact
+#     same bytes as before.
+#   * The detail below rides `ScenarioResult.api_error_detail` ->
+#     `HoneypotResult.api_error_details` -> `Verdict.honeypot_api_errors` ->
+#     `Verdict.to_audit()`. That record lives in the quarantine zone.
+#
+# The detail is derived from the SDK's STRUCTURED body only, never `str(e)`
+# / `repr(e)` — SDK exceptions stringify with request/response fragments
+# that embed the prompt we sent, i.e. the attacker's own report bytes.
+#
+# Even the structured body is treated as untrusted: a provider can echo
+# request fragments back (`messages.0.content: ...`), so the extracted text
+# is control-stripped, whitespace-flattened, run through the L0
+# `unicode_sanitize` covert-channel stripper, and hard-capped.
+
+_API_ERROR_DETAIL_MAX = 300
+_REQUEST_ID_MAX = 64
+
+
+def _scrub(text: str) -> str:
+    """Flatten and sanitize one untrusted provider-supplied fragment.
+
+    Three passes, in order:
+      1. C0/C1 control characters (NUL, ESC, ...) -> space. These are outside
+         `unicode_sanitize`'s remit but would corrupt a terminal or log
+         viewer rendering the audit record.
+      2. Collapse all whitespace runs so the detail stays a single audit line.
+      3. `unicode_sanitize.sanitize` — strips the tag block, variation
+         selectors, bidi overrides and zero-width marks, and NFKC-normalizes,
+         exactly as L0 does to the report body itself.
+    """
+    flat = "".join(" " if unicodedata.category(ch) == "Cc" else ch for ch in text)
+    flat = " ".join(flat.split())
+    return unicode_sanitize.sanitize(flat).text
+
+
+def _clean_request_id(value: object) -> str | None:
+    """Return `value` if it is a plausible provider request id, else None.
+
+    Provider-generated and genuinely useful for support escalation, but it
+    arrives on a response header, so it gets the same distrust as the rest:
+    ASCII `[A-Za-z0-9_-]` and a hard length bound, or it is dropped.
+    """
+    if not isinstance(value, str):
+        return None
+    v = value.strip()
+    if not v or len(v) > _REQUEST_ID_MAX:
+        return None
+    if not all(c.isascii() and (c.isalnum() or c in "_-") for c in v):
+        return None
+    return v
+
+
+def _error_detail(e: BaseException) -> str:
+    """Audit-only diagnostic string for a provider API failure.
+
+    Reads the SDK exception's structured attributes only. Two body shapes
+    are handled, both verified against the installed SDKs:
+
+      anthropic 0.96.0 — `APIStatusError.body` is the whole envelope:
+        {'type': 'error',
+         'error': {'type': 'invalid_request_error', 'message': '...'},
+         'request_id': 'req_...'}
+
+      openai 2.32.0 — `_make_status_error` unwraps before constructing, so
+      `APIStatusError.body` is the INNER error object:
+        {'message': '...', 'type': 'insufficient_quota',
+         'param': None, 'code': '...'}
+
+    Anything else (no body, a raw non-JSON response, a plain builtin
+    exception) degrades to the type name — never a stringified exception.
+
+    Field order puts the long, untrusted `message=` last so that the cheap
+    high-value fields (type name, status, error type, request id) survive
+    the length cap.
+    """
+    parts: list[str] = [type(e).__name__]
+
+    status = getattr(e, "status_code", None)
+    if isinstance(status, int) and not isinstance(status, bool):
+        parts.append(f"status={status}")
+
+    body = getattr(e, "body", None)
+    err_type: str | None = None
+    err_message: str | None = None
+    if isinstance(body, dict):
+        inner = body.get("error")
+        node = inner if isinstance(inner, dict) else body
+        raw_type = node.get("type")
+        raw_message = node.get("message")
+        if isinstance(raw_type, str) and raw_type:
+            err_type = _scrub(raw_type[:_API_ERROR_DETAIL_MAX])
+        if isinstance(raw_message, str) and raw_message:
+            # Slice before scrubbing: an adversarially long message
+            # shouldn't cost a full-length sanitize pass.
+            err_message = _scrub(raw_message[: _API_ERROR_DETAIL_MAX * 4])
+
+    if err_type:
+        parts.append(f"type={err_type}")
+
+    rid = getattr(e, "request_id", None)
+    if rid is None and isinstance(body, dict):
+        rid = body.get("request_id")
+    clean_rid = _clean_request_id(rid)
+    if clean_rid:
+        parts.append(f"request_id={clean_rid}")
+
+    if err_message:
+        parts.append(f"message={err_message}")
+
+    detail = " ".join(parts)
+    if len(detail) > _API_ERROR_DETAIL_MAX:
+        detail = detail[: _API_ERROR_DETAIL_MAX - 3] + "..."
+    return detail
 
 
 # ---------- secret loading ----------
@@ -381,10 +520,14 @@ async def _call_anthropic(
         # with request/response fragments, which could echo attacker-shaped
         # content back up into the signal string. The audit record lives in
         # the quarantine zone today, but keep the signal flat by default.
+        # The structured body goes to the audit-only `api_error_detail`
+        # instead (see `_error_detail`) so an outage is diagnosable in one
+        # step without widening what the signal exposes.
         return ScenarioResult(
             scenario=scenario["name"], verdict="Honeypot_Skipped",
             signal=f"unavailable:anthropic-api-error:{type(e).__name__}",
             provider="anthropic", model=scenario["model"],
+            api_error_detail=_error_detail(e),
         )
     try:
         called: list[tuple[str, dict]] = []
@@ -462,10 +605,13 @@ async def _call_openai(
             )
         )
     except Exception as e:
+        # Type name only in the signal (see the Anthropic path above for the
+        # rationale); the structured body rides the audit-only field.
         return ScenarioResult(
             scenario=scenario["name"], verdict="Honeypot_Skipped",
             signal=f"unavailable:openai-api-error:{type(e).__name__}",
             provider="openai", model=scenario["model"],
+            api_error_detail=_error_detail(e),
         )
     try:
         msg = resp.choices[0].message
@@ -539,6 +685,12 @@ async def _run_all(report_text: str) -> HoneypotResult:
                 model=s["model"],
             ))
 
+    # AUDIT-ONLY side channel. Keyed by scenario name; only scenarios that
+    # actually hit a provider error contribute. Never folded into `reason`.
+    api_error_details = {
+        r.scenario: r.api_error_detail for r in results if r.api_error_detail
+    }
+
     triggered = [r for r in results if r.verdict == "Honeypot_Triggered"]
     # Defensive: anything that's not explicitly Triggered or Left_Alone
     # counts as degraded coverage. A future verdict variant (e.g. an
@@ -559,6 +711,7 @@ async def _run_all(report_text: str) -> HoneypotResult:
             ok=False,
             reason=f"honeypot:{first.scenario}:{first.signal}{skip_suffix}",
             per_scenario=results,
+            api_error_details=api_error_details,
         )
     if skipped:
         first = skipped[0]
@@ -568,8 +721,14 @@ async def _run_all(report_text: str) -> HoneypotResult:
             ok=False,
             reason=f"honeypot_unavailable:{first.scenario}:{first.signal}+skipped={len(skipped)}/{total}",
             per_scenario=results,
+            api_error_details=api_error_details,
         )
-    return HoneypotResult(ok=True, reason="pass", per_scenario=results)
+    return HoneypotResult(
+        ok=True,
+        reason="pass",
+        per_scenario=results,
+        api_error_details=api_error_details,
+    )
 
 
 def check(report_text: str) -> HoneypotResult:

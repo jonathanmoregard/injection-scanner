@@ -40,7 +40,7 @@ zero-FP and survives any future tag rename.
 """
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from pathlib import Path
 
 from injection_scanner import decode, judge, lakera, secret_shapes, unicode_sanitize
@@ -54,6 +54,13 @@ class Verdict:
     layers: dict[str, str]         # per-layer outcome for audit
     sanitize_stats: dict           # unicode_sanitize stats
     sanitized_text: str            # cleaned text the server should deliver
+    # AUDIT-ONLY: honeypot scenario name -> structured provider API-error
+    # detail (see honeypot._error_detail). Empty unless a honeypot probe hit
+    # a provider error. Deliberately kept OUT of `reason` and `layers`, which
+    # stay type-name-only so no provider-echoed request fragment can ride
+    # them back into a caller's context. This field is for the quarantine
+    # audit record only.
+    honeypot_api_errors: dict[str, str] = field(default_factory=dict)
 
     def to_audit(self) -> dict:
         """Return an audit record safe to persist to disk or forward to an
@@ -61,6 +68,10 @@ class Verdict:
         of a quarantine is that the bytes stay out of any interactive
         session. Callers needing the raw bytes must read the quarantined
         file directly outside the session.
+
+        `honeypot_api_errors` IS included: it is capped, sanitized,
+        structured-body-derived provider diagnostics, and the quarantine
+        audit record is the one surface cleared to carry it.
         """
         d = asdict(self)
         d.pop("sanitized_text", None)
@@ -101,6 +112,10 @@ def scan_text(raw: str, use_honeypot: bool = True, use_lakera: bool = True) -> V
     `str(e)`, which can echo input bytes back to the caller.
     """
     layers: dict[str, str] = {}
+    # Audit-only provider diagnostics from L3; stays empty unless a honeypot
+    # probe hit a provider API error. Populated after the honeypot runs and
+    # threaded into every Verdict reachable from that point onwards.
+    hp_api_errors: dict[str, str] = {}
 
     # L0
     try:
@@ -265,8 +280,12 @@ def scan_text(raw: str, use_honeypot: bool = True, use_lakera: bool = True) -> V
                 sanitized_text=san.text,
             )
         layers["honeypot"] = hp.reason
+        # `layers` stays type-name-only: `s.signal` never carries provider
+        # body text. The structured error body travels separately, on
+        # `hp_api_errors` -> `Verdict.honeypot_api_errors` -> to_audit().
         for s in hp.per_scenario:
             layers[f"honeypot.{s.scenario}"] = f"{s.verdict}:{s.signal}"
+        hp_api_errors = dict(hp.api_error_details)
         if not hp.ok:
             return Verdict(
                 ok=False,
@@ -274,6 +293,7 @@ def scan_text(raw: str, use_honeypot: bool = True, use_lakera: bool = True) -> V
                 layers=layers,
                 sanitize_stats=asdict(san),
                 sanitized_text=san.text,
+                honeypot_api_errors=hp_api_errors,
             )
 
         # L4 judge — arbitration of the Lakera-flag / honeypot-clean
@@ -293,6 +313,7 @@ def scan_text(raw: str, use_honeypot: bool = True, use_lakera: bool = True) -> V
                     layers=layers,
                     sanitize_stats=asdict(san),
                     sanitized_text=san.text,
+                    honeypot_api_errors=hp_api_errors,
                 )
             layers["judge"] = jr.reason
             for v in jr.votes:
@@ -304,6 +325,7 @@ def scan_text(raw: str, use_honeypot: bool = True, use_lakera: bool = True) -> V
                     layers=layers,
                     sanitize_stats=asdict(san),
                     sanitized_text=san.text,
+                    honeypot_api_errors=hp_api_errors,
                 )
     else:
         layers["honeypot"] = "disabled (test-only)"
@@ -314,4 +336,5 @@ def scan_text(raw: str, use_honeypot: bool = True, use_lakera: bool = True) -> V
         layers=layers,
         sanitize_stats=asdict(san),
         sanitized_text=san.text,
+        honeypot_api_errors=hp_api_errors,
     )
