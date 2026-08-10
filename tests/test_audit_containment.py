@@ -114,7 +114,12 @@ def test_untrusted_fields_are_still_readable_for_the_audit_record():
     """Containment hides, it does not delete. The audit channel still works."""
     r = _scenario_result()
     assert ECHOED_REQUEST_FRAGMENT in r.api_error_detail.reveal_for_quarantine_record()
-    assert r.raw_excerpt == JUDGE_EXCERPT
+    # `raw_excerpt` reads the same way as every other contained field now:
+    # through the named reveal, never as a bare attribute. This is the only
+    # read of it anywhere in either repo — the package writes it and never
+    # looks at it again — so no new package call site was needed, and
+    # `_EXPECTED_REVEAL_SITES` is unchanged.
+    assert r.raw_excerpt.reveal_for_quarantine_record() == JUDGE_EXCERPT
     hp = _honeypot_result()
     revealed = hp.api_error_details.reveal_for_quarantine_record()
     assert revealed["A_conversation_history_leak"] == ECHOED_REQUEST_FRAGMENT
@@ -441,6 +446,57 @@ def test_scenario_result_constructor_and_assignment_wrap_a_bare_str():
     with pytest.raises(TypeError):
         json.dumps({"d": r.api_error_detail})
     assert "TAINT-CANARY-9f3a1c" in r.api_error_detail.reveal_for_quarantine_record()
+
+
+def test_scenario_result_raw_excerpt_survives_asdict():
+    """Repro: `json.dumps(asdict(honeypot.check(text)), default=str)`.
+
+    `raw_excerpt` carried `repr=False` and nothing else, and `repr=False`
+    is the one containment `dataclasses.asdict()` walks straight past — it
+    copies every field regardless. So the excerpt (up to 300 chars of judge
+    output produced while reading the attacker's report) reached a JSON
+    encoder verbatim through the flattened result, and reached an f-string
+    verbatim once pulled off the dataclass.
+    """
+    import dataclasses
+
+    r = ScenarioResult(scenario="A", verdict="Honeypot_Triggered",
+                       signal="trap:x", raw_excerpt=JUDGE_EXCERPT)
+    h = HoneypotResult(ok=False, reason="honeypot:A:trap:x", per_scenario=[r])
+
+    assert isinstance(r.raw_excerpt, QuarantineOnlyText)
+    assert not isinstance(r.raw_excerpt, str)
+
+    flat = dataclasses.asdict(h)
+    assert "REPORT-BYTES-CANARY-77bd02" not in json.dumps(flat, default=str)
+    # The nested holder survives the flattening as an opaque object rather
+    # than being rebuilt into a raw str.
+    assert isinstance(flat["per_scenario"][0]["raw_excerpt"], QuarantineOnlyText)
+
+    r.raw_excerpt = JUDGE_EXCERPT + " reassigned"
+    assert isinstance(r.raw_excerpt, QuarantineOnlyText)
+    for rendered in (repr(r), repr(h), f"{r.raw_excerpt}", str(r.raw_excerpt)):
+        assert "REPORT-BYTES-CANARY-77bd02" not in rendered
+    # Hidden, not deleted: the audit channel still reaches the bytes.
+    assert JUDGE_EXCERPT in r.raw_excerpt.reveal_for_quarantine_record()
+
+
+def test_the_judge_excerpt_is_wrapped_where_it_is_sliced():
+    """Pin the boundary's LOCATION, as for the provider error body.
+
+    `_classify_from_parts` wraps at the slice, so the local cannot be
+    logged on its way to the six ScenarioResult sites. Field coercion
+    would catch it a moment later; this pins the earlier point so a
+    refactor cannot quietly reintroduce the bare local.
+    """
+    import inspect
+
+    from injection_scanner import honeypot
+
+    src = inspect.getsource(honeypot._classify_from_parts)
+    assert "excerpt = QuarantineOnlyText(text[:300])" in src, (
+        "the judge excerpt is no longer wrapped where it is sliced"
+    )
 
 
 def test_honeypot_result_constructor_and_assignment_wrap_a_bare_dict():

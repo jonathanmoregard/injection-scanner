@@ -70,11 +70,14 @@ async def _with_retries(make_awaitable):
 
 @dataclass
 class ScenarioResult(QuarantineFieldsCoerced):
-    # A bare string assigned to `api_error_detail` — at construction or
+    # A bare string assigned to either of these — at construction or
     # afterwards — is wrapped before it lands. The holder is then what the
     # object HAS, not what its constructor was trusted to pass. See
     # `containment.QuarantineFieldsCoerced`.
-    _QUARANTINE_FIELDS = {"api_error_detail": QuarantineOnlyText}
+    _QUARANTINE_FIELDS = {
+        "raw_excerpt": QuarantineOnlyText,
+        "api_error_detail": QuarantineOnlyText,
+    }
 
     scenario: str
     verdict: Verdict
@@ -86,9 +89,20 @@ class ScenarioResult(QuarantineFieldsCoerced):
     # `repr=False`: the default dataclass repr renders every field, so a bare
     # `print(result)`, a log line, an f-string, or a pytest assertion diff
     # would spill these bytes into whatever context is rendering them —
-    # including an interactive LLM session. Excluding them from the repr
-    # means the only way out is an explicit attribute read.
-    raw_excerpt: str = field(default="", repr=False)
+    # including an interactive LLM session.
+    #
+    # `repr=False` alone was not enough, and this field was the last place
+    # in the package where that showed: `dataclasses.asdict()` copies EVERY
+    # field regardless of `repr`, so
+    # `json.dumps(asdict(honeypot.check(text)), default=str)` handed out the
+    # excerpt verbatim, and so did any f-string once the value had been
+    # pulled off the dataclass. Same holder as `api_error_detail` below for
+    # the same reason — different provenance (judge output rather than a
+    # provider error body), identical trust class: bytes shaped by the
+    # attacker's report, cleared for the audit record and nothing else.
+    raw_excerpt: QuarantineOnlyText = field(
+        default_factory=QuarantineOnlyText, repr=False
+    )
     # AUDIT-ONLY. Structured detail from a provider API failure (see
     # `_error_detail`). Deliberately NOT part of `signal` — it flows only to
     # the quarantine audit record, which already carries full report text and
@@ -442,7 +456,12 @@ def _classify_from_parts(
     interpolation is safe.
     """
     own_canary = scenario["canary"]
-    excerpt = text[:300]  # audit-only; never interpolated into signal/reason
+    # Audit-only; never interpolated into signal/reason. Wrapped HERE, where
+    # the judge's freeform text is first sliced, rather than left to the
+    # field's coercion: the same point-of-construction rule `_error_detail`
+    # follows, so the local itself cannot be logged or f-stringed on the way
+    # to the six `ScenarioResult(...)` sites below.
+    excerpt = QuarantineOnlyText(text[:300])
     valid_names = LEGIT_TOOL_NAMES | trap_names
 
     # 0. Defense in depth: reject any malformed-name tool call. A judge
