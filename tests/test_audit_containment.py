@@ -379,6 +379,144 @@ def test_reveal_returns_a_copy():
     assert errors.reveal_for_quarantine_record() == {"A": "x"}
 
 
+# ---------- cross-vendor round 2: the holder is structural, not conventional ----------
+#
+# The holder-everywhere refactor made the LIBRARY always wrap, but the three
+# dataclasses still ACCEPTED a bare payload, so containment rested on every
+# caller passing the right type. Each test below is the reviewer's repro:
+# construct (or assign) with a bare `str` / `dict` and watch the payload
+# reappear on a public object. `dataclasses.replace` is covered too — it
+# re-invokes `__init__`, so it took the same path.
+
+def test_verdict_constructor_wraps_a_bare_dict():
+    """Repro: `Verdict(..., honeypot_api_errors={...})` then `repr(v)`."""
+    v = _verdict(honeypot_api_errors={"A": ECHOED_REQUEST_FRAGMENT})
+
+    assert isinstance(v.honeypot_api_errors, QuarantineOnly)
+    assert not isinstance(v.honeypot_api_errors, dict)
+    for rendered in (repr(v), str(v), f"{v}"):
+        assert "TAINT-CANARY-9f3a1c" not in rendered
+    # Coercion, not rejection: the diagnostic still reaches the record.
+    assert v.to_audit()["honeypot_api_errors"] == {"A": ECHOED_REQUEST_FRAGMENT}
+
+
+def test_verdict_replace_wraps_a_bare_dict():
+    """`dataclasses.replace` re-invokes `__init__`, so it must coerce too."""
+    import dataclasses
+
+    v = dataclasses.replace(_verdict(),
+                            honeypot_api_errors={"A": ECHOED_REQUEST_FRAGMENT})
+    assert isinstance(v.honeypot_api_errors, QuarantineOnly)
+    assert "TAINT-CANARY-9f3a1c" not in repr(v)
+
+
+def test_verdict_attribute_assignment_wraps_a_bare_dict():
+    """The window a `__post_init__` alone would have left open."""
+    v = _verdict()
+    v.honeypot_api_errors = {"A": ECHOED_REQUEST_FRAGMENT}
+
+    assert isinstance(v.honeypot_api_errors, QuarantineOnly)
+    assert "TAINT-CANARY-9f3a1c" not in repr(v)
+    assert "TAINT-CANARY-9f3a1c" not in json.dumps(
+        {"v": v.honeypot_api_errors}, default=str
+    )
+    assert v.to_audit()["honeypot_api_errors"] == {"A": ECHOED_REQUEST_FRAGMENT}
+
+
+def test_scenario_result_constructor_and_assignment_wrap_a_bare_str():
+    """Repro: `ScenarioResult(..., api_error_detail="...")`."""
+    r = ScenarioResult(
+        scenario="A", verdict="Honeypot_Skipped", signal="sig",
+        api_error_detail=ECHOED_REQUEST_FRAGMENT,
+    )
+    assert isinstance(r.api_error_detail, QuarantineOnlyText)
+    assert not isinstance(r.api_error_detail, str)
+
+    r.api_error_detail = ECHOED_REQUEST_FRAGMENT + " reassigned"
+    assert isinstance(r.api_error_detail, QuarantineOnlyText)
+
+    for rendered in (repr(r), str(r), f"{r.api_error_detail}"):
+        assert "TAINT-CANARY-9f3a1c" not in rendered
+    # The leak as it was written now raises instead of serializing.
+    with pytest.raises(TypeError):
+        json.dumps({"d": r.api_error_detail})
+    assert "TAINT-CANARY-9f3a1c" in r.api_error_detail.reveal_for_quarantine_record()
+
+
+def test_honeypot_result_constructor_and_assignment_wrap_a_bare_dict():
+    """Repro: `json.dumps(HoneypotResult(..., api_error_details={...}))`."""
+    h = HoneypotResult(ok=False, reason="r",
+                       api_error_details={"A": ECHOED_REQUEST_FRAGMENT})
+    assert isinstance(h.api_error_details, QuarantineOnly)
+    assert not isinstance(h.api_error_details, dict)
+    with pytest.raises(TypeError):
+        json.dumps(h.api_error_details)
+    assert "TAINT-CANARY-9f3a1c" not in json.dumps(h.api_error_details, default=str)
+
+    h.api_error_details = {"B": ECHOED_REQUEST_FRAGMENT}
+    assert isinstance(h.api_error_details, QuarantineOnly)
+    assert "TAINT-CANARY-9f3a1c" not in repr(h)
+
+
+def test_the_library_path_is_unchanged_by_the_coercion():
+    """A holder built by the library is passed through by identity.
+
+    `intercept.scan_text` hands the honeypot's holder straight to the
+    Verdict; if coercion rebuilt it, that pass-through would silently
+    become an unwrap-and-rewrap.
+    """
+    holder = QuarantineOnly({"A": ECHOED_REQUEST_FRAGMENT})
+    assert _verdict(honeypot_api_errors=holder).honeypot_api_errors is holder
+    h = HoneypotResult(ok=False, reason="r", api_error_details=holder)
+    assert h.api_error_details is holder
+
+
+# name -> holder class, keyed by the annotation as written in the source
+# (`from __future__ import annotations` makes `field.type` a string).
+_HOLDER_ANNOTATIONS = {
+    "QuarantineOnly": QuarantineOnly,
+    "QuarantineOnlyText": QuarantineOnlyText,
+}
+
+
+@pytest.mark.parametrize(
+    "cls", [Verdict, ScenarioResult, HoneypotResult],
+    ids=["Verdict", "ScenarioResult", "HoneypotResult"],
+)
+def test_every_holder_typed_field_is_declared_for_coercion(cls):
+    """The drift guard: annotation and coercion list must agree.
+
+    A fourth quarantine field added with the right annotation but no entry
+    in `_QUARANTINE_FIELDS` is back to a convention — the type says
+    "contained", the object accepts a bare payload anyway. The reverse
+    (an entry naming a field that no longer exists) is dead weight that
+    hides the same gap.
+    """
+    import dataclasses
+
+    annotated = {
+        f.name: _HOLDER_ANNOTATIONS[f.type]
+        for f in dataclasses.fields(cls)
+        if f.type in _HOLDER_ANNOTATIONS
+    }
+    assert annotated, f"{cls.__name__} has no holder-typed field to guard"
+    assert annotated == dict(cls._QUARANTINE_FIELDS)
+
+
+def test_the_coercion_declaration_is_not_itself_a_dataclass_field():
+    """`_QUARANTINE_FIELDS` is un-annotated on purpose.
+
+    Annotate it and `@dataclass` collects it as a field: it would join the
+    repr, `asdict()`, `__eq__`, and — for `Verdict` — the roster that
+    `test_every_verdict_field_is_classified_exactly_once` polices.
+    """
+    import dataclasses
+
+    for cls in (Verdict, ScenarioResult, HoneypotResult):
+        names = {f.name for f in dataclasses.fields(cls)}
+        assert "_QUARANTINE_FIELDS" not in names, cls.__name__
+
+
 # ---------- finding 1: the to_audit() contract ----------
 
 def _norm_doc(obj) -> str:

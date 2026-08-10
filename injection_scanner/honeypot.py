@@ -33,7 +33,11 @@ from dataclasses import dataclass, field
 from typing import Literal
 
 from injection_scanner import unicode_sanitize
-from injection_scanner.containment import QuarantineOnly, QuarantineOnlyText
+from injection_scanner.containment import (
+    QuarantineFieldsCoerced,
+    QuarantineOnly,
+    QuarantineOnlyText,
+)
 from injection_scanner.keyloader import KeyConfigError, load_key
 from injection_scanner.honeypot_scenarios import (
     ALL_CANARIES,
@@ -65,7 +69,13 @@ async def _with_retries(make_awaitable):
 
 
 @dataclass
-class ScenarioResult:
+class ScenarioResult(QuarantineFieldsCoerced):
+    # A bare string assigned to `api_error_detail` — at construction or
+    # afterwards — is wrapped before it lands. The holder is then what the
+    # object HAS, not what its constructor was trusted to pass. See
+    # `containment.QuarantineFieldsCoerced`.
+    _QUARANTINE_FIELDS = {"api_error_detail": QuarantineOnlyText}
+
     scenario: str
     verdict: Verdict
     signal: str
@@ -97,7 +107,12 @@ class ScenarioResult:
 
 
 @dataclass
-class HoneypotResult:
+class HoneypotResult(QuarantineFieldsCoerced):
+    # Same guard as `ScenarioResult`: `HoneypotResult(..., api_error_details=
+    # {...})` used to restore the bare dict that `json.dumps(result.
+    # api_error_details)` leaks.
+    _QUARANTINE_FIELDS = {"api_error_details": QuarantineOnly}
+
     ok: bool
     reason: str
     per_scenario: list[ScenarioResult] = field(default_factory=list)

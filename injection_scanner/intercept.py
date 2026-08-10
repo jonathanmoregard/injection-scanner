@@ -48,7 +48,7 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path
 
 from injection_scanner import decode, judge, lakera, secret_shapes, unicode_sanitize
-from injection_scanner.containment import QuarantineOnly
+from injection_scanner.containment import QuarantineFieldsCoerced, QuarantineOnly
 from injection_scanner.honeypot import check as honeypot_check
 
 # `QuarantineOnly` is defined in `injection_scanner.containment`, not here.
@@ -94,7 +94,16 @@ _AUDIT_SANITIZE_STAT_KEYS = (
 
 
 @dataclass
-class Verdict:
+class Verdict(QuarantineFieldsCoerced):
+    # Every assignment to a name in here — by the generated `__init__`, by
+    # `dataclasses.replace`, or by a caller writing to the attribute later —
+    # is wrapped in the holder first. Without it the annotation on
+    # `honeypot_api_errors` below is a promise only this package keeps:
+    # `Verdict(..., honeypot_api_errors={"A": provider_body})` put a bare
+    # dict on a public object and the next `repr(v)` spilled it. See
+    # `containment.QuarantineFieldsCoerced`.
+    _QUARANTINE_FIELDS = {"honeypot_api_errors": QuarantineOnly}
+
     ok: bool                       # True  -> deliver
     reason: str                    # short code e.g. "pass" / "secret_shape:aws_access_key"
     layers: dict[str, str]         # per-layer outcome for audit
