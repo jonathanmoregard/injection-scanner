@@ -284,41 +284,69 @@ def _error_detail(e: BaseException) -> QuarantineOnlyText:
     Field order puts the long, untrusted `message=` last so that the cheap
     high-value fields (type name, status, error type, request id) survive
     the length cap.
+
+    CANNOT RAISE. Everything below the first line runs inside a guard,
+    because this function is called from INSIDE the provider `except`
+    handler: a raise here aborts the `ScenarioResult(...)` that was being
+    built, so the coroutine propagates, `_run_all`'s gather catches it, and
+    the scenario is recorded as `unavailable:unhandled:<the NEW exception>`
+    — losing the detail AND replacing the provider's own error type with
+    the type of the failure to describe it. That is strictly worse than the
+    opacity this whole channel exists to fix, and it would happen exactly
+    when something unusual is going on.
+
+    The risk is established rather than hypothetical: the chain reaches
+    `unicode_sanitize.sanitize` via `_scrub`, and `intercept.scan_text`
+    already wraps that same call in a try/except at layer 0. Attribute
+    reads are not safe either — `status_code` / `body` / `request_id` are
+    SDK properties and a property can raise.
+
+    On an internal failure the line degrades to whatever was already
+    extracted plus `detail_unavailable:<type>`, so the caller always gets
+    at least the type-name detail it would have had before this channel
+    existed. Unscrubbed provider bytes can never appear in that fallback:
+    `type=` / `message=` are appended only after their scrub returns.
     """
     parts: list[str] = [type(e).__name__]
 
-    status = getattr(e, "status_code", None)
-    if isinstance(status, int) and not isinstance(status, bool):
-        parts.append(f"status={status}")
+    try:
+        status = getattr(e, "status_code", None)
+        if isinstance(status, int) and not isinstance(status, bool):
+            parts.append(f"status={status}")
 
-    body = getattr(e, "body", None)
-    err_type: str | None = None
-    err_message: str | None = None
-    if isinstance(body, dict):
-        inner = body.get("error")
-        node = inner if isinstance(inner, dict) else body
-        raw_type = node.get("type")
-        raw_message = node.get("message")
-        # Scrub, then cap. A fragment that scrubs away to nothing is left
-        # falsy and simply omitted below, rather than occupying the line
-        # with an empty `type=` / `message=`.
-        if isinstance(raw_type, str) and raw_type:
-            err_type = _scrub_capped(raw_type, _API_ERROR_DETAIL_MAX)
-        if isinstance(raw_message, str) and raw_message:
-            err_message = _scrub_capped(raw_message, _API_ERROR_DETAIL_MAX)
+        body = getattr(e, "body", None)
+        err_type: str | None = None
+        err_message: str | None = None
+        if isinstance(body, dict):
+            inner = body.get("error")
+            node = inner if isinstance(inner, dict) else body
+            raw_type = node.get("type")
+            raw_message = node.get("message")
+            # Scrub, then cap. A fragment that scrubs away to nothing is
+            # left falsy and simply omitted below, rather than occupying
+            # the line with an empty `type=` / `message=`.
+            if isinstance(raw_type, str) and raw_type:
+                err_type = _scrub_capped(raw_type, _API_ERROR_DETAIL_MAX)
+            if isinstance(raw_message, str) and raw_message:
+                err_message = _scrub_capped(raw_message, _API_ERROR_DETAIL_MAX)
 
-    if err_type:
-        parts.append(f"type={err_type}")
+        if err_type:
+            parts.append(f"type={err_type}")
 
-    rid = getattr(e, "request_id", None)
-    if rid is None and isinstance(body, dict):
-        rid = body.get("request_id")
-    clean_rid = _clean_request_id(rid)
-    if clean_rid:
-        parts.append(f"request_id={clean_rid}")
+        rid = getattr(e, "request_id", None)
+        if rid is None and isinstance(body, dict):
+            rid = body.get("request_id")
+        clean_rid = _clean_request_id(rid)
+        if clean_rid:
+            parts.append(f"request_id={clean_rid}")
 
-    if err_message:
-        parts.append(f"message={err_message}")
+        if err_message:
+            parts.append(f"message={err_message}")
+    except Exception as inner_exc:  # noqa: BLE001 — see "CANNOT RAISE" above
+        # Type name only, never `str(inner_exc)`: an exception raised while
+        # handling provider bytes can carry those bytes in its message, and
+        # this fallback is the one path that has not been scrubbed.
+        parts.append(f"detail_unavailable:{type(inner_exc).__name__}")
 
     detail = " ".join(parts)
     if len(detail) > _API_ERROR_DETAIL_MAX:

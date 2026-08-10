@@ -242,6 +242,102 @@ def test_audit_detail_truncated_and_sanitized(monkeypatch, caller):
     assert "messages.0.content" in d
 
 
+# ---------- adversarial finding: detail extraction must not raise ----------
+#
+# `_error_detail` runs INSIDE the provider `except` handler, while the
+# `ScenarioResult(...)` for that failure is being constructed. A raise there
+# aborts that construction, so the coroutine propagates to `_run_all`'s
+# gather, which records `unavailable:unhandled:<the NEW exception type>` and
+# no detail at all. That is worse than the opacity this channel exists to
+# fix: the detail is gone AND the provider's own error type has been
+# replaced by the type of the failure to describe it.
+#
+# Not hypothetical: the chain reaches `unicode_sanitize.sanitize` through
+# `_scrub`, and `intercept.scan_text` already guards that exact call at
+# layer 0. SDK attribute reads are properties and can raise too.
+
+_INNER_MESSAGE = "INNER-EXC-CANARY-must-not-be-stringified"
+
+
+def _sabotage_scrub(monkeypatch):
+    from injection_scanner import unicode_sanitize
+
+    def boom(_text):
+        raise ValueError(_INNER_MESSAGE)
+
+    monkeypatch.setattr(unicode_sanitize, "sanitize", boom)
+
+
+def test_error_detail_survives_a_raising_scrub(monkeypatch):
+    """The repro, directly on `_error_detail`."""
+    _sabotage_scrub(monkeypatch)
+
+    detail = honeypot._error_detail(_anthropic_bad_request())
+    d = detail.reveal_for_quarantine_record()
+
+    # Degraded, never lost: the provider's own error type still leads, and
+    # the cheap fields extracted before the failure survive.
+    assert d.startswith("BadRequestError")
+    assert "status=400" in d
+    # Why the rest is missing is stated, by exception type only.
+    assert "detail_unavailable:ValueError" in d
+    # Never `str(inner_exc)` — an exception raised while handling provider
+    # bytes can carry those bytes in its own message.
+    assert _INNER_MESSAGE not in d
+    # And no unscrubbed provider text rode the fallback out.
+    assert "credit balance" not in d
+
+
+@pytest.mark.parametrize("caller", ["anthropic", "openai"])
+def test_a_raising_scrub_does_not_cost_the_provider_error_type(monkeypatch, caller):
+    """The consequence the guard exists to prevent, pinned end to end.
+
+    Unguarded, the adapter's `except` handler never finished building its
+    result, so the signal became `unavailable:unhandled:ValueError`.
+    """
+    if caller == "anthropic":
+        _patch_anthropic(monkeypatch, _anthropic_bad_request())
+        _sabotage_scrub(monkeypatch)
+        r = asyncio.run(honeypot._call_anthropic(SCEN_A, "report body", [], set()))
+        expected = "unavailable:anthropic-api-error:BadRequestError"
+    else:
+        _patch_openai(monkeypatch, _openai_bad_request())
+        _sabotage_scrub(monkeypatch)
+        r = asyncio.run(honeypot._call_openai(SCEN_OPENAI, "report body", [], set()))
+        expected = "unavailable:openai-api-error:BadRequestError"
+
+    assert r.signal == expected
+    assert "unhandled" not in r.signal
+    # Fail-closed is unchanged: a provider error is still degraded coverage.
+    assert r.verdict == "Honeypot_Skipped"
+    assert "detail_unavailable:ValueError" in _detail(r)
+
+
+def test_error_detail_survives_exploding_sdk_properties():
+    """`status_code` / `body` / `request_id` are SDK properties, not fields."""
+
+    class Exploding(Exception):
+        @property
+        def status_code(self):
+            raise RuntimeError(_INNER_MESSAGE)
+
+        @property
+        def body(self):  # pragma: no cover - status_code raises first
+            raise RuntimeError(_INNER_MESSAGE)
+
+    d = honeypot._error_detail(Exploding("x")).reveal_for_quarantine_record()
+    assert d.startswith("Exploding")
+    assert "detail_unavailable:RuntimeError" in d
+    assert _INNER_MESSAGE not in d
+
+
+def test_error_detail_still_returns_a_holder_when_it_degrades(monkeypatch):
+    """The degraded path must not drop the containment either."""
+    _sabotage_scrub(monkeypatch)
+    assert isinstance(honeypot._error_detail(_anthropic_bad_request()),
+                      QuarantineOnlyText)
+
+
 # ---------- cross-vendor finding: the cap must follow the scrub ----------
 #
 # The cap used to be applied to the RAW message, before scrubbing. Every
