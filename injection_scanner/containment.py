@@ -47,6 +47,10 @@ They are guards, not just labels:
     a public object, and the next `repr()` spilled it. The mixin funnels
     every assignment to those fields through `coerce()`, so the wrapper is
     what the object HAS, not what its constructor was trusted to pass.
+    `coerce()` is TOTAL — every value becomes a holder, including types the
+    field was never meant to hold. A coercion with an escape hatch is not a
+    boundary: a list or any object with a payload-bearing `__repr__` used
+    to sail through untouched, which looked like containment and was not.
 
 What they do NOT protect against — known, accepted, and listed here so
 nobody mistakes these types for a hard boundary:
@@ -76,8 +80,8 @@ from collections.abc import Mapping
 
 
 class _OpaqueHolder:
-    """Shared redaction machinery. Subclasses supply `_redaction()` and
-    `_BARE_TYPES` only.
+    """Shared redaction machinery. Subclasses supply `_redaction()`,
+    `_BARE_TYPES` and `_adopt_foreign()` only.
 
     Factored out so the two holders cannot drift: a `__repr__` that
     forgets to redact — or a `coerce()` that forgets to wrap — is the whole
@@ -87,16 +91,51 @@ class _OpaqueHolder:
 
     __slots__ = ()
 
-    # The unwrapped shapes this holder is willing to adopt. Declared per
+    # The shapes this holder adopts NATURALLY, keeping the payload intact:
+    # `str` for the text holder, `Mapping` for the mapping one. Declared per
     # subclass; the coercion itself lives here so it cannot diverge.
+    # Everything else still gets wrapped, via `_adopt_foreign`.
     _BARE_TYPES: tuple[type, ...] = ()
 
     def _redaction(self) -> str:  # pragma: no cover - overridden
         raise NotImplementedError
 
     @classmethod
-    def coerce(cls, value: object) -> object:
-        """Wrap a bare payload; return anything else untouched.
+    def _adopt_foreign(cls, value: object) -> _OpaqueHolder:  # pragma: no cover - overridden
+        raise NotImplementedError
+
+    @staticmethod
+    def _render_unexpected(value: object) -> str:
+        """Render a value of an unexpected type, from INSIDE the holder.
+
+        Deliberately a holder method rather than something a caller does
+        before wrapping. `QuarantineOnlyText(repr(obj))` at a call site
+        creates exactly the bare intermediate this module exists to
+        prevent — a plain `str` of attacker-derived bytes, live in the
+        caller's scope, one log line away from escaping. Here the string
+        is born and consumed inside `_adopt_foreign` and is never returned
+        to anyone.
+
+        `repr()` is the rendering because it is what would have leaked
+        anyway: an object that reaches a `print`, an f-string or
+        `json.dumps(..., default=str)` is rendered by exactly this call.
+        Capturing it verbatim keeps the diagnostic and moves it inside the
+        holder.
+
+        Never raises. A `__repr__` that blows up is itself a caller bug and
+        must not become a scanner outage, so the exception TYPE NAME stands
+        in — the same discipline the rest of the package applies to
+        provider exceptions, and for the same reason: `str(e)` on a broken
+        repr can carry the very bytes we are containing.
+        """
+        try:
+            return repr(value)
+        except Exception as e:  # noqa: BLE001 — a broken __repr__ is not an outage
+            return f"<unrepresentable: {type(e).__name__}>"
+
+    @classmethod
+    def coerce(cls, value: object) -> _OpaqueHolder:
+        """Wrap ANY value. Total by construction: the return is a holder.
 
         Wrap rather than reject on purpose. A `TypeError` here would only
         move the failure from "silent leak in the library" to "crash in the
@@ -105,17 +144,35 @@ class _OpaqueHolder:
         the containment automatic: there is no way to spell the unsafe
         version.
 
-        Non-coercible values pass through unchanged rather than raising,
-        so this can never turn a working call into an outage. A wrong type
-        still fails closed downstream — `to_audit()` reaches for
-        `reveal_for_quarantine_record()` and gets an `AttributeError`
-        rather than writing the value out.
+        An earlier revision returned unrecognised values untouched, which
+        made the coercion look total without being it:
+        `Verdict(honeypot_api_errors=["provider text"])`, or any object
+        with a payload-bearing `__repr__`, stayed bare and leaked through
+        `repr(v)` and `json.dumps(..., default=str)`. Passing an odd type
+        through is never safer than wrapping it — these fields are
+        annotated `str` / `dict[str, str]`, so an odd type is already a
+        caller bug, and the only question is whether it is also a leaking
+        one. There are now four outcomes and every one of them is a
+        holder:
+
+          * already this holder -> returned by identity, so the library's
+            own pass-through (`hp.api_error_details` -> `Verdict`) is not
+            an unwrap-and-rewrap;
+          * `None` -> EMPTY holder, i.e. "absent". Not the string "None":
+            that is the field's own default (`default_factory`) semantics,
+            and it keeps a placeholder out of the audit record;
+          * a naturally-adopted shape (`_BARE_TYPES`) -> wrapped with the
+            payload intact;
+          * anything else -> `_adopt_foreign`, which renders it inside the
+            holder.
         """
         if isinstance(value, cls):
             return value
+        if value is None:
+            return cls()  # type: ignore[call-arg]
         if cls._BARE_TYPES and isinstance(value, cls._BARE_TYPES):
             return cls(value)  # type: ignore[call-arg]
-        return value
+        return cls._adopt_foreign(value)
 
     def __repr__(self) -> str:
         return self._redaction()
@@ -143,6 +200,11 @@ class QuarantineOnlyText(_OpaqueHolder):
 
     def __init__(self, value: str = "") -> None:
         self._value: str = value
+
+    @classmethod
+    def _adopt_foreign(cls, value: object) -> QuarantineOnlyText:
+        """Wrap a non-string. One expression: no bare local to leak."""
+        return cls(cls._render_unexpected(value))
 
     def reveal_for_quarantine_record(self) -> str:
         """Return the raw string. ONE legal destination.
@@ -190,8 +252,18 @@ class QuarantineOnly(_OpaqueHolder):
     # carries the payload just as well, and `__init__` already accepts one.
     _BARE_TYPES = (Mapping,)
 
+    # Key the rendering of a non-mapping lands under. Angle-bracketed so it
+    # cannot collide with a scenario name, which is what every real key is,
+    # and so it reads as "the library put this here" in an audit record.
+    _UNCOERCED_KEY = "<uncoerced>"
+
     def __init__(self, values: Mapping[str, str] | None = None) -> None:
         self._values: dict[str, str] = dict(values) if values else {}
+
+    @classmethod
+    def _adopt_foreign(cls, value: object) -> QuarantineOnly:
+        """Wrap a non-mapping. One expression: no bare local to leak."""
+        return cls({cls._UNCOERCED_KEY: cls._render_unexpected(value)})
 
     @classmethod
     def from_texts(cls, texts: Mapping[str, QuarantineOnlyText]) -> QuarantineOnly:

@@ -52,6 +52,22 @@ ECHOED_REQUEST_FRAGMENT = (
 # Model output produced while reading the attacker's report.
 JUDGE_EXCERPT = "REPORT-BYTES-CANARY-77bd02 attacker prose from the report"
 
+# Values of a type the fields were never meant to hold. A caller bug either
+# way — the question these pin is whether it is also a LEAKING caller bug.
+_ECHOED_IN_A_LIST = "PASSTHROUGH-CANARY-4d21ef provider text from the report"
+
+
+class _Echoing:
+    """Payload in the `__repr__`, which is what incidental paths render."""
+
+    def __repr__(self) -> str:
+        return f"_Echoing({_ECHOED_IN_A_LIST!r})"
+
+
+class _Exploding:
+    def __repr__(self) -> str:
+        raise RuntimeError("BOOM-CANARY-must-not-escape")
+
 
 def _scenario_result() -> ScenarioResult:
     return ScenarioResult(
@@ -335,23 +351,90 @@ def test_coerce_passes_an_existing_holder_through_untouched():
     assert QuarantineOnlyText.coerce(text) is text
 
 
-@pytest.mark.parametrize("value", [None, 7, ["A"], object()],
-                         ids=["none", "int", "list", "object"])
-def test_coerce_does_not_raise_on_an_uncoercible_value(value):
-    """Coerce, never reject.
+@pytest.mark.parametrize("holder", [QuarantineOnly, QuarantineOnlyText],
+                         ids=["mapping", "text"])
+@pytest.mark.parametrize(
+    "value",
+    [7, ["A"], ("A",), {"A"}, object(), _Echoing(), _Exploding(), lambda: None],
+    ids=["int", "list", "tuple", "set", "object", "echoing-repr",
+         "exploding-repr", "callable"],
+)
+def test_coerce_is_total_every_value_becomes_a_holder(holder, value):
+    """Coerce, never reject — and never pass through either.
 
-    Raising would turn a wrong type into a crash in the consuming server —
-    trading a silent leak for an outage in a fail-closed scanner. A value
-    it cannot wrap passes through and fails closed later, at `to_audit()`.
+    Raising would turn a wrong type into a crash in the consuming server,
+    trading a silent leak for an outage in a fail-closed scanner. But the
+    earlier "return it untouched" answer was not the safe half of that
+    trade: an unrecognised value stayed bare on a public object and leaked
+    through the ordinary rendering paths. Wrapping is strictly safer than
+    passing through, so every value ends up inside a holder.
     """
-    assert QuarantineOnly.coerce(value) is value
-    assert QuarantineOnlyText.coerce(value) is value
+    wrapped = holder.coerce(value)
+    assert isinstance(wrapped, holder)
+    assert wrapped is not value
+    for rendered in (repr(wrapped), str(wrapped), f"{wrapped}"):
+        assert "PASSTHROUGH-CANARY-4d21ef" not in rendered
+        assert "redacted" in rendered
+    assert "PASSTHROUGH-CANARY-4d21ef" not in json.dumps(
+        {"w": wrapped}, default=str
+    )
 
 
-def test_uncoercible_value_still_fails_closed_at_the_audit_boundary():
-    v = _verdict(honeypot_api_errors=None)
-    with pytest.raises(AttributeError):
-        v.to_audit()
+def test_coerce_captures_a_payload_bearing_repr_rather_than_dropping_it():
+    """The rendering is the diagnostic, moved inside the holder.
+
+    `repr()` is what would have leaked anyway — it is exactly what a
+    `print`, an f-string or `json.dumps(..., default=str)` would have
+    called. So capture it verbatim into the holder rather than discarding
+    it: contained, and still diagnosable from the audit file.
+    """
+    revealed = QuarantineOnlyText.coerce(_Echoing()).reveal_for_quarantine_record()
+    assert "PASSTHROUGH-CANARY-4d21ef" in revealed
+
+    mapping = QuarantineOnly.coerce([_ECHOED_IN_A_LIST]).reveal_for_quarantine_record()
+    # Landed under a reserved key that cannot collide with a scenario name.
+    assert set(mapping) == {"<uncoerced>"}
+    assert "PASSTHROUGH-CANARY-4d21ef" in mapping["<uncoerced>"]
+
+
+def test_a_broken_repr_is_not_an_outage():
+    """`_render_unexpected` must not propagate — and must not echo `str(e)`.
+
+    A `__repr__` that raises is a caller bug; a fail-closed scanner that
+    dies on a diagnostic field is worse. The exception TYPE NAME stands in,
+    the same discipline the package applies to provider exceptions, so a
+    message that itself carries report bytes cannot ride the placeholder.
+    """
+    revealed = QuarantineOnlyText.coerce(_Exploding()).reveal_for_quarantine_record()
+    assert revealed == "<unrepresentable: RuntimeError>"
+    assert "BOOM-CANARY" not in revealed
+
+
+@pytest.mark.parametrize(
+    "holder, empty",
+    [(QuarantineOnly, {}), (QuarantineOnlyText, "")],
+    ids=["mapping", "text"],
+)
+def test_none_coerces_to_an_empty_holder_meaning_absent(holder, empty):
+    """`None` is "absent", not the string "None".
+
+    The field default is an empty holder, so `None` matching that default
+    is the reading that keeps a junk placeholder out of the audit record.
+    Rendering it through `_adopt_foreign` would have written the literal
+    "None" into the record as if a provider had said it.
+    """
+    wrapped = holder.coerce(None)
+    assert isinstance(wrapped, holder)
+    assert not wrapped
+    assert len(wrapped) == 0
+    assert wrapped.reveal_for_quarantine_record() == empty
+
+
+def test_none_on_the_verdict_reads_as_an_empty_audit_entry():
+    """Was an `AttributeError` out of `to_audit()`; now simply absent."""
+    audit = _verdict(honeypot_api_errors=None).to_audit()
+    assert audit["honeypot_api_errors"] == {}
+    assert "None" not in json.dumps(audit["honeypot_api_errors"])
 
 
 def test_mixin_coerces_only_the_declared_fields():
@@ -525,6 +608,69 @@ def test_the_library_path_is_unchanged_by_the_coercion():
     assert _verdict(honeypot_api_errors=holder).honeypot_api_errors is holder
     h = HoneypotResult(ok=False, reason="r", api_error_details=holder)
     assert h.api_error_details is holder
+
+
+# ---------- cross-vendor round 3: the coercion has no escape hatch ----------
+#
+# Round 2 routed every assignment through `coerce()`, but `coerce()` itself
+# returned unrecognised types untouched. So the guard was total for the two
+# shapes it recognised and absent for everything else — which is the worst
+# shape for a containment control, because the annotation and the mixin both
+# say "handled".
+
+@pytest.mark.parametrize(
+    "value", [[_ECHOED_IN_A_LIST], _Echoing()],
+    ids=["list", "repr-bearing-object"],
+)
+def test_verdict_wraps_a_value_of_an_unexpected_type(value):
+    """Repro: `Verdict(honeypot_api_errors=["provider text"])`."""
+    v = _verdict(honeypot_api_errors=value)
+
+    assert isinstance(v.honeypot_api_errors, QuarantineOnly)
+    for rendered in (repr(v), str(v), f"{v}"):
+        assert "PASSTHROUGH-CANARY-4d21ef" not in rendered
+    assert "PASSTHROUGH-CANARY-4d21ef" not in json.dumps(
+        {"v": v.honeypot_api_errors}, default=str
+    )
+    # Contained, not deleted: the audit file still gets the diagnostic.
+    assert "PASSTHROUGH-CANARY-4d21ef" in json.dumps(v.to_audit())
+
+
+@pytest.mark.parametrize(
+    "value", [[_ECHOED_IN_A_LIST], _Echoing()],
+    ids=["list", "repr-bearing-object"],
+)
+def test_honeypot_dataclasses_wrap_a_value_of_an_unexpected_type(value):
+    """Same hole on all three honeypot-side fields, including assignment."""
+    s = ScenarioResult(scenario="A", verdict="Honeypot_Skipped", signal="s",
+                       api_error_detail=value, raw_excerpt=value)
+    h = HoneypotResult(ok=False, reason="r", per_scenario=[s],
+                       api_error_details=value)
+
+    assert isinstance(s.api_error_detail, QuarantineOnlyText)
+    assert isinstance(s.raw_excerpt, QuarantineOnlyText)
+    assert isinstance(h.api_error_details, QuarantineOnly)
+
+    h.api_error_details = value
+    s.api_error_detail = value
+    assert isinstance(h.api_error_details, QuarantineOnly)
+    assert isinstance(s.api_error_detail, QuarantineOnlyText)
+
+    import dataclasses
+    blob = json.dumps(dataclasses.asdict(h), default=str)
+    assert "PASSTHROUGH-CANARY-4d21ef" not in blob
+    for rendered in (repr(s), repr(h), f"{s.api_error_detail}"):
+        assert "PASSTHROUGH-CANARY-4d21ef" not in rendered
+
+
+def test_a_broken_repr_on_a_field_does_not_break_construction():
+    """Fail-closed means the scanner keeps running, including on junk."""
+    v = _verdict(honeypot_api_errors=_Exploding())
+    assert isinstance(v.honeypot_api_errors, QuarantineOnly)
+    assert v.to_audit()["honeypot_api_errors"] == {
+        "<uncoerced>": "<unrepresentable: RuntimeError>"
+    }
+    assert "BOOM-CANARY" not in json.dumps(v.to_audit())
 
 
 # name -> holder class, keyed by the annotation as written in the source
