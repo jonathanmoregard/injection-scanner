@@ -510,6 +510,54 @@ def _arg_blob(inp: object) -> str | None:
         return None
 
 
+def _unhandled_block_text(block: object) -> str:
+    """Scan-surface contribution of a response block this adapter does not model.
+
+    `_call_anthropic` walks `resp.content` looking for `tool_use` and
+    `text`. The SDK's `ContentBlock` union has TWELVE members
+    (`ThinkingBlock`, `RedactedThinkingBlock`, `ServerToolUseBlock`,
+    `WebSearchToolResultBlock`, `CodeExecutionToolResultBlock`, …), and an
+    `if/elif` with no `else` silently discards the other ten. A canary
+    echoed inside one would never be scanned and the scenario would read
+    clean — the same "unknown shape, conclude clean" fault as the tool-call
+    defects above, one layer out.
+
+    NOT reachable under the current request shape: we send no `thinking`
+    parameter and offer no server or MCP tools, so the API returns only
+    `text` and `tool_use`. This exists so that enabling either does not
+    silently open the hole — a config change should not be able to create
+    a detection gap.
+
+    FOLD IN, DO NOT FAIL CLOSED. Quarantining on the mere presence of an
+    unknown block would turn "someone switched thinking on" into a total
+    outage misattributed to the scanner, which is exactly the failure this
+    module has now fixed three times. Scanning more content costs nothing
+    and is strictly more detection: if the judge echoes the canary in its
+    reasoning, we want to catch it, not to refuse to look AND refuse to
+    proceed.
+
+    A block that exposes no readable content simply contributes nothing.
+    That is NOT grounds to quarantine, and it must not be "fixed" into a
+    fail-closed later: absence of readable content in a block we never
+    asked for is not evidence that a scan was missed.
+
+    The rendering is untrusted judge output. It joins the same freeform
+    text surface the `text` blocks feed, which is canary-scanned and
+    sliced into the audit-only `raw_excerpt`; it reaches no signal,
+    reason, or layer, and opens no new channel.
+    """
+    if getattr(block, "type", "") == "redacted_thinking":
+        # Ciphertext by construction, so a canary cannot be a literal
+        # substring of it — and at a few hundred characters per block it
+        # would push real judge text out of the 300-char audit excerpt.
+        # The type marker still goes in, so the block stays VISIBLE to an
+        # operator reading the excerpt; only the opaque payload is left
+        # out. Skipping the block entirely would be the special case worth
+        # avoiding.
+        return "redacted_thinking"
+    return _arg_blob(block) or ""
+
+
 def _args_are_readable(inp: object) -> bool:
     """Whether a canary scan of these arguments proves anything.
 
@@ -861,6 +909,11 @@ async def _call_anthropic(
     try:
         called: list[tuple[str, object]] = []
         text_chunks: list[str] = []
+        # Kept separate from `text_chunks` only for ORDER: the judge's own
+        # prose leads the joined surface, so the 300-char `raw_excerpt` an
+        # operator reads still opens with the response rather than with a
+        # rendered `ThinkingBlock`. Both halves are scanned identically.
+        other_chunks: list[str] = []
         for block in resp.content:
             btype = getattr(block, "type", "")
             if btype == "tool_use":
@@ -878,6 +931,11 @@ async def _call_anthropic(
                 ))
             elif btype == "text":
                 text_chunks.append(getattr(block, "text", ""))
+            else:
+                # Every other block type in the union — see
+                # `_unhandled_block_text` for why this folds in rather
+                # than failing closed.
+                other_chunks.append(_unhandled_block_text(block))
     except Exception as e:
         # A malformed / unexpected response shape must not fail-open — treat
         # an unparseable response as degraded coverage (Skipped), not a pass.
@@ -886,7 +944,9 @@ async def _call_anthropic(
             signal=f"unavailable:anthropic-parse-error:{type(e).__name__}",
             provider="anthropic", model=scenario["model"],
         )
-    return _classify_from_parts(scenario, called, " ".join(text_chunks), trap_names)
+    return _classify_from_parts(
+        scenario, called, " ".join(text_chunks + other_chunks), trap_names
+    )
 
 
 async def _call_openai(
@@ -951,6 +1011,15 @@ async def _call_openai(
             api_error_detail=_error_detail(e),
         )
     try:
+        # `choices[0]` only. We never pass `n`, so the API returns exactly
+        # one choice and there is nothing here to miss today. Scanning
+        # alternatives is NOT a one-liner and is deliberately not attempted:
+        # separate choices are alternative completions, so merging their
+        # tool calls into one `called` list would invent a response the
+        # model never produced, and keeping them apart needs a rule for
+        # combining per-choice verdicts (any-triggers-wins? majority?)
+        # that nothing in the ensemble currently defines. If `n` is ever
+        # set, that rule has to be decided first.
         msg = resp.choices[0].message
         called: list[tuple[str, object]] = []
         for tc in (msg.tool_calls or []):
@@ -1011,6 +1080,14 @@ async def _call_openai(
                     args = _UnparsedArgs(raw_args)
             called.append((fn.name, args))
         text = msg.content or ""
+        # `refusal` is a SEPARATE model-authored string: when the model
+        # declines, the prose lands here and `content` is None. It is
+        # judge output like any other, so it joins the canary scan surface
+        # rather than being discarded — a refusal that quotes what it was
+        # asked to exfiltrate is still an exfiltration.
+        refusal = getattr(msg, "refusal", None)
+        if isinstance(refusal, str) and refusal:
+            text = f"{text} {refusal}".strip()
     except Exception as e:
         # A malformed / unexpected response shape must not fail-open — treat
         # an unparseable response as degraded coverage (Skipped), not a pass.
