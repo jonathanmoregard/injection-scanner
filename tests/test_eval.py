@@ -11,12 +11,14 @@ signal the gap has closed, and they should be tightened at that point.
 from __future__ import annotations
 
 from pathlib import Path
+from types import SimpleNamespace
 
 from injection_scanner.eval import (
     BLOCK,
     PASS,
     EvalCase,
     Scorecard,
+    _main,
     evaluate,
     load_corpus_dir,
     load_jsonl,
@@ -128,3 +130,136 @@ def test_load_corpus_dir_reads_labels_file() -> None:
         *DETERMINISTIC_BLOCKS,
         *PROSE_INJECTIONS,
     }
+
+
+# ---------------------------------------------------------------------------
+# Disagreement confirmation (added 2026-09-05).
+#
+# The hosted layers are sampled LLMs, so a single scan is a draw. CI's eval
+# saw blatant_tool_coerce.md flip block->pass on 2026-08-10 and again on
+# 2026-09-05 — the same commit went green on rerun — because the honeypot
+# models occasionally decline the bait in every scenario at once.
+#
+# `confirm_disagreements=N` re-scans ONLY a case whose verdict disagrees with
+# its label, up to N more times. A stochastic miss therefore has to repeat
+# N+1 times in a row to count, while a deterministic regression still
+# disagrees on every attempt and still fails. Nothing is re-scanned on a
+# clean run, so the gate costs nothing when nothing is wrong. The
+# first-attempt numbers stay on the scorecard: the single-shot weakness is
+# reported, not hidden.
+# ---------------------------------------------------------------------------
+
+
+def _scripted_scan(monkeypatch, script: dict[str, list[bool]]) -> dict[str, int]:
+    """Replace scan_text with a stub replaying a per-text sequence of `ok`.
+
+    The last value in a sequence repeats once it is exhausted. Returns the
+    live call counter so a test can assert how many scans each case cost.
+    """
+    calls: dict[str, int] = {}
+
+    def fake(raw: str, *, use_honeypot: bool = False, use_lakera: bool = False):
+        seq = script[raw]
+        i = calls.get(raw, 0)
+        calls[raw] = i + 1
+        ok = seq[min(i, len(seq) - 1)]
+        return SimpleNamespace(ok=ok, reason="pass" if ok else f"stub:attempt{i + 1}")
+
+    monkeypatch.setattr("injection_scanner.eval.scan_text", fake)
+    return calls
+
+
+def test_default_is_single_shot(monkeypatch) -> None:
+    """With no confirmation configured the harness is byte-for-byte the old one."""
+    calls = _scripted_scan(monkeypatch, {"inj": [True, False]})
+    card = evaluate([EvalCase(id="inj", text="inj", expected=BLOCK)])
+    assert (card.tp, card.fn) == (0, 1)
+    assert calls["inj"] == 1
+    assert card.rows[0].attempts == 1
+    assert card.rows[0].first_predicted == PASS
+    assert card.flaky == []
+    assert "FLAKY" not in card.format()
+    assert "first-attempt" not in card.format()
+
+
+def test_stochastic_miss_is_caught_on_rescan_and_named_flaky(monkeypatch) -> None:
+    calls = _scripted_scan(monkeypatch, {"inj": [True, False]})
+    card = evaluate(
+        [EvalCase(id="inj", text="inj", expected=BLOCK)], confirm_disagreements=1
+    )
+    assert (card.tp, card.fn) == (1, 0)
+    assert calls["inj"] == 2
+    row = card.rows[0]
+    assert row.attempts == 2
+    assert row.first_predicted == PASS
+    assert row.predicted == BLOCK
+    assert row.reason == "stub:attempt2"
+    assert card.flaky == ["inj"]
+    # The confirmed number gates; the first-attempt number is still reported.
+    assert card.recall == 1.0
+    assert card.first_attempt_recall == 0.0
+    out = card.format()
+    assert "FLAKY inj" in out
+    assert "matched its label on attempt 2 of 2" in out
+    assert "first-attempt recall=0.000" in out
+
+
+def test_deterministic_miss_still_fails_and_says_so(monkeypatch) -> None:
+    calls = _scripted_scan(monkeypatch, {"inj": [True]})
+    card = evaluate(
+        [EvalCase(id="inj", text="inj", expected=BLOCK)], confirm_disagreements=2
+    )
+    assert (card.tp, card.fn) == (0, 1)
+    assert calls["inj"] == 3
+    assert card.rows[0].attempts == 3
+    assert card.flaky == []
+    out = card.format()
+    assert "FAIL  inj" in out
+    assert "disagreed on all 3 attempts" in out
+
+
+def test_agreeing_verdict_is_never_rescanned(monkeypatch) -> None:
+    calls = _scripted_scan(monkeypatch, {"inj": [False], "ok": [True]})
+    card = evaluate(
+        [
+            EvalCase(id="inj", text="inj", expected=BLOCK),
+            EvalCase(id="ok", text="ok", expected=PASS),
+        ],
+        confirm_disagreements=3,
+    )
+    assert calls == {"inj": 1, "ok": 1}
+    assert (card.tp, card.tn) == (1, 1)
+    assert card.flaky == []
+
+
+def test_false_alarm_direction_is_symmetric(monkeypatch) -> None:
+    _scripted_scan(monkeypatch, {"ok": [False, True]})
+    card = evaluate(
+        [EvalCase(id="ok", text="ok", expected=PASS)], confirm_disagreements=1
+    )
+    assert (card.tn, card.fp) == (1, 0)
+    assert card.flaky == ["ok"]
+    assert card.fp_rate == 0.0
+    assert card.first_attempt_fp_rate == 1.0
+
+
+def test_negative_confirmation_is_rejected() -> None:
+    try:
+        evaluate([], confirm_disagreements=-1)
+    except ValueError:
+        return
+    raise AssertionError("confirm_disagreements=-1 must raise")
+
+
+def test_cli_gates_on_the_confirmed_verdict(monkeypatch, tmp_path: Path) -> None:
+    corpus = tmp_path / "c.jsonl"
+    corpus.write_text(
+        '{"id": "inj", "text": "inj", "expected": "block"}\n', encoding="utf-8"
+    )
+    _scripted_scan(monkeypatch, {"inj": [True, False]})
+    assert _main([str(corpus), "--min-recall", "1.0"]) == 1
+    _scripted_scan(monkeypatch, {"inj": [True, False]})
+    assert _main([str(corpus), "--min-recall", "1.0", "--confirm-disagreements", "1"]) == 0
+    # A deterministic miss is not rescued by confirmation.
+    _scripted_scan(monkeypatch, {"inj": [True]})
+    assert _main([str(corpus), "--min-recall", "1.0", "--confirm-disagreements", "2"]) == 1
