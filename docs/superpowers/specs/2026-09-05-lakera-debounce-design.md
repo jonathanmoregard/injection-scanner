@@ -41,8 +41,9 @@ Goals:
    processes are alive.
 2. After a 429 (or 503) nobody in the fleet calls Lakera again until `Retry-After` — or a capped
    exponential backoff when the header is absent — has elapsed.
-3. CI never bursts, never runs two Lakera-touching jobs at once, and never starts the 16-call
-   `eval` when the 1-call `smoke` already shows Lakera down.
+3. Per-push CI makes no external calls at all. The live checks run once nightly and on manual
+   dispatch, never overlap, and never start the 16-call `eval` when the 1-call `smoke` already
+   shows Lakera down.
 4. An outage never scores as a classification: `eval` aborts loudly on the first infra verdict.
 5. Every limit is an input (environment or CLI), never a constant fitted to today's numbers; the
    defaults are provisional until the 2026-09-06 00:12 measurement lands.
@@ -170,8 +171,9 @@ account is evidently not throttling us.
 Half-open behaviour falls out of the state: once `open_until` passes, the first caller with a token
 goes through; a further 429 increments `failures` and opens the breaker for longer (capped).
 
-Errors: an `OSError`/`ValueError` inside `acquire` yields `ERROR`. `record_*` swallow their own
-errors — if the state cannot be written, the very next `acquire` fails the same way and refuses, so
+Errors: any exception inside `acquire` (IO, lock timeout, malformed state that slipped past the
+loader, arithmetic) yields `ERROR` — `intercept.py` does not wrap `lakera.check`, so an escapee would
+abort the whole scan instead of failing it closed. `record_*` swallow their own errors — if the state cannot be written, the very next `acquire` fails the same way and refuses, so
 a broken limiter can never turn into a hammer. A corrupt, truncated, or foreign-schema state file
 is NOT an error: it is replaced by a fresh state (full bucket, breaker closed).
 
@@ -226,8 +228,11 @@ refused call costs ~1 ms and no network.
 ### 3.4 `intercept.py` plumbing
 
 `scan(path, use_honeypot=True, use_lakera=True, lakera_max_wait_s=None)` and `scan_text(...)`
-gain the one keyword and pass it to `lakera.check(san.text, max_wait_s=lakera_max_wait_s)`. No other
-behaviour change; the deferred-arbitration path is untouched.
+gain the one keyword and pass it unconditionally to
+`lakera.check(san.text, max_wait_s=lakera_max_wait_s)`. No other behaviour change; the
+deferred-arbitration path is untouched. Existing one-argument `lakera.check` stubs in
+`tests/test_intercept.py` are updated to accept the keyword — a conditional call site that only
+passes it when set would hide the signature change from those tests.
 
 ### 3.5 `eval.py` — batch caller, honest scorecard
 
@@ -235,50 +240,76 @@ behaviour change; the deferred-arbitration path is untouched.
   `run_eval(..., lakera_max_wait_s=...)` to `scan_text`. A batch run waits for its turn instead of
   being refused; the default is on the CLI because `eval` is always a batch caller and should not
   depend on the operator remembering an env var.
-- Infra abort. `run_eval` classifies every verdict with `_is_infra_reason(reason)`, the same
+- Infra abort. `evaluate` classifies every verdict with `_is_infra_reason(reason)`, the same
   head-anchored, closed rule research-agent uses (`mcp_server/server.py::_is_infra_reason`):
   the first `:`-segment ends with `_unavailable`; or the first segment is `honeypot` /
   `lakera_arbitration` and the second ends with `_unavailable`; or the whole reason is one of
   `no-key`, `key-config-error`, `bad-response`. Never a substring search; default `False`. On the
-  first infra verdict `run_eval` raises `EvalInfraError(case_id, reason)`; `main()` prints
+  first infra verdict `evaluate` raises `EvalInfraError(case_id, reason)`; `_main()` prints
   `INFRA <case_id> <reason>` to stderr and exits with code `3` (distinct from `1` = gate failed,
   `2` = usage). No further cases are scanned, so a throttled Lakera costs at most one probe per
   breaker window and the scorecard can never report recall earned by an outage.
 
-### 3.6 `.github/workflows/ci.yml`
+### 3.6 CI: hermetic merge gate, live checks on a schedule
+
+Maintainer directive 2026-09-06 (verbatim): *"ci tests should not call external services in
+general, smell. Sceptical of calling lakera/honeypots in ci."* Resolved as: the per-push workflow
+makes no external calls at all; the live checks move to their own scheduled / on-demand workflow.
+
+**`.github/workflows/ci.yml`** (`pull_request` + `push: main`) keeps ONLY the `test` job (python
+3.12 / 3.13 matrix, `pytest tests/`). The `smoke` and `eval` jobs, their fork guards and every
+`secrets.*` reference are removed. A workflow-level concurrency block is added so superseded PR
+pushes are cancelled instead of stacking:
 
 ```yaml
-# Superseded PR pushes are cancelled; pushes to main queue behind each other.
 concurrency:
   group: ci-${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+```
 
+**`.github/workflows/live-eval.yml`** (new) carries the live pipeline, unchanged in what it runs:
+
+```yaml
+name: live-eval
+on:
+  schedule:
+    - cron: "17 3 * * *"          # once nightly, off the hour
+  workflow_dispatch: {}           # on demand, incl. on a branch: gh workflow run live-eval.yml --ref <branch>
+permissions:
+  contents: read
+# At most ONE Lakera-touching job anywhere in this repo at any time; queue, never cancel.
+concurrency:
+  group: lakera-live
+  cancel-in-progress: false
 jobs:
   smoke:
     timeout-minutes: 10
-    # At most ONE Lakera-touching job anywhere in this repo at any time.
-    concurrency:
-      group: lakera-live
-      cancel-in-progress: false
-    ...
-  eval:
-    needs: [test, smoke]            # the 1-call smoke is the canary for the 16-call eval
-    timeout-minutes: 30
-    concurrency:
-      group: lakera-live
-      cancel-in-progress: false
-    env / run:
+    env:
       INJECTION_SCANNER_LAKERA_MIN_INTERVAL_S: "30"   # CI paces itself stricter than the fleet
-      ... --lakera-max-wait 900
+    ...                                             # the former ci.yml smoke job, keys via secrets
+  eval:
+    needs: smoke                    # the 1-call smoke is the canary for the 16-call eval
+    timeout-minutes: 30
+    env:
+      INJECTION_SCANNER_LAKERA_MIN_INTERVAL_S: "30"
+    ...                                             # the former eval job, plus --lakera-max-wait 900
 ```
 
-Relations this encodes: `smoke` and `eval` never overlap within a run (`needs`) or across runs
-(shared job-level group); a PR push while the previous push's run is still going cancels the old
-run instead of stacking a second eval; a Lakera outage fails `smoke` (1 call) and `eval` is skipped
-(0 calls). The CI runner's cache dir is fresh per run, so its limiter is a separate domain from the
-local fleet — which is why CI gets its own, stricter interval. Expected cost: the eval job grows
-from ~1.5 min to ~9 min (16 cases × 30 s). Job-level and workflow-level `concurrency` are both
-supported by GitHub Actions and compose.
+Relations this encodes: PR CI touches no vendor, needs no secret, and cannot go red because a
+vendor is down or throttled; live checks cost ~17 Lakera calls per day instead of ~17 per push;
+`smoke` and `eval` never overlap within a run (`needs`) or across runs (the workflow-level group);
+a Lakera outage fails `smoke` (1 call) and `eval` is skipped (0 calls). GitHub notifies the last
+committer of a scheduled workflow on failure, so a nightly red is seen without extra machinery. A
+detection-quality-sensitive PR is checked by dispatching `live-eval` on its branch before merge —
+deliberately a human gesture, like the merge click. The CI runner's cache dir is fresh per run, so
+its limiter is a separate domain from the local fleet — hence the stricter interval. Production's
+own boot smoke (every research-agent spawn, agent-readable since 2026-09-05) remains the live
+canary for vendor drift, which is where such drift actually bites.
+
+Offline regression coverage does not shrink: the SDK-signature class is caught by
+`tests/test_judge.py` driving the real SDK over a stub transport, and the Lakera response contract
+is pinned by `tests/test_lakera.py` over the monkeypatched `_post` seam. What moves to the nightly is
+the sampled-model *benchmark* (recall / FP over the labelled corpus), which was never deterministic.
 
 ### 3.7 README
 
@@ -323,8 +354,8 @@ at `tmp_path` so no test touches `~/.cache`.
 - `min_interval_s=0` → always `ALLOWED` while the breaker is closed.
 - clock going backwards does not mint tokens.
 - cross-process: 3 subprocesses × 20 `acquire()` against one state dir with
-  `min_interval_s=1e6`, `burst=2` → exactly 2 `ALLOWED` in total (`Decision` written to stdout,
-  parent sums).
+  `min_interval_s=3600` (the clamp ceiling), `burst=2` → exactly 2 `ALLOWED` in total (`Decision`
+  written to stdout, parent sums).
 - env parsing: malformed values fall back to defaults; clamps applied.
 
 `tests/test_lakera.py` additions: `throttled` and `limiter-error` reasons; no token spent on the
@@ -338,11 +369,15 @@ is exactly `lakera_unavailable:HTTPError:429` and the state file contains no hea
 and on `honeypot:…_unavailable`, exit code 3, message on stderr, no further `scan_text` calls;
 `secret_shape:thing_unavailable` is NOT infra; a normal block/pass run is unchanged.
 
-CI file guard (`tests/test_ci_relations.py`, `pyyaml` added to the `test` extra): `smoke` and `eval`
-both declare `concurrency.group == "lakera-live"` with `cancel-in-progress: false`; `eval.needs`
-contains `smoke`; the workflow-level group contains `github.ref`; `eval` passes `--lakera-max-wait`.
-This is the "mind the relations" rule made executable so a future edit cannot quietly reintroduce
-overlapping Lakera jobs.
+CI file guard (`tests/test_ci_relations.py`, `pyyaml` added to the `test` extra), parsing both
+workflow files (note PyYAML parses the `on:` key as boolean `True`): `ci.yml` triggers on
+`pull_request` and `push`, has no job other than `test`, and contains no `secrets.` reference
+anywhere; `live-eval.yml` triggers on exactly `schedule` and `workflow_dispatch`, declares
+workflow-level `concurrency.group == "lakera-live"` with `cancel-in-progress: false`, `eval.needs`
+is `smoke`, both live jobs set `INJECTION_SCANNER_LAKERA_MIN_INTERVAL_S`, and the eval command
+contains `--lakera-max-wait`. This is the "mind the relations" and "no external services in CI"
+rules made executable, so a future edit cannot quietly put a vendor call back on the merge gate or
+reintroduce overlapping Lakera jobs.
 
 Verifier: `uv run --extra test pytest -q tests/` in the worktree, plus `python -m compileall`.
 
@@ -367,7 +402,10 @@ Verifier: `uv run --extra test pytest -q tests/` in the worktree, plus `python -
   header.
 - **503 trips the breaker alongside 429.** RFC 9110 puts `Retry-After` on both; a Lakera-side
   outage deserves the same courtesy and it costs nothing.
-- **CI keeps Lakera in `eval`.** The full-pipeline eval is what caught the judge regression; the fix
-  is pacing and serialization, not removing the signal.
+- **Live checks leave the merge gate.** A per-push gate coupled to sampled models and a vendor's
+  quota is non-deterministic by construction (today's flake, today's 429s) and buys no correctness
+  the offline SDK-over-stub-transport tests do not already buy. The live pipeline is a benchmark
+  plus a vendor canary: nightly + on-demand, serialised, paced — and production's boot smoke stays
+  the real-time canary.
 - **No verdict cache for CI.** Caching security verdicts to save calls is a second system with its
   own staleness and poisoning questions; out of scope.
