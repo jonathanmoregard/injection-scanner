@@ -1,13 +1,17 @@
 """Tests for the L4 judge arbitration layer.
 
 FULLY MOCKED — no network. Provider calls are stubbed at the `_ask_one`
-seam (vote aggregation) or exercised through the no-key paths (adapter
-fail-closed behavior), mirroring the test_lakera.py approach.
+seam (vote aggregation), exercised through the no-key paths (adapter
+fail-closed behavior), or — for the request itself — driven through the
+REAL provider SDK over a stub HTTP transport (see "real-SDK request shape"
+at the bottom of this file), mirroring the test_lakera.py approach.
 """
 from __future__ import annotations
 
 import asyncio
+import json
 
+import httpx2
 import pytest
 
 from injection_scanner import judge, keyloader
@@ -228,3 +232,144 @@ def test_check_works_inside_running_event_loop(monkeypatch):
 
     r = asyncio.run(in_loop())
     assert r.ok
+
+
+# ----- real-SDK request shape (the silent parameter-removal class) -----
+#
+# Measured 2026-09-05. The anthropic SDK moved 0.x -> 1.4.0 under this
+# package's unbounded `anthropic>=0.96.0` floor and dropped `temperature`
+# from `messages.create`. Every Anthropic judge call then raised TypeError
+# before reaching the network: `api-error:TypeError` -> `unavailable` ->
+# fail-closed. The gate stayed sound, but L4 arbitration — whose entire job
+# is clearing Lakera `prompt_attack` false positives on agent-tooling
+# research — stopped clearing anything, and the eval blocked 4/9 benign
+# `fp_*` fixtures (fp_rate 0.444 against a 0.000 ceiling).
+#
+# The escape was in the TESTS, not the code. `_Raiser.__call__(*a, **kw)`
+# above — like any `MagicMock` — accepts every keyword, so no local test
+# could see a signature change; it took a live-key CI job to surface it.
+#
+# These tests fix that by stubbing only the HTTP transport: the real client
+# class and the real `create` method run, so a removed, renamed, or
+# retyped parameter raises here exactly as it does in production, with no
+# network and no API key. They also assert the resulting WIRE body, which
+# is the only place a raw-body parameter can be observed now that the SDK
+# no longer exposes `temperature` as a named argument to introspect.
+
+_ANTHROPIC_200 = {
+    "id": "msg_regression",
+    "type": "message",
+    "role": "assistant",
+    "model": "claude-haiku-4-5",
+    "content": [{"type": "text", "text": "benign"}],
+    "stop_reason": "end_turn",
+    "stop_sequence": None,
+    "usage": {"input_tokens": 1, "output_tokens": 1},
+}
+
+_OPENAI_200 = {
+    "id": "chatcmpl-regression",
+    "object": "chat.completion",
+    "created": 1,
+    "model": "gpt-4o-mini",
+    "choices": [
+        {
+            "index": 0,
+            "message": {"role": "assistant", "content": "benign"},
+            "finish_reason": "stop",
+        }
+    ],
+    "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2},
+}
+
+
+def _stub_transport(monkeypatch, provider: str) -> list[dict]:
+    """Run the REAL provider SDK against a stub transport.
+
+    Returns the list the outgoing JSON request bodies are captured into.
+    Only `http_client` is substituted — the SDK's own client class and
+    `create` method are untouched, which is the whole point: they are what
+    validates the keyword arguments the adapter passes.
+
+    `httpx2` is no extra dependency surface: it is a hard requirement of
+    both installed SDKs (`anthropic` needs httpx2<3,>=2.0.0, `openai`
+    httpx2<3,>=2.7.0) and is pinned in uv.lock. Importing it at module
+    scope is deliberate — if a future SDK swaps its HTTP layer, this file
+    fails loudly, which is exactly the drift these tests exist to catch.
+    """
+    bodies: list[dict] = []
+
+    def handle(request, payload=None):
+        bodies.append(json.loads(request.content))
+        return httpx2.Response(200, json=payload)
+
+    monkeypatch.setattr(judge, "_anthropic_key", lambda: "sk-ant-test")
+    monkeypatch.setattr(judge, "_openai_key", lambda: "sk-openai-test")
+
+    if provider == "anthropic":
+        import anthropic
+
+        real = anthropic.Anthropic
+
+        def factory(*a, **kw):
+            kw["http_client"] = anthropic.DefaultHttpxClient(
+                transport=httpx2.MockTransport(
+                    lambda r: handle(r, _ANTHROPIC_200)
+                )
+            )
+            return real(*a, **kw)
+
+        monkeypatch.setattr(anthropic, "Anthropic", factory)
+        return bodies
+
+    import openai
+
+    real_openai = openai.OpenAI
+
+    def openai_factory(*a, **kw):
+        kw["http_client"] = openai.DefaultHttpxClient(
+            transport=httpx2.MockTransport(lambda r: handle(r, _OPENAI_200))
+        )
+        return real_openai(*a, **kw)
+
+    monkeypatch.setattr(openai, "OpenAI", openai_factory)
+    return bodies
+
+
+def _ask_over_stub(monkeypatch, provider: str):
+    bodies = _stub_transport(monkeypatch, provider)
+    ask = judge._ask_anthropic if provider == "anthropic" else judge._ask_openai
+    vote = asyncio.run(ask(_JUDGES_BY_PROVIDER[provider], "sealed document"))
+    return vote, bodies
+
+
+@pytest.mark.parametrize("provider", ["anthropic", "openai"])
+def test_judge_request_matches_installed_sdk_signature(monkeypatch, provider):
+    """Every kwarg the adapter passes must exist on the INSTALLED SDK.
+
+    This is the test that would have caught the incident: with
+    `temperature=0` passed as a named argument, the real `create` raises
+    TypeError, the adapter maps it to `api-error:TypeError`, and this fails
+    — offline, in under a second.
+    """
+    vote, bodies = _ask_over_stub(monkeypatch, provider)
+    assert vote.signal != "api-error:TypeError"
+    assert not vote.signal.startswith("api-error:")
+    assert (vote.vote, vote.signal) == ("benign", "verdict")
+    assert len(bodies) == 1, "the adapter must actually reach the transport"
+
+
+@pytest.mark.parametrize("provider", ["anthropic", "openai"])
+def test_judge_requests_deterministic_sampling(monkeypatch, provider):
+    """Determinism is a security property of this layer, not a nicety.
+
+    A judge sampling at the provider default is a behavior change: this
+    panel decides whether a Lakera flag is overturned, and `_parse_verdict`
+    fails closed on anything but an exact single verdict word. Asserted on
+    the wire body because `temperature` reaches the Anthropic API as a raw
+    body field now — the 1.x SDK has no named parameter to inspect.
+    """
+    _, bodies = _ask_over_stub(monkeypatch, provider)
+    assert bodies[0]["temperature"] == 0
+    assert bodies[0]["model"] == _JUDGES_BY_PROVIDER[provider]["model"]
+    assert bodies[0]["max_tokens"] == 8

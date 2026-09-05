@@ -173,7 +173,33 @@ async def _ask_anthropic(judge: dict, sealed: str) -> JudgeVote:
                 client.messages.create,
                 model=judge["model"],
                 max_tokens=8,
-                temperature=0,
+                # Deterministic judging, sent as a raw body field rather than
+                # a named kwarg. `temperature` was REMOVED from the anthropic
+                # Python SDK's typed `messages.create` in 1.x: it appears
+                # nowhere in the 1.4.0 package, and it did NOT move into
+                # `output_config` (that carries only `effort` and `format`).
+                # Passing it as a keyword raises TypeError before any request.
+                #
+                # Measured 2026-09-05: the SDK moved 0.x -> 1.4.0 under an
+                # unbounded `anthropic>=0.96.0` floor, so every Anthropic judge
+                # call began raising TypeError -> `api-error:TypeError` ->
+                # `unavailable` -> fail-closed. L4 exists to clear Lakera
+                # `prompt_attack` false positives on agent-tooling research, so
+                # it instead blocked 4/9 benign `fp_*` fixtures (eval fp_rate
+                # 0.444). Guarded by tests/test_judge.py
+                # `test_judge_request_matches_installed_sdk_signature` and
+                # `test_judge_requests_deterministic_sampling`, which drive the
+                # REAL SDK over a stub transport so the next signature break
+                # fails offline instead of in a live-key CI job.
+                #
+                # `extra_body` merges verbatim into the JSON body on both 0.x
+                # and 1.x, reproducing the request that last passed CI on
+                # 2026-08-10. Sampling is MODEL-SCOPED: accepted by
+                # claude-haiku-4-5 (the configured judge), rejected with 400 by
+                # current-generation models. Retarget `_JUDGES` at a newer
+                # Anthropic model and this line must go in the same commit, or
+                # the judge fails closed exactly as it did here.
+                extra_body={"temperature": 0},
                 system=_SYSTEM,
                 messages=[{"role": "user", "content": f"{_USER_PREFIX}\n\n{sealed}"}],
             )

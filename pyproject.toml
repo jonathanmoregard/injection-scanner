@@ -11,7 +11,15 @@ requires-python = ">=3.12"
 authors = [{ name = "Jonathan Moregard" }]
 license = { text = "MIT" }
 dependencies = [
-    "anthropic>=0.96.0",
+    # Major-version ceiling, added 2026-09-05 after an unbounded floor let the
+    # anthropic SDK move 0.x -> 1.4.0 silently: 1.x removed `temperature` from
+    # `messages.create`, so every L4 Anthropic judge call raised TypeError and
+    # the layer fail-closed on benign agent-tooling research (eval fp_rate
+    # 0.444). The floor is 1.0 because that is the major this code is written
+    # and tested against; the ceiling makes the next major a reviewed change
+    # rather than a silent one. tests/test_judge.py drives the installed SDK
+    # over a stub transport so a signature break fails locally, not in CI.
+    "anthropic>=1.0,<2",
     "openai>=2.32.0",
 ]
 
