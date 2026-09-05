@@ -20,7 +20,11 @@ dependencies = [
     # rather than a silent one. tests/test_judge.py drives the installed SDK
     # over a stub transport so a signature break fails locally, not in CI.
     "anthropic>=1.0,<2",
-    "openai>=2.32.0",
+    # Same shape for openai, added the same day: the floor had been 2.32.0 and
+    # the installed SDK was 3.8.0, so one major had already been crossed
+    # unreviewed — it merely happened not to break anything. Floor at the
+    # major the code is tested against, ceiling so the next one is a change.
+    "openai>=3,<4",
 ]
 
 [project.optional-dependencies]
