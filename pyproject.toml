@@ -24,7 +24,14 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-test = ["pytest>=8"]
+test = [
+    "pytest>=8",
+    # tests/test_honeypot_api_error_audit.py builds SDK error objects from
+    # httpx.Request/Response. The SDKs themselves pull httpx2, so httpx is
+    # not otherwise installed and a clean `.[test]` install failed at
+    # collection once CI started running the whole tests/ tree.
+    "httpx>=0.28,<1",
+]
 
 [tool.setuptools.packages.find]
 include = ["injection_scanner*"]

@@ -30,10 +30,15 @@ jobs:
           uv venv --python ${{ matrix.python }}
           uv pip install -e ".[test]"
 
-      # Deterministic suite — no API keys, no network. test_payload.py
-      # is a CLI tool, not a pytest target.
+      # Deterministic suite — no API keys, no network. The whole tests/ tree
+      # is key-free (measured 2026-09-05: 436 passed with ANTHROPIC_API_KEY,
+      # OPENAI_API_KEY and LAKERA_API_KEY all unset), so it runs in full here.
+      # It used to run an explicit four-file list, which left test_judge.py
+      # out — so the anthropic-SDK signature break only surfaced in the
+      # live-key `eval` job. test_payload.py is a CLI tool with no test_
+      # functions; pytest collects nothing from it.
       - name: pytest
-        run: .venv/bin/python -m pytest tests/test_intercept.py tests/test_delivery.py tests/test_safeio.py tests/test_selfupdate.py -v
+        run: .venv/bin/python -m pytest tests/ -v
 
   smoke:
     name: smoke (full pipeline incl. honeypot)
