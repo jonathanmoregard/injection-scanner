@@ -310,7 +310,8 @@ def scan_text(raw: str, use_honeypot: bool = True, use_lakera: bool = True) -> V
     # clean pass: a flagged classification, a missing key, a broken `*_FILE`
     # mount, or any network/HTTP/JSON/timeout error. lakera.check already
     # collapses every one of those to ok=False with a flat reason (detector
-    # name / category label / exception type only — never input bytes), so
+    # name / category label / exception type / bounded HTTP status only —
+    # never input bytes; see lakera._transport_reason), so
     # the `if not res.ok` branch below quarantines both real detections and
     # degraded-coverage outages. Silent degradation of a detection layer is
     # exactly the failure operators must hear about.
@@ -389,7 +390,9 @@ def scan_text(raw: str, use_honeypot: bool = True, use_lakera: bool = True) -> V
                 sanitized_text=san.text,
             )
         layers["honeypot"] = hp.reason
-        # `layers` stays type-name-only: `s.signal` never carries provider
+        # `layers` stays content-free: `s.signal` carries library labels,
+        # exception type names and a bounded HTTP status code (three ASCII
+        # digits at most — see honeypot._api_error_signal), never provider
         # body text. The structured error body travels separately, on
         # `hp_api_errors` -> `Verdict.honeypot_api_errors` -> to_audit().
         for s in hp.per_scenario:

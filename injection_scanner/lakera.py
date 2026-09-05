@@ -21,9 +21,11 @@ reject rather than crashing the scan.
 
 Invariant (honeypot-manufacturing Invariant 4 — "the caught bytes never
 return"): the `reason` and `categories` strings carry ONLY detector /
-category labels and exception TYPE names — never any fragment of the scanned
-input, and never a stringified exception (some HTTP/JSON errors embed the
-request/response body, which is itself the attacker-shaped bytes we sent).
+category labels, exception TYPE names, and a bounded HTTP status code —
+never any fragment of the scanned input, and never a stringified exception
+(some HTTP/JSON errors embed the request/response body, which is itself the
+attacker-shaped bytes we sent). See `_transport_reason` for why the status
+code is on the safe side of that line.
 
 No new dependency: the POST is issued with stdlib urllib.request, isolated in
 `_post` so tests can monkeypatch it and never touch the network.
@@ -32,9 +34,11 @@ from __future__ import annotations
 
 import json
 import os
+import urllib.error
 import urllib.request
 from dataclasses import dataclass, field
 
+from injection_scanner.http_status import status_suffix
 from injection_scanner.keyloader import KeyConfigError, load_key
 
 _DEFAULT_URL = "https://api.lakera.ai/v2/guard"
@@ -63,6 +67,37 @@ def _post(url: str, body: bytes, headers: dict, timeout: float) -> dict:
     return json.loads(raw.decode("utf-8"))
 
 
+def _transport_reason(e: BaseException) -> str:
+    """Caller-visible reason for a failed POST: exception TYPE, plus the
+    HTTP status when there is one.
+
+    NEVER `str(e)`, and never anything else off the exception. An
+    `HTTPError` stringifies as its reason phrase and can be `.read()` for
+    the response body; both are server-supplied TEXT, and a provider error
+    body can echo the request we sent — i.e. the attacker-shaped report
+    bytes. Those stay out of `reason`, which is read outside the quarantine
+    zone.
+
+    The STATUS CODE is different in kind, not merely in degree. It is a
+    bounded integer, range-checked by `http_status.bounded_status` before
+    it is formatted, so at most three ASCII digits can reach the caller —
+    strictly less expressive than the exception type name already in the
+    string. Measured 2026-09-05: without it every failure read
+    `lakera_unavailable:HTTPError`, so an expired key (401), throttling
+    (429) and a Lakera-side outage (5xx) were indistinguishable and cost an
+    operator a full session to tell apart.
+
+    The `isinstance` gate is deliberate: only a real `HTTPError` has a
+    `.code` that MEANS an HTTP status, so every other exception type keeps
+    its previous reason byte for byte by construction rather than by
+    coincidence of not having the attribute.
+    """
+    reason = f"lakera_unavailable:{type(e).__name__}"
+    if isinstance(e, urllib.error.HTTPError):
+        reason += status_suffix(e, "code")
+    return reason
+
+
 def _lakera_key() -> str | None:
     return load_key(
         file_env="LAKERA_API_KEY_FILE",
@@ -80,7 +115,10 @@ def check(text: str) -> LakeraResult:
                                  -> ok=False reason "lakera_unavailable:key-config-error"
       * no key configured at all -> ok=False reason "lakera_unavailable:no-key"
       * any network/HTTP/JSON/timeout error
-                                 -> ok=False reason "lakera_unavailable:<ExcType>"
+                                 -> ok=False reason "lakera_unavailable:<ExcType>",
+                                    plus ":<status>" for an HTTPError with a
+                                    plausible status code (e.g.
+                                    "lakera_unavailable:HTTPError:429")
       * bad/unknown response shape
                                  -> ok=False reason "lakera_unavailable:bad-response"
       * prompt_attack detected   -> ok=False reason "lakera:prompt_attack"
@@ -128,10 +166,11 @@ def check(text: str) -> LakeraResult:
     try:
         data = _post(url, body, headers, timeout)
     except Exception as e:  # noqa: BLE001 — any failure fails CLOSED
-        # Exception TYPE only — never str(e). Some HTTP/JSON errors embed the
-        # request/response body (the attacker-shaped bytes we sent), so
-        # stringifying would flow input back into the caller-visible reason.
-        return LakeraResult(ok=False, reason=f"lakera_unavailable:{type(e).__name__}")
+        # Exception TYPE (+ bounded HTTP status) only — never str(e). Some
+        # HTTP/JSON errors embed the request/response body (the
+        # attacker-shaped bytes we sent), so stringifying would flow input
+        # back into the caller-visible reason. See `_transport_reason`.
+        return LakeraResult(ok=False, reason=_transport_reason(e))
 
     # Parse defensively: a malformed / unexpected response shape must not
     # fail-open. Any parse error collapses to a fail-closed reject with only

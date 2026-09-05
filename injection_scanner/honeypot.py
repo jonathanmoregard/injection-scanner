@@ -42,6 +42,7 @@ from injection_scanner.containment import (
     QuarantineOnly,
     QuarantineOnlyText,
 )
+from injection_scanner.http_status import status_suffix
 from injection_scanner.keyloader import KeyConfigError, load_key
 from injection_scanner.honeypot_scenarios import (
     ALL_CANARIES,
@@ -143,6 +144,34 @@ class HoneypotResult(QuarantineFieldsCoerced):
     # is a bare dict.
     api_error_details: QuarantineOnly = field(
         default_factory=QuarantineOnly, repr=False
+    )
+
+
+def _api_error_signal(provider: str, e: BaseException) -> str:
+    """`signal` for a failed provider call: exception TYPE + bounded status.
+
+    Complements — does not replace — the audit-only channel below. `signal`
+    flows into `reason` and `Verdict.layers`, which are read OUTSIDE the
+    quarantine zone, so it stays restricted to library vocabulary. The
+    exception type name has always been in it; the HTTP status code joins
+    it because it is a bounded INTEGER (range-checked by
+    `http_status.bounded_status` before formatting), and three ASCII digits
+    cannot carry a fragment of the request or response.
+
+    Motivating incident, measured 2026-09-05 on the sibling Lakera gate:
+    with the type name alone, an expired key (401), throttling (429) and a
+    provider-side outage (5xx) all read identically to whoever consumes
+    `reason`, and the audit record that DOES carry `status=` lives inside
+    the quarantine zone where that reader cannot go.
+
+    `status_code` specifically, never `code`: the SDKs' `APIError.code` is
+    a provider-supplied STRING (`"insufficient_quota"`), i.e. exactly the
+    free text that belongs in `api_error_detail` and nowhere else. An
+    exception without a status (`APIConnectionError`, a plain builtin)
+    keeps its previous signal byte for byte.
+    """
+    return f"unavailable:{provider}-api-error:{type(e).__name__}" + status_suffix(
+        e, "status_code"
     )
 
 
@@ -893,16 +922,16 @@ async def _call_anthropic(
             )
         )
     except Exception as e:
-        # Use only the exception *type* — some SDKs stringify exceptions
-        # with request/response fragments, which could echo attacker-shaped
-        # content back up into the signal string. The audit record lives in
-        # the quarantine zone today, but keep the signal flat by default.
-        # The structured body goes to the audit-only `api_error_detail`
-        # instead (see `_error_detail`) so an outage is diagnosable in one
-        # step without widening what the signal exposes.
+        # Use only the exception *type* and a bounded HTTP status — some
+        # SDKs stringify exceptions with request/response fragments, which
+        # could echo attacker-shaped content back up into the signal
+        # string. The structured body goes to the audit-only
+        # `api_error_detail` instead (see `_error_detail`) so an outage is
+        # diagnosable in one step without widening what the signal exposes;
+        # the status code is safe in both places (see `_api_error_signal`).
         return ScenarioResult(
             scenario=scenario["name"], verdict="Honeypot_Skipped",
-            signal=f"unavailable:anthropic-api-error:{type(e).__name__}",
+            signal=_api_error_signal("anthropic", e),
             provider="anthropic", model=scenario["model"],
             api_error_detail=_error_detail(e),
         )
@@ -1002,11 +1031,12 @@ async def _call_openai(
             )
         )
     except Exception as e:
-        # Type name only in the signal (see the Anthropic path above for the
-        # rationale); the structured body rides the audit-only field.
+        # Type name + bounded status in the signal (see the Anthropic path
+        # above for the rationale); the structured body rides the
+        # audit-only field.
         return ScenarioResult(
             scenario=scenario["name"], verdict="Honeypot_Skipped",
-            signal=f"unavailable:openai-api-error:{type(e).__name__}",
+            signal=_api_error_signal("openai", e),
             provider="openai", model=scenario["model"],
             api_error_detail=_error_detail(e),
         )

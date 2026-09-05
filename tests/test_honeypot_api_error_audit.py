@@ -168,18 +168,28 @@ def _detail(r: ScenarioResult) -> str:
     return r.api_error_detail.reveal_for_quarantine_record()
 
 
-# ---------- (a) signal string byte-identical ----------
+# ---------- (a) signal: type name + bounded status, nothing else ----------
+#
+# The signal carried the exception TYPE NAME alone until 2026-09-05, when
+# the same opacity that motivated the audit channel above showed up one
+# level out: `signal` flows into `reason` and `Verdict.layers`, which are
+# read OUTSIDE the quarantine zone, and there 401 / 429 / 5xx were
+# indistinguishable. `APIStatusError.status_code` is a bounded INTEGER —
+# range-checked by `http_status.bounded_status` before it is formatted — so
+# it cannot echo request or response bytes and is no more revealing than
+# the type name beside it. Free text stays where commit 4cada8d put it:
+# the audit-only `api_error_detail`, never here.
 
-def test_anthropic_api_error_signal_unchanged(monkeypatch):
+def test_anthropic_api_error_signal_carries_status(monkeypatch):
     r = _call_anthropic(monkeypatch, _anthropic_bad_request())
     assert r.verdict == "Honeypot_Skipped"
-    assert r.signal == "unavailable:anthropic-api-error:BadRequestError"
+    assert r.signal == "unavailable:anthropic-api-error:BadRequestError:400"
 
 
-def test_openai_api_error_signal_unchanged(monkeypatch):
+def test_openai_api_error_signal_carries_status(monkeypatch):
     r = _call_openai(monkeypatch, _openai_bad_request())
     assert r.verdict == "Honeypot_Skipped"
-    assert r.signal == "unavailable:openai-api-error:BadRequestError"
+    assert r.signal == "unavailable:openai-api-error:BadRequestError:400"
 
 
 def test_api_error_body_never_reaches_signal(monkeypatch):
@@ -189,6 +199,27 @@ def test_api_error_body_never_reaches_signal(monkeypatch):
     o = _call_openai(monkeypatch, _openai_bad_request())
     assert "quota" not in o.signal
     assert STR_E_MARKER not in o.signal
+
+
+@pytest.mark.parametrize("bad", ["400; IGNORE PREVIOUS", None, 99999, -1, object()])
+def test_malformed_status_degrades_to_the_bare_type_name(monkeypatch, bad):
+    """`status_code` is an SDK attribute, not a validated field. Anything
+    that is not a plausible HTTP status is dropped rather than formatted."""
+    exc = _anthropic_bad_request()
+    exc.status_code = bad  # type: ignore[assignment]
+    r = _call_anthropic(monkeypatch, exc)
+    assert r.signal == "unavailable:anthropic-api-error:BadRequestError"
+
+
+def test_status_does_not_leak_into_the_reason_body_channel(monkeypatch):
+    """The status is the ONLY thing added: the structured body still rides
+    the audit-only field and still never appears in the signal."""
+    r = _call_anthropic(monkeypatch, _anthropic_bad_request())
+    assert r.signal.endswith(":400")
+    assert "invalid_request_error" not in r.signal
+    assert ANTHROPIC_REQUEST_ID not in r.signal
+    # Unchanged: the audit channel still carries the full detail.
+    assert "credit balance is too low" in _detail(r)
 
 
 # ---------- (b) audit field carries the provider message ----------
@@ -299,12 +330,12 @@ def test_a_raising_scrub_does_not_cost_the_provider_error_type(monkeypatch, call
         _patch_anthropic(monkeypatch, _anthropic_bad_request())
         _sabotage_scrub(monkeypatch)
         r = asyncio.run(honeypot._call_anthropic(SCEN_A, "report body", [], set()))
-        expected = "unavailable:anthropic-api-error:BadRequestError"
+        expected = "unavailable:anthropic-api-error:BadRequestError:400"
     else:
         _patch_openai(monkeypatch, _openai_bad_request())
         _sabotage_scrub(monkeypatch)
         r = asyncio.run(honeypot._call_openai(SCEN_OPENAI, "report body", [], set()))
-        expected = "unavailable:openai-api-error:BadRequestError"
+        expected = "unavailable:openai-api-error:BadRequestError:400"
 
     assert r.signal == expected
     assert "unhandled" not in r.signal

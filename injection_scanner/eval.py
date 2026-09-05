@@ -18,6 +18,12 @@ CLI:
 
 Always exits 0 (measurement, not a gate) UNLESS --min-recall is passed, in
 which case it exits 1 when recall falls below the floor (lets CI enforce it).
+
+With the hosted layers live, one scan is a sample from an LLM. Pass
+--confirm-disagreements N to re-scan only the cases whose verdict disagrees
+with their label; the gate then uses the confirmed verdict and the scorecard
+still prints the first-attempt numbers. See `evaluate` for the measured
+history behind it.
 """
 from __future__ import annotations
 
@@ -55,10 +61,25 @@ class CaseRow:
     expected: str
     predicted: str
     reason: str
+    # How many scans this case cost, and what the FIRST one said. They differ
+    # from 1 / `predicted` only when disagreement confirmation re-scanned the
+    # case (see `evaluate`). Kept on the row so the scorecard can report the
+    # single-shot outcome next to the confirmed one instead of hiding it.
+    attempts: int = 1
+    first_predicted: str | None = None
+
+    def __post_init__(self) -> None:
+        if self.first_predicted is None:
+            self.first_predicted = self.predicted
 
     @property
     def correct(self) -> bool:
         return self.expected == self.predicted
+
+    @property
+    def flaky(self) -> bool:
+        """Matched its label only on a re-scan: a sampled layer disagreed first."""
+        return self.correct and self.first_predicted != self.predicted
 
 
 @dataclass
@@ -81,6 +102,8 @@ class Scorecard:
     fp: int = 0
     tn: int = 0
     rows: list[CaseRow] = field(default_factory=list)
+    # The confirmation budget this card was scored under (0 = single shot).
+    confirm_disagreements: int = 0
 
     @property
     def total(self) -> int:
@@ -124,6 +147,31 @@ class Scorecard:
         """Ids falsely blocked — expected pass but predicted block."""
         return [r.id for r in self.rows if r.expected == PASS and r.predicted == BLOCK]
 
+    @property
+    def flaky(self) -> list[str]:
+        """Ids that matched their label only after a re-scan.
+
+        These are the sampled-layer draws the gate absorbed. A non-empty list
+        is the measured single-shot weakness, and belongs in the report even
+        though the confirmed verdict was right.
+        """
+        return [r.id for r in self.rows if r.flaky]
+
+    # Single-shot metrics, from what the FIRST scan of each case said. These
+    # are what production experiences — one scan per report — so they are
+    # reported alongside the confirmed metrics whenever confirmation is on.
+    @property
+    def first_attempt_recall(self) -> float:
+        pos = [r for r in self.rows if r.expected == BLOCK]
+        hits = sum(1 for r in pos if r.first_predicted == BLOCK)
+        return hits / len(pos) if pos else 0.0
+
+    @property
+    def first_attempt_fp_rate(self) -> float:
+        neg = [r for r in self.rows if r.expected == PASS]
+        alarms = sum(1 for r in neg if r.first_predicted == BLOCK)
+        return alarms / len(neg) if neg else 0.0
+
     def format(self) -> str:
         lines: list[str] = []
         lines.append("=" * 72)
@@ -141,11 +189,28 @@ class Scorecard:
             f"confusion: TP={self.tp} FN={self.fn} FP={self.fp} TN={self.tn}  "
             f"(positive class = {BLOCK!r})"
         )
-        lines.append("-" * 72)
-        for r in self.rows:
-            tag = "PASS" if r.correct else "FAIL"
+        if self.confirm_disagreements:
+            rescanned = sum(1 for r in self.rows if r.attempts > 1)
             lines.append(
-                f"{tag}  {r.id:<24}  {r.expected}->{r.predicted:<5}  {r.reason}"
+                f"confirm-disagreements={self.confirm_disagreements}: "
+                f"first-attempt recall={self.first_attempt_recall:.3f}  "
+                f"FP-rate={self.first_attempt_fp_rate:.3f}  "
+                f"(re-scanned {rescanned} case(s))"
+            )
+        lines.append("-" * 72)
+        max_attempts = self.confirm_disagreements + 1
+        for r in self.rows:
+            tag = "FLAKY" if r.flaky else ("PASS" if r.correct else "FAIL")
+            note = ""
+            if r.flaky:
+                note = (
+                    f"  [matched its label on attempt {r.attempts} of "
+                    f"{max_attempts}; first said {r.first_predicted}]"
+                )
+            elif not r.correct and r.attempts > 1:
+                note = f"  [disagreed on all {r.attempts} attempts]"
+            lines.append(
+                f"{tag:<5} {r.id:<24}  {r.expected}->{r.predicted:<5}  {r.reason}{note}"
             )
         lines.append("-" * 72)
         fns = self.false_negatives
@@ -160,12 +225,24 @@ class Scorecard:
             lines.append(f"FALSE POSITIVES (false alarms): {len(fps)}")
             for fid in fps:
                 lines.append(f"  ALARM {fid}")
+        flaky = self.flaky
+        if flaky:
+            lines.append(
+                f"FLAKY (label matched only on re-scan — a sampled layer "
+                f"disagreed first): {len(flaky)}"
+            )
+            for fid in flaky:
+                lines.append(f"  FLAKY {fid}")
         lines.append("=" * 72)
         return "\n".join(lines)
 
 
 def evaluate(
-    cases: list[EvalCase], *, use_honeypot: bool = False, use_lakera: bool = False
+    cases: list[EvalCase],
+    *,
+    use_honeypot: bool = False,
+    use_lakera: bool = False,
+    confirm_disagreements: int = 0,
 ) -> Scorecard:
     """Run scan_text over each case and score against expected labels.
 
@@ -179,17 +256,50 @@ def evaluate(
     live key, so leaving it on would block every case in a keyless CI run.
     Deterministic-layer measurement runs it off; pass True (with a key set)
     to score the hosted layer end-to-end.
+
+    `confirm_disagreements=N` re-scans a case whose verdict disagrees with
+    its label, up to N more times, and counts the disagreement only if every
+    attempt disagrees. A case that agrees on its first scan is never
+    re-scanned, so a clean run costs exactly one scan per case.
+
+    Why it exists (2026-09-05): the hosted layers are sampled LLMs, so with
+    them live a single scan is a draw. CI's gate saw blatant_tool_coerce.md
+    flip block->pass on 2026-08-10 and again on 2026-09-05 — the honeypot
+    models occasionally decline the bait in every scenario at once — and
+    the identical commit went green on rerun. Confirmation makes a
+    stochastic miss have to repeat N+1 times before it fails the gate,
+    while a deterministic regression (a layer that is actually broken)
+    disagrees on every attempt and fails exactly as before. The first-scan
+    outcome is kept on each row and reported by `Scorecard.format` as the
+    single-shot numbers, because one scan per report is what production
+    gets: the weakness is surfaced, not absorbed.
     """
-    card = Scorecard()
+    if confirm_disagreements < 0:
+        raise ValueError(
+            f"confirm_disagreements must be >= 0, got {confirm_disagreements}"
+        )
+    card = Scorecard(confirm_disagreements=confirm_disagreements)
     for case in cases:
-        verdict = scan_text(case.text, use_honeypot=use_honeypot, use_lakera=use_lakera)
-        predicted = PASS if verdict.ok else BLOCK
+        attempts = 0
+        first_predicted: str | None = None
+        while True:
+            attempts += 1
+            verdict = scan_text(
+                case.text, use_honeypot=use_honeypot, use_lakera=use_lakera
+            )
+            predicted = PASS if verdict.ok else BLOCK
+            if first_predicted is None:
+                first_predicted = predicted
+            if predicted == case.expected or attempts > confirm_disagreements:
+                break
         card.rows.append(
             CaseRow(
                 id=case.id,
                 expected=case.expected,
                 predicted=predicted,
                 reason=verdict.reason,
+                attempts=attempts,
+                first_predicted=first_predicted,
             )
         )
         if case.expected == BLOCK and predicted == BLOCK:
@@ -291,10 +401,26 @@ def _main(argv: list[str] | None = None) -> int:
         help="exit 1 if FP-rate > X (lets CI enforce a false-alarm ceiling "
         "over the expected-pass cases). Omit to always exit 0.",
     )
+    parser.add_argument(
+        "--confirm-disagreements",
+        type=int,
+        default=0,
+        metavar="N",
+        help="re-scan a case whose verdict disagrees with its label up to N "
+        "more times and count the disagreement only if every attempt "
+        "disagrees (absorbs sampled-layer draws; a deterministic regression "
+        "still fails). Agreeing cases are never re-scanned. The scorecard "
+        "reports the first-attempt numbers alongside. Default 0: single shot.",
+    )
     args = parser.parse_args(argv)
 
     cases = load_jsonl(args.corpus)
-    card = evaluate(cases, use_honeypot=args.use_honeypot, use_lakera=args.use_lakera)
+    card = evaluate(
+        cases,
+        use_honeypot=args.use_honeypot,
+        use_lakera=args.use_lakera,
+        confirm_disagreements=args.confirm_disagreements,
+    )
     print(card.format())
 
     failed = False
