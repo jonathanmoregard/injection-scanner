@@ -35,11 +35,15 @@ the process, refuse to bind a port, surface the reason to logs.
 """
 from __future__ import annotations
 
+import json
+import math
 import tempfile
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable
 
+from injection_scanner import throttle
 from injection_scanner.intercept import Verdict, scan, scan_text
 
 
@@ -74,6 +78,142 @@ _DETERMINISTIC: tuple[_Canary, ...] = (
 _BENIGN_PROBE = "Benign smoke probe. Sources: 1. Routine self-test, no payload."
 
 
+# ---------- the fleet-wide liveness cache ----------
+#
+# Measured 2026-09-06: research-agent boot smokes alone ran ~632 per day — one
+# per server spawn, plus one per degraded recheck — about 19,000 a month
+# against Lakera's published Community quota of 10,000, before a single report
+# is scanned. SPAWN FREQUENCY, not scan volume, is what exhausts the account,
+# and one Claude Code session restore spawns six panes at once. The limiter in
+# throttle.py bounds the RATE; it cannot reduce the demand. This does.
+#
+# So one PASSING Phase 2 probe is trusted fleet-wide for a TTL. It is a cache
+# in front of a probe, NOT a gate: every failure mode below degrades to "run
+# the probe exactly as before", never to "pass without probing". Phase 1 is
+# never cached — it checks THIS process's own code, not the fleet's vendors.
+#
+# What a stale cached pass can hide: an outage that began within the TTL. Then
+# the server boots "healthy" and the first real scan fails closed with the
+# agent-readable infra reason. Fail-closed and visibility are both preserved;
+# only the moment of discovery moves from spawn to first use.
+#
+# It caches a BOOLEAN ABOUT THE VENDORS, never a verdict about content. A
+# verdict cache would be a second system with its own staleness and poisoning
+# questions, and is deliberately out of scope.
+
+ENV_LIVENESS_TTL_S = "INJECTION_SCANNER_SMOKE_LIVENESS_TTL_S"
+
+# One hour: long enough that a six-pane session restore costs ONE Lakera call
+# instead of six, short enough that an outage is rediscovered within the same
+# working hour. `0` disables the cache; the clamp ceiling is a day. An INPUT,
+# like every other limit in this package — never a fitted constant.
+DEFAULT_LIVENESS_TTL_S = 3600.0
+LIVENESS_TTL_RANGE = (0.0, 86400.0)
+
+# Bumped only when the on-disk shape changes. Any other value is FOREIGN and is
+# discarded exactly like a corrupt file: an older or newer scanner sharing the
+# cache directory must never hand this one a liveness claim it would misread.
+_LIVENESS_SCHEMA = 1
+
+_LIVENESS_STATE_NAME = "smoke-liveness.json"
+_LIVENESS_LOCK_NAME = "smoke-liveness.lock"
+
+
+def _liveness_paths() -> tuple[Path, Path]:
+    """State file and lock file, in the same cache directory the limiter and
+    the self-updater already use — one place for an operator to look, and one
+    place to clear."""
+    d = throttle.cache_dir()
+    return d / _LIVENESS_STATE_NAME, d / _LIVENESS_LOCK_NAME
+
+
+def _liveness_ttl_s() -> float:
+    """How long one passing probe is trusted. Malformed values fall back to
+    the default and are then clamped, so a typo degrades to the documented
+    hour rather than to a cache that never expires."""
+    return throttle.env_float(
+        ENV_LIVENESS_TTL_S, DEFAULT_LIVENESS_TTL_S, LIVENESS_TTL_RANGE
+    )
+
+
+def _liveness_lock_wait_s() -> float:
+    """Bounded wait for the liveness lock.
+
+    Deliberately the limiter's own `INJECTION_SCANNER_LAKERA_LOCK_WAIT_S`
+    rather than a new knob: the flock discipline is shared, so the bound on it
+    should be too, and an operator who widens one has widened both.
+    """
+    return throttle.LimiterConfig.from_env().lock_wait_s
+
+
+def _cached_liveness_age(now: float) -> float | None:
+    """Age in seconds of a still-fresh cached PASS, or `None` for a miss.
+
+    Every unusable shape is a MISS, never an error and never a pass: missing,
+    unreadable, truncated, non-JSON, wrong type, foreign schema, `ok` that is
+    not literally `true`, an `at` that will not parse or is not finite, an `at`
+    in the FUTURE (a clock step — trusting it could extend the TTL by an
+    arbitrary amount), or an entry older than the TTL. A miss costs one probe,
+    which is exactly what every boot cost before this cache existed.
+
+    A cache directory this uid does not own is a miss too: `throttle.file_lock`
+    refuses it, which lands in the `except` below. Somebody else's file must
+    not be able to suppress the fleet's vendor probe.
+
+    `json.loads` accepts bare `NaN`/`Infinity`, which is why the finiteness
+    check is explicit rather than implied by `float()`.
+    """
+    ttl = _liveness_ttl_s()
+    if ttl <= 0.0:
+        return None
+    state_path, lock_path = _liveness_paths()
+    try:
+        with throttle.file_lock(lock_path, _liveness_lock_wait_s()):
+            obj = json.loads(state_path.read_text(encoding="utf-8"))
+    except Exception:  # noqa: BLE001 — TOTAL by contract; any failure is a miss
+        return None
+    if not isinstance(obj, dict) or obj.get("schema") != _LIVENESS_SCHEMA:
+        return None
+    if obj.get("ok") is not True:
+        return None
+    try:
+        at = float(obj["at"])
+    except (KeyError, TypeError, ValueError):
+        return None
+    if not math.isfinite(at):
+        return None
+    age = now - at
+    if age < 0.0 or age > ttl:
+        return None
+    return age
+
+
+def _record_liveness_pass(now: float) -> None:
+    """Record that the probe passed. Best effort, by design.
+
+    An unwritable cache directory means the pass is simply not recorded — the
+    next spawn probes again, which is what happens today. Failing the smoke
+    because a CACHE could not be written would turn an optimisation into a new
+    way to refuse to boot.
+
+    The file carries a boolean and a timestamp and nothing else: no reason
+    string, no layer map, no probe text. Invariant 4 ("the caught bytes never
+    return") therefore holds trivially, and the payload is built by NAMING its
+    three fields, so anything added upstream tomorrow stays invisible.
+    """
+    if _liveness_ttl_s() <= 0.0:
+        return
+    state_path, lock_path = _liveness_paths()
+    try:
+        with throttle.file_lock(lock_path, _liveness_lock_wait_s()):
+            throttle.atomic_write_json(
+                state_path,
+                {"schema": _LIVENESS_SCHEMA, "ok": True, "at": now},
+            )
+    except Exception:  # noqa: BLE001 — see the docstring
+        return
+
+
 def _scan_via_path(payload: str, *, use_honeypot: bool, use_lakera: bool = True) -> Verdict:
     """Write payload to a temp file and run scan(Path). Cleans up the
     temp file even if scan raises. Exists so the disk-read wrapper
@@ -96,12 +236,20 @@ def run_smoke(
     *,
     log_info: Callable[[str], None] | None = None,
     log_error: Callable[[str], None] | None = None,
+    clock: Callable[[], float] = time.time,
 ) -> None:
     """Run the self-test. Raises SmokeFailure on any regression.
 
     log_info / log_error are injected so callers can route messages
     through their own logger (stdlib logging, FastMCP, journal, etc.)
     without this module taking a hard logger dep.
+
+    `clock` drives the liveness cache's TTL arithmetic and nothing else. It
+    DEFAULTS, so every existing caller — research-agent's boot smoke
+    (`run_smoke(log_info=…, log_error=…)`), the scheduled CI job, an ad-hoc
+    CLI run — keeps working unchanged. Wall-clock rather than monotonic,
+    deliberately: the cache is read by processes that did not exist when it
+    was written.
     """
     info = log_info or (lambda _msg: None)
     err = log_error or (lambda _msg: None)
@@ -137,6 +285,19 @@ def run_smoke(
     # accidentally triggered) means infra rot or a false-positive
     # regression. Because Lakera fails closed on a missing key, this phase
     # requires a live LAKERA_API_KEY.
+    #
+    # It is also the ONE call in here that spends vendor quota, which is why a
+    # recent fleet-wide PASS is trusted instead of re-run: hit -> return,
+    # miss -> probe exactly as before. See the liveness cache above.
+    age = _cached_liveness_age(clock())
+    if age is not None:
+        info(f"liveness probe: cached pass, {int(age)}s old")
+        info(
+            f"scanner self-test OK ({len(_DETERMINISTIC)} canaries × "
+            "2 entry points blocked; lakera + honeypot liveness from cache)"
+        )
+        return
+
     v = _scan_via_path(_BENIGN_PROBE, use_honeypot=True, use_lakera=True)
     if not v.ok:
         msg = (
@@ -162,6 +323,11 @@ def run_smoke(
         )
         err(f"scanner self-test FAILED: {msg}")
         raise SmokeFailure(msg)
+
+    # Only here, with all three Phase 2 checks passed, is the result worth
+    # sharing. A failure raised above and recorded nothing, so an outage can
+    # never be cached — one bad boot must not silence the probe fleet-wide.
+    _record_liveness_pass(clock())
 
     info(
         f"scanner self-test OK ({len(_DETERMINISTIC)} canaries × "

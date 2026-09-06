@@ -184,12 +184,18 @@ def _clamp_float(value: float, bounds: tuple[float, float]) -> float:
     return min(max(value, lo), hi)
 
 
-def _env_float(name: str, default: float, bounds: tuple[float, float]) -> float:
+def env_float(name: str, default: float, bounds: tuple[float, float]) -> float:
     """A float from the environment: malformed -> default, then clamp.
 
     NaN is turned back explicitly. It parses fine, survives `min`/`max`
     unchanged on CPython, and would then make every comparison in `acquire`
     false — a limiter that neither allows nor refuses.
+
+    PUBLIC because `smoke.py` parses `INJECTION_SCANNER_SMOKE_LIVENESS_TTL_S`
+    with it. That knob is not a limiter setting, but it wants exactly this
+    contract — "every limit is an input with a range", malformed to the
+    default, NaN refused — and one audited implementation of it beats two.
+    `_env_int` stays private; nothing outside this module needs it yet.
     """
     raw = os.environ.get(name)
     value = default
@@ -281,7 +287,7 @@ def default_max_wait_s() -> float:
     Default 0: an interactive scan refuses immediately rather than parking a
     report behind the fleet's budget. Batch callers (`eval`) pass their own.
     """
-    return _env_float(ENV_MAX_WAIT_S, DEFAULT_MAX_WAIT_S, MAX_WAIT_RANGE)
+    return env_float(ENV_MAX_WAIT_S, DEFAULT_MAX_WAIT_S, MAX_WAIT_RANGE)
 
 
 @dataclass(frozen=True)
@@ -310,17 +316,17 @@ class LimiterConfig:
     @classmethod
     def from_env(cls) -> "LimiterConfig":
         return cls(
-            min_interval_s=_env_float(
+            min_interval_s=env_float(
                 ENV_MIN_INTERVAL_S, DEFAULT_MIN_INTERVAL_S, MIN_INTERVAL_RANGE
             ),
             burst=_env_int(ENV_BURST, DEFAULT_BURST, BURST_RANGE),
-            backoff_base_s=_env_float(
+            backoff_base_s=env_float(
                 ENV_BACKOFF_BASE_S, DEFAULT_BACKOFF_BASE_S, BACKOFF_BASE_RANGE
             ),
-            backoff_max_s=_env_float(
+            backoff_max_s=env_float(
                 ENV_BACKOFF_MAX_S, DEFAULT_BACKOFF_MAX_S, BACKOFF_MAX_RANGE
             ),
-            lock_wait_s=_env_float(
+            lock_wait_s=env_float(
                 ENV_LOCK_WAIT_S, DEFAULT_LOCK_WAIT_S, LOCK_WAIT_RANGE
             ),
         )
@@ -391,6 +397,133 @@ def _parse_retry_after(value: object, now: float) -> float | None:
         return max(0.0, parsed.timestamp() - now)
     except Exception:  # noqa: BLE001 — TOTAL by contract; see the docstring
         return None
+
+
+def _require_own_directory(state_dir: Path) -> None:
+    """Refuse a state directory this uid does not own.
+
+    `mode=0o700` on `mkdir` applies only when THIS process creates the
+    directory; `exist_ok=True` accepts whatever is already at the path. And the
+    path is not always private: with no home directory the default falls back
+    under the system temp dir, which is world-writable, so another user can get
+    there first. Two shapes matter, and `lstat` catches both because it does
+    not follow the link:
+
+      * a SYMLINK, which redirects every state write to a directory of their
+        choosing;
+      * a directory owned by someone else (0777 or otherwise), which they can
+        also write.
+
+    Either turns the fleet's shared budget into an object a third party
+    controls — they could hold the breaker open and deny the scanner, or keep
+    it closed and restore the storm this module exists to stop. It is also the
+    one place attacker-influenced state could re-enter the limiter, so the
+    answer is to refuse, not to repair.
+
+    Called from `file_lock`, so it guards EVERY user of the cache directory
+    rather than the limiter alone. `smoke.py`'s liveness cache needs it just as
+    much and for the same reason in the opposite direction: a planted
+    `{"ok": true}` there would let a foreign file suppress the fleet's vendor
+    probe. Both callers reach this inside a guard that renders a raise as their
+    own safe default — the limiter's `ERROR` -> `limiter-error` fail-closed
+    reject, the liveness cache's "miss, probe as before".
+
+    Only the FINAL component is checked: a hostile ancestor is beyond what a
+    cache path can defend against and belongs to whoever configured
+    `INJECTION_SCANNER_CACHE_DIR`.
+    """
+    info = os.lstat(state_dir)
+    if not stat.S_ISDIR(info.st_mode):
+        raise NotADirectoryError("cache state path is not a real directory")
+    if info.st_uid != os.getuid():
+        raise PermissionError("cache state directory belongs to another user")
+
+
+@contextlib.contextmanager
+def file_lock(lock_path: Path, wait_s: float, *, clock=time.time, sleep=time.sleep):
+    """Exclusive `flock` over `lock_path`, bounded by `wait_s`.
+
+    The file is opened FRESH for every operation, so the lock also serialises
+    threads inside one process: flock is associated with the open file
+    description, and each `os.open` makes its own. flock is released by the
+    kernel when the holder dies, so there are no stale locks to reap after a
+    crash. The parent directory is created `0700` if it is missing, and is then
+    refused unless this uid owns it (`_require_own_directory`).
+
+    Two limits on that guarantee, both real and both accepted:
+
+      * the lock lives on an INODE, not on a path. Deleting the lock file while
+        a holder still has it open lets the next opener create a fresh inode
+        and lock that instead, and the two then run concurrently believing they
+        are exclusive. So a wipe of the cache directory is the one window in
+        which exclusion is genuinely lost — and it is also the only way two
+        processes can collide on the shared `.tmp` name in
+        `atomic_write_json`. Clearing the directory is an operator action on
+        state that is rebuilt on the next call, so the cost of losing that race
+        is one reset bucket.
+      * flock is advisory and is EMULATED on some filesystems. Over NFS it is
+        mapped onto POSIX locks, and on some overlay and network mounts it
+        degrades to a no-op. The cache directory is expected to be local disk;
+        a fleet sharing it over NFS gets pacing that is best-effort rather than
+        guaranteed.
+
+    `LOCK_NB` plus a retry, rather than a blocking `LOCK_EX`, because the wait
+    has to be BOUNDED: a wedged peer must degrade to a caught `TimeoutError`
+    (which the limiter renders as a fail-closed reject, and the smoke liveness
+    cache renders as a miss) rather than hanging a scan or a boot forever.
+
+    Shared with `smoke.py`'s liveness cache, which keeps a different file in
+    the same directory under the same discipline.
+    """
+    lock_path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    _require_own_directory(lock_path.parent)
+    deadline = clock() + wait_s
+    fd = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o600)
+    try:
+        while True:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except OSError as e:
+                if e.errno not in (errno.EACCES, errno.EAGAIN, errno.EWOULDBLOCK):
+                    raise
+                if clock() >= deadline:
+                    raise TimeoutError("lock wait exceeded") from None
+                sleep(_LOCK_RETRY_SLEEP_S)
+        try:
+            yield
+        finally:
+            fcntl.flock(fd, fcntl.LOCK_UN)
+    finally:
+        os.close(fd)
+
+
+def atomic_write_json(path: Path, payload: dict) -> None:
+    """Write `payload` to `path` via `<path>.tmp` + `os.replace`.
+
+    The replace is atomic, so a reader without the lock — or a process killed
+    mid-write — never sees a half-written file. Callers build `payload` by
+    NAMING its fields, so a field added to some upstream structure tomorrow is
+    invisible here until it is added on purpose.
+
+    There is deliberately NO fsync: what this package keeps in the cache
+    directory is a pacing hint (and a liveness hint) rebuilt on the next call,
+    not a ledger, and paying a disk flush on every scan to protect it would be
+    the wrong trade. The exposure is a power loss, after which the file may be
+    torn or empty; every reader in this package treats that as unusable and
+    falls back to its own safe default.
+
+    The file is created 0o600 explicitly rather than inheriting whatever umask
+    is in force, so it does not depend on this module having been the one to
+    create the 0o700 directory around it.
+
+    Shared with `smoke.py`'s liveness cache. Call it inside `file_lock`.
+    """
+    tmp = path.parent / (path.name + ".tmp")
+    fd = os.open(tmp, os.O_CREAT | os.O_WRONLY | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w", encoding="utf-8") as fh:
+        fh.write(json.dumps(payload))
+    os.replace(tmp, path)
 
 
 class CrossProcessLimiter:
@@ -620,91 +753,23 @@ class CrossProcessLimiter:
             self._save(st)
             return wait
 
-    @contextlib.contextmanager
     def _locked(self):
-        """Exclusive `flock` over `<name>-throttle.lock`, bounded by config.
+        """This limiter's own lock: `file_lock` over `<name>-throttle.lock`,
+        bounded by `lock_wait_s` and driven by the INJECTED clock and sleep,
+        so the lock-timeout test runs in microseconds and production still
+        gets `time.time` / `time.sleep` from the constructor defaults.
 
-        The file is opened FRESH for every operation, so the lock also
-        serialises threads inside one process: flock is associated with the
-        open file description, and each `os.open` makes its own. flock is
-        released by the kernel when the holder dies, so there are no stale
-        locks to reap after a crash.
-
-        Two limits on that guarantee, both real and both accepted:
-
-          * the lock lives on an INODE, not on a path. Deleting the lock file
-            while a holder still has it open lets the next opener create a
-            fresh inode and lock that instead, and the two then run
-            concurrently believing they are exclusive. So a wipe of the cache
-            directory is the one window in which exclusion is genuinely lost
-            — and it is also the only way two processes can collide on the
-            shared `.tmp` name in `_save`. Clearing the directory is an
-            operator action on state that is rebuilt on the next call, so the
-            cost of losing that race is one reset bucket.
-          * flock is advisory and is EMULATED on some filesystems. Over NFS it
-            is mapped onto POSIX locks, and on some overlay and network mounts
-            it degrades to a no-op. The cache directory is expected to be
-            local disk; a fleet sharing it over NFS gets pacing that is
-            best-effort rather than guaranteed.
-
-        `LOCK_NB` plus a retry, rather than a blocking `LOCK_EX`, because the
-        wait has to be BOUNDED: a wedged peer must degrade to `ERROR` (a
-        fail-closed reject) rather than hanging a scan forever.
+        A wedged peer therefore degrades to a `TimeoutError`, which `acquire`
+        catches and renders as `ERROR` — a fail-closed reject — rather than
+        hanging a scan forever. So does a state directory this uid does not
+        own, which `file_lock` refuses before it locks anything.
         """
-        self._state_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
-        self._require_own_directory()
-        deadline = self._clock() + self._config.lock_wait_s
-        fd = os.open(self._lock_path, os.O_CREAT | os.O_RDWR, 0o600)
-        try:
-            while True:
-                try:
-                    fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-                    break
-                except OSError as e:
-                    if e.errno not in (errno.EACCES, errno.EAGAIN, errno.EWOULDBLOCK):
-                        raise
-                    if self._clock() >= deadline:
-                        raise TimeoutError("lakera limiter lock wait exceeded") from None
-                    self._sleep(_LOCK_RETRY_SLEEP_S)
-            try:
-                yield
-            finally:
-                fcntl.flock(fd, fcntl.LOCK_UN)
-        finally:
-            os.close(fd)
-
-    def _require_own_directory(self) -> None:
-        """Refuse a state directory this uid does not own.
-
-        `mode=0o700` on `mkdir` applies only when THIS process creates the
-        directory; `exist_ok=True` accepts whatever is already at the path.
-        And the path is not always private: with no home directory the default
-        falls back under the system temp dir, which is world-writable, so
-        another user can get there first. Two shapes matter, and `lstat`
-        catches both because it does not follow the link:
-
-          * a SYMLINK, which redirects every state write to a directory of
-            their choosing;
-          * a directory owned by someone else (0777 or otherwise), which they
-            can also write.
-
-        Either turns the fleet's shared budget into an object a third party
-        controls — they could hold the breaker open and deny the scanner, or
-        keep it closed and restore the storm this module exists to stop. It is
-        also the one place attacker-influenced state could re-enter the
-        limiter, so the answer is to refuse, not to repair.
-
-        Raises, and every caller reaches this inside `acquire`'s guard or a
-        recorder's, so the outcome is the ordinary `ERROR` -> `limiter-error`
-        fail-closed reject. Only the FINAL component is checked: a hostile
-        ancestor is beyond what a cache path can defend against and belongs to
-        whoever configured `INJECTION_SCANNER_CACHE_DIR`.
-        """
-        info = os.lstat(self._state_dir)
-        if not stat.S_ISDIR(info.st_mode):
-            raise NotADirectoryError("limiter state path is not a real directory")
-        if info.st_uid != os.getuid():
-            raise PermissionError("limiter state directory belongs to another user")
+        return file_lock(
+            self._lock_path,
+            self._config.lock_wait_s,
+            clock=self._clock,
+            sleep=self._sleep,
+        )
 
     def _fresh(self, now: float) -> _State:
         return _State(
@@ -766,37 +831,28 @@ class CrossProcessLimiter:
         )
 
     def _save(self, st: _State) -> None:
-        """Write via `<file>.tmp` + `os.replace`, inside the lock.
+        """Persist the bucket + breaker, inside the lock.
 
-        The replace is atomic, so a reader without the lock — or a process
-        killed mid-write — never sees a half-written bucket. There is
-        deliberately NO fsync: this is a pacing hint rebuilt on the next call,
-        not a ledger, and paying a disk flush on every scan to protect it
-        would be the wrong trade. The exposure is a power loss, after which
-        the file may be torn or empty; `_load` reads that as unusable and
-        returns `_fresh`, a full bucket with the breaker closed. That is the
-        fail-OPEN direction, and it is the deliberate choice: a machine that
-        just lost power must come back able to scan, and the breaker re-learns
-        within one 429.
-
-        The file is created 0o600 explicitly rather than inheriting whatever
-        umask is in force, so it does not depend on this module having been
-        the one to create the 0o700 directory around it.
-
-        Only the fields below are written; the payload is built by NAMING
+        Only the six fields below are written; the payload is built by NAMING
         them, so a field added to `_State` tomorrow is invisible until it is
-        added here on purpose.
+        added here on purpose. `atomic_write_json` does the tmp + `os.replace`
+        (and the 0o600 creation), so no reader ever sees a half-written bucket.
+
+        Its lack of an fsync is the deliberate trade documented there. The
+        exposure is a power loss, after which the file may be torn or empty;
+        `_load` reads that as unusable and returns `_fresh`, a full bucket with
+        the breaker closed. That is the fail-OPEN direction, and it is the
+        deliberate choice: a machine that just lost power must come back able
+        to scan, and the breaker re-learns within one 429.
         """
-        payload = {
-            "schema": _SCHEMA,
-            "tokens": st.tokens,
-            "updated_at": st.updated_at,
-            "open_until": st.open_until,
-            "failures": st.failures,
-            "tripped_at": st.tripped_at,
-        }
-        tmp = self._state_path.parent / (self._state_path.name + ".tmp")
-        fd = os.open(tmp, os.O_CREAT | os.O_WRONLY | os.O_TRUNC, 0o600)
-        with os.fdopen(fd, "w", encoding="utf-8") as fh:
-            fh.write(json.dumps(payload))
-        os.replace(tmp, self._state_path)
+        atomic_write_json(
+            self._state_path,
+            {
+                "schema": _SCHEMA,
+                "tokens": st.tokens,
+                "updated_at": st.updated_at,
+                "open_until": st.open_until,
+                "failures": st.failures,
+                "tripped_at": st.tripped_at,
+            },
+        )

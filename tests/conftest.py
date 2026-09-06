@@ -42,11 +42,23 @@ _LIMITER_ENV = (
 )
 
 
+# `smoke.py`'s own knob (the boot-smoke liveness cache). Not read by
+# `LimiterConfig.from_env`, but it shares the cache directory and carries the
+# same hazard: a value in the developer's shell must not change what the suite
+# measures, and a suite that silently reuses a cached pass measures the cache
+# instead of the probe. Pinned OFF below; tests/test_smoke_liveness.py opts
+# back in per test.
+_SMOKE_ENV = (
+    "INJECTION_SCANNER_SMOKE_LIVENESS_TTL_S",
+)
+
+
 @pytest.fixture(autouse=True)
 def _isolated_limiter_state(monkeypatch, tmp_path):
-    """Private limiter state directory + the documented "off" budget."""
-    for name in _LIMITER_ENV:
+    """Private cache directory + the documented "off" budget, cache included."""
+    for name in _LIMITER_ENV + _SMOKE_ENV:
         monkeypatch.delenv(name, raising=False)
     monkeypatch.setenv("INJECTION_SCANNER_CACHE_DIR", str(tmp_path / "cache"))
     monkeypatch.setenv("INJECTION_SCANNER_LAKERA_MIN_INTERVAL_S", "0")
     monkeypatch.setenv("INJECTION_SCANNER_LAKERA_BACKOFF_MAX_S", "0")
+    monkeypatch.setenv("INJECTION_SCANNER_SMOKE_LIVENESS_TTL_S", "0")
