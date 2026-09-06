@@ -1,0 +1,582 @@
+"""Cross-process rate limiting for the hosted Lakera Guard gate (L2).
+
+Lakera Guard is called from ONE function — `injection_scanner.lakera.check()`
+— by several independent processes that share a single Lakera account: a
+research-agent MCP server per Claude Code pane (boot smoke, degraded recheck,
+per-report scan), the CI `smoke` job, the CI `eval` job, and ad-hoc local
+`eval` runs. Measured 2026-09-05: from ~15:00 local, Lakera answered HTTP 429
+to roughly three of every four calls (190-280 ms, immediate server-side
+rejection), about one success per 4-5 minutes fleet-wide regardless of how
+many attempts were made. Nothing in the code reacted: `check()` failed closed
+on the spot, every caller retried on its own schedule, and no process knew
+what any other had just done.
+
+This module is the shared memory those processes were missing. One token
+bucket plus one circuit breaker, both in a single JSON file under the cache
+directory, every operation a read-modify-write under an exclusive
+`fcntl.flock`. The aggregate guarantee is the point: with N processes sharing
+the file, at most `burst + elapsed / min_interval_s` calls reach Lakera in any
+window of length `elapsed`, and zero while the breaker is open. N does not
+appear in the bound, so adding a pane or a CI runner cannot raise the ceiling.
+
+Wall-clock `time.time()` throughout, deliberately. `time.monotonic()` is not
+comparable across processes, and this state is read by processes that did not
+exist when it was written. A clock that steps BACKWARDS is handled by clamping
+elapsed at zero, so a step can delay calls but can never mint tokens.
+
+Fail-closed, like every other layer. The three outcomes are `ALLOWED`,
+`THROTTLED` (bucket empty or breaker open beyond the caller's wait budget) and
+`ERROR` (the limiter itself is unusable — unwritable directory, lock wait
+exceeded, IO error). `lakera.check` turns the latter two into
+`lakera_unavailable:throttled` / `lakera_unavailable:limiter-error`, which
+reject the report exactly as any other outage does. A limiter that cannot
+write its state REFUSES rather than waving calls through: a silent fail-open
+would re-enable the storm this module exists to stop. `record_success` and
+`record_throttled` swallow their own errors for the same reason — if the state
+cannot be written, the very next `acquire` fails the same way and refuses, so
+a broken limiter can never turn into a hammer.
+
+A corrupt, truncated or foreign-schema state file is NOT an error: it is
+replaced by a fresh state (full bucket, breaker closed). A torn file after a
+crash must not brick every scanner on the machine, and the breaker re-learns
+within one 429.
+
+Invariant 4 ("the caught bytes never return") applies here in an unusual
+direction. `Retry-After` is server-supplied TEXT and a hostile or buggy server
+can put anything in it. It is parsed into a clamped number INSIDE this module
+(`_parse_retry_after`) and the string itself is never stored in the state
+file, never logged, and never interpolated into a reason. `backoff_max_s` caps
+the PARSED value too, so an absurd header cannot park the fleet indefinitely.
+
+There is NO on/off switch. "Off" is `min_interval_s=0` (bucket always full)
+plus `backoff_max_s=0` (every breaker delay clamps to zero); the test suite
+runs in exactly that configuration and nobody should want it in production. A
+feature flag shipped defaulted-off is the failure mode the
+`avoiding-unrequested-feature-flags` rule exists to prevent.
+
+Every limit is an INPUT (`LimiterConfig.from_env`), never a constant fitted to
+today's numbers. The defaults follow the ONE limit Lakera publishes (the
+Community plan's 10,000 requests per month) and are retuned by changing env
+values or these defaults when the dashboard shows a different tier — never by
+editing the algorithm.
+"""
+from __future__ import annotations
+
+import contextlib
+import enum
+import errno
+import fcntl
+import json
+import math
+import os
+import time
+from dataclasses import dataclass
+from datetime import timezone
+from email.utils import parsedate_to_datetime
+from pathlib import Path
+
+# Bumped only when the on-disk shape changes. A file carrying any other value
+# is FOREIGN, not corrupt, and is discarded the same way: an older or newer
+# scanner sharing the cache directory must never be able to hand this one a
+# bucket it would misread.
+_SCHEMA = 1
+
+# ---------- environment variable names ----------
+
+ENV_CACHE_DIR = "INJECTION_SCANNER_CACHE_DIR"
+ENV_MIN_INTERVAL_S = "INJECTION_SCANNER_LAKERA_MIN_INTERVAL_S"
+ENV_BURST = "INJECTION_SCANNER_LAKERA_BURST"
+ENV_BACKOFF_BASE_S = "INJECTION_SCANNER_LAKERA_BACKOFF_BASE_S"
+ENV_BACKOFF_MAX_S = "INJECTION_SCANNER_LAKERA_BACKOFF_MAX_S"
+ENV_LOCK_WAIT_S = "INJECTION_SCANNER_LAKERA_LOCK_WAIT_S"
+ENV_MAX_WAIT_S = "INJECTION_SCANNER_LAKERA_MAX_WAIT_S"
+
+# ---------- defaults + clamps ----------
+#
+# Set from measurement on 2026-09-06, not from a guess (full findings in
+# ~/.local/state/claude-tasks/research-agent/findings-lakera-limits.md).
+#
+# Lakera publishes exactly ONE limit: the Community plan's 10,000 requests per
+# month. That is 13.9 per hour, one every 4.3 minutes — and it equals the
+# trickle measured through the 2026-09-05 throttle ("one success per 4-5
+# minutes fleet-wide regardless of attempt count"), which is what identifies
+# the monthly quota, rather than some unpublished QPS ceiling, as the thing the
+# fleet was hitting. Overnight, 25 calls in 30 minutes were accepted before
+# ~40 minutes of 429s, so Lakera's own bucket is roughly 25-50 deep with a slow
+# refill.
+#
+# The defaults sit UNDER that: 300 s sustained is 12 calls/hour against the
+# quota's 13.9; a burst of 10 lets one multi-pane session restore through
+# without being refused; and the breaker waits MINUTES rather than seconds
+# because recovery was observed to take tens of minutes, so a 30 s retry would
+# simply re-spend the budget on 429s. For scale: research-agent boot smokes
+# alone ran ~632 per day before the liveness cache in smoke.py (~19k/month,
+# about twice the entire quota) — spawn frequency, not scan volume, is what
+# exhausts this account.
+#
+# The plan tier is visible only on the Lakera dashboard. On a paid tier every
+# knob loosens via env; the algorithm does not change.
+#
+# Each clamp is a RANGE, so a typo in an environment variable degrades to a
+# sane limiter instead of either disabling the bucket or parking the fleet.
+
+DEFAULT_MIN_INTERVAL_S = 300.0
+DEFAULT_BURST = 10
+DEFAULT_BACKOFF_BASE_S = 300.0
+DEFAULT_BACKOFF_MAX_S = 3600.0
+DEFAULT_LOCK_WAIT_S = 2.0
+DEFAULT_MAX_WAIT_S = 0.0
+
+MIN_INTERVAL_RANGE = (0.0, 3600.0)
+BURST_RANGE = (1, 1000)
+BACKOFF_BASE_RANGE = (0.0, 3600.0)
+BACKOFF_MAX_RANGE = (0.0, 86400.0)
+LOCK_WAIT_RANGE = (0.0, 60.0)
+MAX_WAIT_RANGE = (0.0, 86400.0)
+
+# Fixed by design, not configurable: the lock is held for microseconds, so a
+# 50 ms retry is already generous, and a 1 s poll ceiling means a process
+# waiting for a token re-reads often enough to notice that a PEER finished
+# early (returned a token, or closed the breaker) rather than sleeping through
+# the whole computed gap on stale state.
+_LOCK_RETRY_SLEEP_S = 0.05
+_MAX_POLL_SLEEP_S = 1.0
+
+# A token is a whole call, so anything within this of one IS one.
+#
+# Refill is an ACCUMULATION under the lock — `tokens += elapsed /
+# min_interval_s`, one read-modify-write per poll — so a waiter that naps ten
+# times for a tenth of the interval lands on 0.9999999999999999, not 1.0.
+# Compared against a bare `>= 1.0` that waiter then computes a residual gap of
+# ~1e-15 s and sleeps for it; at today's timestamps one ULP of a float wall
+# clock is ~2.4e-7 s, so the nap cannot move the clock and `acquire` spins
+# until its budget runs out — measured as a hang under the injected clock in
+# tests/test_throttle.py::test_a_positive_wait_budget_sleeps_until_a_token_arrives.
+# 1e-9 of a token is 300 ns of budget at the default interval: dust, not a
+# call, so this can never mint one. Paired with the `max(0.0, ...)` in
+# `_attempt`, which keeps the subtraction from writing a negative balance.
+_TOKEN_EPSILON = 1e-9
+
+# `backoff_base_s * 2 ** (failures - 1)` raises OverflowError past ~1024
+# consecutive failures. The product is clamped to `backoff_max_s` immediately
+# afterwards, so capping the exponent changes no reachable outcome and removes
+# the only arithmetic in here that can raise.
+_MAX_BACKOFF_DOUBLINGS = 32
+
+
+def _clamp_float(value: float, bounds: tuple[float, float]) -> float:
+    lo, hi = bounds
+    return min(max(value, lo), hi)
+
+
+def _env_float(name: str, default: float, bounds: tuple[float, float]) -> float:
+    """A float from the environment: malformed -> default, then clamp.
+
+    NaN is turned back explicitly. It parses fine, survives `min`/`max`
+    unchanged on CPython, and would then make every comparison in `acquire`
+    false — a limiter that neither allows nor refuses.
+    """
+    raw = os.environ.get(name)
+    value = default
+    if raw is not None:
+        try:
+            value = float(raw)
+        except (TypeError, ValueError):
+            value = default
+    if not math.isfinite(value):
+        value = default
+    return _clamp_float(value, bounds)
+
+
+def _env_int(name: str, default: int, bounds: tuple[int, int]) -> int:
+    raw = os.environ.get(name)
+    value = default
+    if raw is not None:
+        try:
+            value = int(raw)
+        except (TypeError, ValueError):
+            value = default
+    lo, hi = bounds
+    return min(max(value, lo), hi)
+
+
+def cache_dir() -> Path:
+    """The limiter's state directory.
+
+    Same directory `selfupdate.py` already uses, so an operator has one place
+    to look and one place to clear.
+    """
+    raw = os.environ.get(ENV_CACHE_DIR)
+    if raw:
+        return Path(raw)
+    return Path.home() / ".cache" / "injection-scanner"
+
+
+def default_max_wait_s() -> float:
+    """`acquire`'s wait budget when the caller does not name one.
+
+    Default 0: an interactive scan refuses immediately rather than parking a
+    report behind the fleet's budget. Batch callers (`eval`) pass their own.
+    """
+    return _env_float(ENV_MAX_WAIT_S, DEFAULT_MAX_WAIT_S, MAX_WAIT_RANGE)
+
+
+@dataclass(frozen=True)
+class LimiterConfig:
+    min_interval_s: float
+    """Sustained fleet-wide interval: one call per this many seconds. 0
+    disables the bucket entirely (the breaker still applies)."""
+
+    burst: int
+    """Bucket capacity — how many calls may go out back-to-back after an idle
+    period."""
+
+    backoff_base_s: float
+    """Breaker delay after the FIRST consecutive throttle that carried no
+    usable `Retry-After`. Doubles per consecutive failure."""
+
+    backoff_max_s: float
+    """Cap on EVERY breaker delay, a server-supplied `Retry-After` included.
+    One knob, and it bounds the blast radius of a bad header."""
+
+    lock_wait_s: float
+    """Bounded wait for the flock before `acquire` gives up with `ERROR`."""
+
+    @classmethod
+    def from_env(cls) -> "LimiterConfig":
+        return cls(
+            min_interval_s=_env_float(
+                ENV_MIN_INTERVAL_S, DEFAULT_MIN_INTERVAL_S, MIN_INTERVAL_RANGE
+            ),
+            burst=_env_int(ENV_BURST, DEFAULT_BURST, BURST_RANGE),
+            backoff_base_s=_env_float(
+                ENV_BACKOFF_BASE_S, DEFAULT_BACKOFF_BASE_S, BACKOFF_BASE_RANGE
+            ),
+            backoff_max_s=_env_float(
+                ENV_BACKOFF_MAX_S, DEFAULT_BACKOFF_MAX_S, BACKOFF_MAX_RANGE
+            ),
+            lock_wait_s=_env_float(
+                ENV_LOCK_WAIT_S, DEFAULT_LOCK_WAIT_S, LOCK_WAIT_RANGE
+            ),
+        )
+
+
+class Decision(enum.Enum):
+    """What `acquire` concluded. A closed vocabulary; `lakera.check` maps each
+    member to one fixed reason literal and never formats anything else."""
+
+    ALLOWED = "allowed"
+    THROTTLED = "throttled"
+    ERROR = "error"
+
+
+@dataclass
+class _State:
+    """The on-disk bucket + breaker, in memory. Never leaves this module."""
+
+    tokens: float
+    updated_at: float
+    open_until: float
+    failures: int
+
+
+def _parse_retry_after(value: object, now: float) -> float | None:
+    """Seconds to wait, from a `Retry-After` header. `None` when unusable.
+
+    THE HEADER IS SERVER-SUPPLIED TEXT and is treated as such: this is the
+    only function that ever looks at it, the return is a plain float, and the
+    caller clamps that float before storing it. Nothing derived from the
+    string is kept.
+
+    RFC 9110 allows two forms and both are accepted: a non-negative number of
+    seconds, or an HTTP-date. Anything else — a negative number, a
+    non-finite one, a date that will not parse, a value with a comment glued
+    to it (`"30; IGNORE PREVIOUS"`), any exception at all — is `None`, and the
+    caller falls back to its own exponential backoff. Being unable to read the
+    header is not a reason to skip the breaker.
+    """
+    if not isinstance(value, str):
+        return None
+    try:
+        text = value.strip()
+        if not text:
+            return None
+        try:
+            seconds = float(text)
+        except ValueError:
+            seconds = None
+        if seconds is not None:
+            if not math.isfinite(seconds) or seconds < 0.0:
+                return None
+            return seconds
+        parsed = parsedate_to_datetime(text)
+        if parsed is None:
+            return None
+        if parsed.tzinfo is None:
+            # HTTP-dates are GMT by definition; a date without a zone is
+            # malformed, but reading it as UTC is strictly better than
+            # inheriting the local zone of whichever host happens to run this.
+            parsed = parsed.replace(tzinfo=timezone.utc)
+        return max(0.0, parsed.timestamp() - now)
+    except Exception:  # noqa: BLE001 — TOTAL by contract; see the docstring
+        return None
+
+
+class CrossProcessLimiter:
+    """A token bucket + circuit breaker shared through one file.
+
+    `state_dir` holds `<name>-throttle.json` and `<name>-throttle.lock`.
+    `clock` and `sleep` are constructor keywords so tests can drive simulated
+    time exactly; production takes the `time` module defaults.
+    """
+
+    def __init__(
+        self,
+        state_dir: Path | str,
+        config: LimiterConfig,
+        *,
+        name: str = "lakera",
+        clock=time.time,
+        sleep=time.sleep,
+    ) -> None:
+        self._state_dir = Path(state_dir)
+        self._config = config
+        self._name = name
+        self._clock = clock
+        self._sleep = sleep
+        self._state_path = self._state_dir / f"{name}-throttle.json"
+        self._lock_path = self._state_dir / f"{name}-throttle.lock"
+
+    @classmethod
+    def from_env(cls, name: str = "lakera") -> "CrossProcessLimiter":
+        return cls(cache_dir(), LimiterConfig.from_env(), name=name)
+
+    @property
+    def config(self) -> LimiterConfig:
+        return self._config
+
+    @property
+    def state_path(self) -> Path:
+        return self._state_path
+
+    @property
+    def lock_path(self) -> Path:
+        return self._lock_path
+
+    # ---------- public API ----------
+
+    def acquire(self, max_wait_s: float = 0.0) -> Decision:
+        """Spend one token, waiting up to `max_wait_s` seconds for one.
+
+        `max_wait_s = 0` (the production default) returns on the first pass:
+        `ALLOWED` or `THROTTLED`, sub-millisecond, no network. A positive
+        budget blocks until a token is available AND the breaker is closed, or
+        the deadline passes.
+
+        Never raises. Every failure of the limiter itself becomes `ERROR`,
+        which the caller renders as a fail-closed reject. That is deliberately
+        wider than "OSError and ValueError": `intercept.scan_text` does not
+        wrap `lakera.check`, so an exception escaping here would abort the
+        scan instead of rejecting the report.
+        """
+        budget = max_wait_s
+        try:
+            budget = float(budget)
+        except (TypeError, ValueError):
+            budget = 0.0
+        if not math.isfinite(budget) or budget < 0.0:
+            budget = 0.0
+
+        try:
+            deadline = self._clock() + budget
+            while True:
+                wait = self._attempt()
+                if wait is None:
+                    return Decision.ALLOWED
+                if self._clock() + wait > deadline:
+                    return Decision.THROTTLED
+                # Re-read after a bounded nap rather than sleeping the whole
+                # computed gap: another process may return a token or close
+                # the breaker while this one waits.
+                self._sleep(min(wait, _MAX_POLL_SLEEP_S))
+        except Exception:  # noqa: BLE001 — see the docstring
+            return Decision.ERROR
+
+    def record_success(self) -> None:
+        """Called on any HTTP 200, flagged or not.
+
+        A 200 means the account is evidently not throttling us, so the breaker
+        closes and the consecutive-failure count resets. Swallows its own
+        errors: if the state cannot be written, the next `acquire` fails the
+        same way and refuses.
+        """
+        try:
+            with self._locked():
+                now = self._clock()
+                st = self._load(now)
+                st.failures = 0
+                st.open_until = 0.0
+                self._save(st)
+        except Exception:  # noqa: BLE001 — see the docstring
+            return
+
+    def record_throttled(self, retry_after: str | None) -> None:
+        """Open the breaker after a throttling response (429 or 503).
+
+        `retry_after` is the RAW header value and goes no further than
+        `_parse_retry_after`, which turns it into a number or `None`. The
+        number is clamped to `backoff_max_s` before it is stored, so a hostile
+        or buggy `Retry-After: 999999999` cannot park the fleet.
+
+        No token is spent and none is returned: the bucket accounts for calls
+        made, and this call was made.
+        """
+        try:
+            with self._locked():
+                now = self._clock()
+                delay = _parse_retry_after(retry_after, now)
+                st = self._load(now)
+                st.failures += 1
+                if delay is None:
+                    doublings = min(st.failures - 1, _MAX_BACKOFF_DOUBLINGS)
+                    delay = self._config.backoff_base_s * (2.0**doublings)
+                if not math.isfinite(delay) or delay < 0.0:
+                    delay = 0.0
+                delay = min(delay, self._config.backoff_max_s)
+                st.open_until = max(st.open_until, now + delay)
+                self._save(st)
+        except Exception:  # noqa: BLE001 — see the docstring
+            return
+
+    # ---------- internals ----------
+
+    def _attempt(self) -> float | None:
+        """One locked pass. `None` == a token was spent; else seconds to wait.
+
+        Note what is saved on the REFUSING branches: the refill is persisted
+        even when the call is turned down, so a process that polls does not
+        keep re-deriving the same elapsed window, and `updated_at` stays the
+        single source of truth for refill accounting.
+        """
+        with self._locked():
+            now = self._clock()
+            st = self._load(now)
+            elapsed = max(0.0, now - st.updated_at)  # clock stepped back -> 0
+            if self._config.min_interval_s <= 0.0:
+                st.tokens = float(self._config.burst)
+            else:
+                st.tokens = min(
+                    float(self._config.burst),
+                    st.tokens + elapsed / self._config.min_interval_s,
+                )
+            st.updated_at = now
+
+            if now < st.open_until:
+                # Breaker open. No token is spent — the call is not happening,
+                # so it must not be billed against the bucket.
+                wait = st.open_until - now
+            elif st.tokens >= 1.0 - _TOKEN_EPSILON:
+                # See `_TOKEN_EPSILON`: accumulated refill lands just short of
+                # a whole token, and a bare `>= 1.0` turns that dust into an
+                # unservable wait.
+                st.tokens = max(0.0, st.tokens - 1.0)
+                self._save(st)
+                return None
+            else:
+                wait = (1.0 - st.tokens) * self._config.min_interval_s
+
+            self._save(st)
+            return wait
+
+    @contextlib.contextmanager
+    def _locked(self):
+        """Exclusive `flock` over `<name>-throttle.lock`, bounded by config.
+
+        The file is opened FRESH for every operation, so the lock also
+        serialises threads inside one process: flock is associated with the
+        open file description, and each `os.open` makes its own. flock is
+        released by the kernel when the holder dies, so there are no stale
+        locks to reap after a crash.
+
+        `LOCK_NB` plus a retry, rather than a blocking `LOCK_EX`, because the
+        wait has to be BOUNDED: a wedged peer must degrade to `ERROR` (a
+        fail-closed reject) rather than hanging a scan forever.
+        """
+        self._state_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+        deadline = self._clock() + self._config.lock_wait_s
+        fd = os.open(self._lock_path, os.O_CREAT | os.O_RDWR, 0o600)
+        try:
+            while True:
+                try:
+                    fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    break
+                except OSError as e:
+                    if e.errno not in (errno.EACCES, errno.EAGAIN, errno.EWOULDBLOCK):
+                        raise
+                    if self._clock() >= deadline:
+                        raise TimeoutError("lakera limiter lock wait exceeded") from None
+                    self._sleep(_LOCK_RETRY_SLEEP_S)
+            try:
+                yield
+            finally:
+                fcntl.flock(fd, fcntl.LOCK_UN)
+        finally:
+            os.close(fd)
+
+    def _fresh(self, now: float) -> _State:
+        return _State(
+            tokens=float(self._config.burst),
+            updated_at=now,
+            open_until=0.0,
+            failures=0,
+        )
+
+    def _load(self, now: float) -> _State:
+        """Read the state, or synthesize a fresh one.
+
+        Missing, truncated, non-JSON, wrong shape, foreign schema, or carrying
+        a non-finite number all mean the same thing: this file cannot be
+        trusted to describe the fleet's budget. That is a RESET (full bucket,
+        breaker closed), not an error — a torn file after a crash must not
+        brick every scanner on the box, and the breaker re-learns within one
+        429. `json.loads` accepts bare `NaN`/`Infinity`, which is why the
+        finiteness check is explicit rather than implied by `float()`.
+        """
+        try:
+            obj = json.loads(self._state_path.read_text(encoding="utf-8"))
+            if not isinstance(obj, dict) or obj.get("schema") != _SCHEMA:
+                return self._fresh(now)
+            tokens = float(obj["tokens"])
+            updated_at = float(obj["updated_at"])
+            open_until = float(obj["open_until"])
+            failures = int(obj["failures"])
+        except (OSError, ValueError, TypeError, KeyError):
+            return self._fresh(now)
+        if not all(math.isfinite(v) for v in (tokens, updated_at, open_until)):
+            return self._fresh(now)
+        return _State(
+            tokens=min(max(tokens, 0.0), float(self._config.burst)),
+            updated_at=updated_at,
+            open_until=open_until,
+            failures=max(failures, 0),
+        )
+
+    def _save(self, st: _State) -> None:
+        """Write via `<file>.tmp` + `os.replace`, inside the lock.
+
+        The replace is atomic, so a reader without the lock — or a process
+        killed mid-write — never sees a half-written bucket. Only the five
+        fields below are written; the payload is built by NAMING them, so a
+        field added to `_State` tomorrow is invisible until it is added here
+        on purpose.
+        """
+        payload = {
+            "schema": _SCHEMA,
+            "tokens": st.tokens,
+            "updated_at": st.updated_at,
+            "open_until": st.open_until,
+            "failures": st.failures,
+        }
+        tmp = self._state_path.parent / (self._state_path.name + ".tmp")
+        tmp.write_text(json.dumps(payload), encoding="utf-8")
+        os.replace(tmp, self._state_path)
