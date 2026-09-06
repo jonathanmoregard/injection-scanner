@@ -340,6 +340,28 @@ class Decision(enum.Enum):
     THROTTLED = "throttled"
     ERROR = "error"
 
+    def __bool__(self) -> bool:
+        """Refuse truthiness. Every member of an ordinary Enum is truthy.
+
+        So `if limiter.acquire():` READS as "was it allowed?" and MEANS "did it
+        return a member?", which THROTTLED and ERROR both do. A call site
+        written that way waves through exactly the two outcomes this module
+        exists to stop — and in the fail-OPEN direction, silently, from a line
+        that looks right: the storm the limiter was built to prevent,
+        re-enabled by a spelling.
+
+        `lakera.check` compares members explicitly (`is Decision.THROTTLED`)
+        and always has. This guard is for the NEXT caller, and it is the same
+        move as the closed reason vocabulary one module over: make the unsafe
+        thing structurally impossible rather than merely discouraged. The cost
+        is nothing — identity, equality, membership and iteration are all
+        untouched, so correct code cannot notice it.
+        """
+        raise TypeError(
+            "compare Decision members explicitly (is Decision.ALLOWED); "
+            "truthiness would fail open"
+        )
+
 
 @dataclass
 class _State:

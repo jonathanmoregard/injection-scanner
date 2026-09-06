@@ -1041,3 +1041,48 @@ def test_an_uncontended_lock_is_taken_whatever_the_budget_says(tmp_path):
         entered = True
     assert entered
     assert fake.sleeps == []
+
+
+# ---------------------------------------------------------------------------
+# `Decision` refuses to be a boolean (added 2026-09-06).
+#
+# Every member of an ordinary Enum is truthy, so `if limiter.acquire():` reads
+# as "was it allowed?" and means "did it return a member?" — which THROTTLED
+# and ERROR both do. A new call site written that way waves through exactly the
+# two outcomes the limiter exists to stop, silently, in the fail-OPEN
+# direction: the storm this module was built to prevent, re-enabled by a line
+# that looks correct.
+#
+# `lakera.check` compares members explicitly and always did. This is about the
+# NEXT caller: the guard makes the wrong spelling raise at the call site rather
+# than pace nothing in production. A footgun removed structurally, not by
+# convention — the same reasoning as the closed reason vocabulary.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("member", list(Decision))
+def test_a_decision_cannot_be_used_as_a_boolean(member):
+    with pytest.raises(TypeError):
+        bool(member)
+
+
+def test_the_footgun_spelling_raises_instead_of_failing_open(tmp_path):
+    """The shape this exists to catch: `if acquire():` on a REFUSAL. Truthy,
+    it would have read as permission to call Lakera."""
+    fake = _Fake()
+    lim = _limiter(tmp_path, fake, min_interval_s=3600.0, burst=1)
+    assert lim.acquire() is Decision.ALLOWED
+    decision = lim.acquire()
+    assert decision is Decision.THROTTLED
+    with pytest.raises(TypeError):
+        if decision:  # noqa: SIM103 — the whole point of the test
+            pass
+
+
+def test_explicit_comparison_is_unaffected():
+    """The control: identity, equality and membership all still work, so the
+    guard costs nothing at a call site that was written correctly."""
+    assert Decision.ALLOWED is Decision.ALLOWED
+    assert Decision.ALLOWED != Decision.THROTTLED
+    assert Decision("throttled") is Decision.THROTTLED
+    assert len([d for d in Decision if d is not Decision.ALLOWED]) == 2
