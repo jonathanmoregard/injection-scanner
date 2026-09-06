@@ -61,6 +61,7 @@ from injection_scanner.throttle import (
     Decision,
     default_max_wait_s,
     env_float,
+    env_int,
 )
 
 _DEFAULT_URL = "https://api.lakera.ai/v2/guard"
@@ -91,6 +92,46 @@ _DEFAULT_URL = "https://api.lakera.ai/v2/guard"
 ENV_TIMEOUT_S = "INJECTION_SCANNER_LAKERA_TIMEOUT"
 DEFAULT_TIMEOUT_S = 10.0
 TIMEOUT_RANGE = (1.0, 120.0)
+
+# How many bytes of a response body this layer will read. The second LIMIT in
+# this module, and it gets the same treatment as the first: an env INPUT,
+# malformed-to-default, then clamped to a range.
+#
+# The timeout bounds how LONG a call may take; nothing bounded how MUCH it
+# could return. A wedged proxy, a misrouted endpoint or a hostile server
+# answering with gigabytes drives the process to the OOM killer, and process
+# death is not a fail-closed reject: the report is neither delivered nor
+# refused, the pane dies mid-scan, and no reason string is ever produced to say
+# so. Every other failure in this module degrades to a reason; this one
+# degraded to a corpse, which is why a cap belongs here and not only in the
+# operator's kernel settings.
+#
+# 1 MiB is two orders of magnitude above any real Guard response (a breakdown
+# with every detector is a few kilobytes), so it is headroom rather than a
+# fitted value; the range exists because both ends fail badly. The floor (4 KiB)
+# is the smallest cap that can still hold a legitimate breakdown, so anything
+# under it would be a self-inflicted outage; the ceiling (64 MiB) keeps a typo
+# from being spelled as "unbounded again".
+ENV_MAX_RESPONSE_BYTES = "INJECTION_SCANNER_LAKERA_MAX_RESPONSE_BYTES"
+DEFAULT_MAX_RESPONSE_BYTES = 1_048_576
+MAX_RESPONSE_BYTES_RANGE = (4096, 67_108_864)
+
+
+class ResponseTooLarge(Exception):
+    """The response body exceeded `ENV_MAX_RESPONSE_BYTES`.
+
+    A dedicated type, and deliberately not a `ValueError` or an `OSError`: the
+    blanket handler in `check` renders it by TYPE NAME, so the outage reads
+    `lakera_unavailable:ResponseTooLarge` and is distinguishable from a torn
+    connection or a parse failure. Carries no message — nothing about the body
+    it refused, its length included, crosses the scanner boundary.
+    """
+
+
+def _max_response_bytes() -> int:
+    return env_int(
+        ENV_MAX_RESPONSE_BYTES, DEFAULT_MAX_RESPONSE_BYTES, MAX_RESPONSE_BYTES_RANGE
+    )
 
 
 @dataclass
@@ -146,10 +187,17 @@ def _post(url: str, body: bytes, headers: dict, timeout: float) -> dict:
 
     Goes through `_OPENER`, not `urlopen`: see the comment on it for why a
     followed redirect is a key-exfiltration bug rather than a convenience.
+
+    The read is CAPPED. `read(cap + 1)` is what makes the check possible
+    without buffering the thing being refused: one byte over the limit is
+    enough to know, and the rest is never pulled off the socket.
     """
+    cap = _max_response_bytes()
     req = urllib.request.Request(url, data=body, headers=headers, method="POST")
     with _OPENER.open(req, timeout=timeout) as resp:
-        raw = resp.read()
+        raw = resp.read(cap + 1)
+    if len(raw) > cap:
+        raise ResponseTooLarge
     return json.loads(raw.decode("utf-8"))
 
 
@@ -276,7 +324,8 @@ def check(text: str, *, max_wait_s: float | None = None) -> LakeraResult:
       * the limiter itself is unusable (unwritable cache dir, lock wait
         exceeded, IO error)
                                  -> ok=False reason "lakera_unavailable:limiter-error"
-      * any network/HTTP/JSON/timeout error
+      * any network/HTTP/JSON/timeout error, an over-cap response body
+        included (`lakera_unavailable:ResponseTooLarge`)
                                  -> ok=False reason "lakera_unavailable:<ExcType>",
                                     plus ":<status>" for an HTTPError with a
                                     plausible status code (e.g.

@@ -195,7 +195,8 @@ def env_float(name: str, default: float, bounds: tuple[float, float]) -> float:
     with it. That knob is not a limiter setting, but it wants exactly this
     contract — "every limit is an input with a range", malformed to the
     default, NaN refused — and one audited implementation of it beats two.
-    `_env_int` stays private; nothing outside this module needs it yet.
+    `env_int` is public for the same reason: `lakera.py` bounds its response
+    read with it.
     """
     raw = os.environ.get(name)
     value = default
@@ -209,7 +210,14 @@ def env_float(name: str, default: float, bounds: tuple[float, float]) -> float:
     return _clamp_float(value, bounds)
 
 
-def _env_int(name: str, default: int, bounds: tuple[int, int]) -> int:
+def env_int(name: str, default: int, bounds: tuple[int, int]) -> int:
+    """`env_float`'s integer twin: malformed -> default, then clamp.
+
+    No finiteness check is needed — `int()` refuses `inf`, `nan` and `1.5`
+    outright, so everything that survives the parse is already a whole number
+    a range can bound. PUBLIC for `lakera.MAX_RESPONSE_BYTES_RANGE`, which is
+    a limit in bytes and wants exactly this contract.
+    """
     raw = os.environ.get(name)
     value = default
     if raw is not None:
@@ -319,7 +327,7 @@ class LimiterConfig:
             min_interval_s=env_float(
                 ENV_MIN_INTERVAL_S, DEFAULT_MIN_INTERVAL_S, MIN_INTERVAL_RANGE
             ),
-            burst=_env_int(ENV_BURST, DEFAULT_BURST, BURST_RANGE),
+            burst=env_int(ENV_BURST, DEFAULT_BURST, BURST_RANGE),
             backoff_base_s=env_float(
                 ENV_BACKOFF_BASE_S, DEFAULT_BACKOFF_BASE_S, BACKOFF_BASE_RANGE
             ),

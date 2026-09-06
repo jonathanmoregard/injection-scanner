@@ -30,6 +30,7 @@ _LAKERA_ENV = (
     "LAKERA_API_KEY_FILE",
     "LAKERA_GUARD_URL",
     "INJECTION_SCANNER_LAKERA_TIMEOUT",
+    "INJECTION_SCANNER_LAKERA_MAX_RESPONSE_BYTES",
 )
 
 # A benign report that clears L0 (unicode) and L1b (secret_shapes) so the
@@ -1133,3 +1134,77 @@ def test_an_https_override_is_used_as_written(monkeypatch, raw):
     _with_key(monkeypatch)
     monkeypatch.setenv("LAKERA_GUARD_URL", raw)
     assert _captured_url(monkeypatch) == raw
+
+
+# ---------- (k) the response body is read under a cap -----------------------
+#
+# `resp.read()` was unbounded. A wedged or hostile endpoint answering with
+# gigabytes takes the process to OOM — and process DEATH is not a fail-closed
+# reject: the report is neither delivered nor rejected, the research-agent pane
+# dies mid-scan, and nothing in the reason vocabulary ever says why. Everything
+# else in this module degrades to a reason; this degraded to a corpse.
+#
+# So the read is bounded by an env INPUT with a default and a clamped range,
+# like every other limit in the package, and exceeding it raises a dedicated
+# type that the existing blanket handler renders as
+# `lakera_unavailable:ResponseTooLarge`.
+
+_BODY_HEAD = b'{"flagged": false, "breakdown": [], "pad": "'
+_BODY_TAIL = b'"}'
+
+
+def _json_body(size: int) -> bytes:
+    """Valid JSON of EXACTLY `size` bytes, so the boundary is the boundary."""
+    body = _BODY_HEAD + b"x" * (size - len(_BODY_HEAD) - len(_BODY_TAIL)) + _BODY_TAIL
+    assert len(body) == size
+    return body
+
+
+def test_a_response_one_byte_over_the_cap_is_an_outage(loopback, monkeypatch):
+    cap = lakera.MAX_RESPONSE_BYTES_RANGE[0]
+    monkeypatch.setenv("INJECTION_SCANNER_LAKERA_MAX_RESPONSE_BYTES", str(cap))
+    loopback.mode["body"] = _json_body(cap + 1)
+    with pytest.raises(Exception) as excinfo:  # noqa: PT011 — the type is the fix
+        _loopback_post(f"{loopback.base}/guard")
+    assert (
+        lakera._transport_reason(excinfo.value)
+        == "lakera_unavailable:ResponseTooLarge"
+    )
+
+
+def test_a_response_at_the_cap_still_parses(loopback, monkeypatch):
+    """The control: the cap is a ceiling, not an off-by-one reject."""
+    cap = lakera.MAX_RESPONSE_BYTES_RANGE[0]
+    monkeypatch.setenv("INJECTION_SCANNER_LAKERA_MAX_RESPONSE_BYTES", str(cap))
+    loopback.mode["body"] = _json_body(cap)
+    data = _loopback_post(f"{loopback.base}/guard")
+    assert data["flagged"] is False
+    assert data["breakdown"] == []
+
+
+@pytest.mark.parametrize(
+    "raw,expected",
+    [
+        (None, "default"),
+        ("65536", 65536),
+        ("1", "floor"),
+        ("-5", "floor"),
+        ("999999999999", "ceiling"),
+        ("not a number", "default"),
+        ("inf", "default"),
+        ("1.5", "default"),
+    ],
+)
+def test_the_response_cap_is_a_range_clamped_input(monkeypatch, raw, expected):
+    """Default-then-clamp, the treatment every limit in this package gets. A
+    malformed or absurd value must degrade to a documented bound rather than
+    silently restoring the unbounded read."""
+    if raw is not None:
+        monkeypatch.setenv("INJECTION_SCANNER_LAKERA_MAX_RESPONSE_BYTES", raw)
+    lo, hi = lakera.MAX_RESPONSE_BYTES_RANGE
+    want = {
+        "default": lakera.DEFAULT_MAX_RESPONSE_BYTES,
+        "floor": lo,
+        "ceiling": hi,
+    }.get(expected, expected)
+    assert lakera._max_response_bytes() == want

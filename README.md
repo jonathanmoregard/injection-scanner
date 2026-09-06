@@ -57,6 +57,7 @@ Every limit is an input. There is no on/off switch: "off" is `MIN_INTERVAL_S=0` 
 | `INJECTION_SCANNER_LAKERA_BACKOFF_MAX_S` | `3600` | `[0, 86400]` | Cap on **every** breaker delay, a server-supplied `Retry-After` included. |
 | `INJECTION_SCANNER_LAKERA_LOCK_WAIT_S` | `2` | `[0, 60]` | Bounded wait for the state-file lock before the call is refused. Also bounds the liveness cache's lock. |
 | `INJECTION_SCANNER_LAKERA_MAX_WAIT_S` | `0` | `[0, 86400]` | Default wait budget for `check()` when the caller passes none. `0` refuses immediately rather than parking a report. |
+| `INJECTION_SCANNER_LAKERA_MAX_RESPONSE_BYTES` | `1048576` | `[4096, 67108864]` | How much of a Guard response body is read. A larger one is an outage (`lakera_unavailable:ResponseTooLarge`), not an OOM: the timeout bounds how long a call takes, this bounds how much it can return. |
 | `INJECTION_SCANNER_SMOKE_LIVENESS_TTL_S` | `3600` | `[0, 86400]` | How long one passing boot-smoke liveness probe is trusted fleet-wide (see below). `0` disables the cache. |
 | `INJECTION_SCANNER_CACHE_DIR` | `~/.cache/injection-scanner` | — | State directory (`lakera-throttle.json` + `.lock`, `smoke-liveness.json` + `.lock`). Same directory the self-updater defaults to. |
 
