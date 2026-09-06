@@ -13,11 +13,15 @@ from __future__ import annotations
 from pathlib import Path
 from types import SimpleNamespace
 
+import pytest
+
 from injection_scanner.eval import (
     BLOCK,
     PASS,
     EvalCase,
+    EvalInfraError,
     Scorecard,
+    _is_infra_reason,
     _main,
     evaluate,
     load_corpus_dir,
@@ -285,10 +289,6 @@ def test_cli_gates_on_the_confirmed_verdict(monkeypatch, tmp_path: Path) -> None
 # Lakera costs one probe per breaker window instead of 16.
 # ---------------------------------------------------------------------------
 
-import pytest
-
-from injection_scanner.eval import EvalInfraError, _is_infra_reason
-
 
 @pytest.mark.parametrize(
     "reason",
@@ -385,6 +385,67 @@ def test_a_wrapped_honeypot_outage_also_aborts(monkeypatch) -> None:
     assert excinfo.value.case_id == "a"
 
 
+def _reason_sequence_scan(monkeypatch, script: dict[str, list[str]]) -> list[dict]:
+    """Stub `scan_text` with a per-text SEQUENCE of reasons.
+
+    The last reason repeats once the sequence is exhausted. Each log entry
+    records the text scanned AND the wait budget that call carried, so a test
+    can assert what every attempt did — not just the first one.
+    """
+    log: list[dict] = []
+
+    def fake(
+        raw: str,
+        *,
+        use_honeypot: bool = False,
+        use_lakera: bool = False,
+        lakera_max_wait_s: float | None = None,
+    ):
+        seq = script[raw]
+        i = sum(1 for entry in log if entry["raw"] == raw)
+        log.append({"raw": raw, "lakera_max_wait_s": lakera_max_wait_s})
+        reason = seq[min(i, len(seq) - 1)]
+        return SimpleNamespace(ok=(reason == "pass"), reason=reason)
+
+    monkeypatch.setattr("injection_scanner.eval.scan_text", fake)
+    return log
+
+
+def test_an_outage_on_a_rescan_aborts_too(monkeypatch) -> None:
+    """The abort is per ATTEMPT, not per case.
+
+    With confirmation on, a case whose verdict disagrees with its label is
+    scanned again — and the re-scan is exactly where a throttled Lakera turns
+    up, because the first attempt is what spent the last token. Classifying
+    only the first attempt would score the outage AND keep re-scanning
+    through it, spending the budget on a layer that is down.
+    """
+    log = _reason_sequence_scan(
+        monkeypatch,
+        {
+            "ok": ["lakera:prompt_attack", "lakera_unavailable:throttled", "pass"],
+            "next": ["pass"],
+        },
+    )
+    with pytest.raises(EvalInfraError) as excinfo:
+        evaluate(
+            [
+                EvalCase(id="ok", text="ok", expected=PASS),
+                EvalCase(id="next", text="next", expected=PASS),
+            ],
+            confirm_disagreements=2,
+            lakera_max_wait_s=120.0,
+        )
+    assert excinfo.value.case_id == "ok"
+    assert excinfo.value.reason == "lakera_unavailable:throttled"
+    assert [e["raw"] for e in log] == ["ok", "ok"], (
+        "the third attempt and the next case must never be scanned"
+    )
+    assert [e["lakera_max_wait_s"] for e in log] == [120.0, 120.0], (
+        "every attempt, not just the first, must carry the wait budget"
+    )
+
+
 def test_a_detection_that_merely_ends_in_the_suffix_still_scores(monkeypatch) -> None:
     _reason_scan(monkeypatch, {"a": "secret_shape:thing_unavailable"})
     card = evaluate([EvalCase(id="a", text="a", expected=BLOCK)])
@@ -471,8 +532,14 @@ def test_the_cli_reports_infra_on_stderr_and_exits_three(
         monkeypatch, {"inj": "lakera_unavailable:throttled", "ok": "pass"}
     )
     assert _main([str(corpus), "--min-recall", "1.0"]) == 3
-    err = capsys.readouterr().err
-    assert "INFRA inj lakera_unavailable:throttled" in err
+    captured = capsys.readouterr()
+    assert captured.out == "", (
+        "no scorecard on stdout: there isn't one, and a partial card is how "
+        "an outage gets mistaken for a measurement"
+    )
+    # The exact line and nothing else: a CI log reading this must not have to
+    # guess which of several lines is the diagnosis.
+    assert captured.err.strip() == "INFRA inj lakera_unavailable:throttled"
     assert seen == ["inj"], "the second case must never be scanned"
 
 
