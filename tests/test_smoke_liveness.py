@@ -171,8 +171,13 @@ def test_a_fresh_cache_runs_the_probe_and_records_the_pass(probe, cache_file, tt
 
 
 def test_a_second_boot_inside_the_ttl_skips_the_probe(probe, ttl):
-    """The property the whole file exists for: a six-pane session restore
-    costs ONE Lakera call, not six.
+    """The property the whole file exists for: the second and every later
+    spawn inside the TTL costs ZERO vendor calls.
+
+    Not "a six-pane restore costs one" — there is no single-flight, so panes
+    that boot before the first probe has recorded all miss and all probe, and
+    that burst is the limiter's job to bound. What this pins is the steady
+    state: once a pass is on disk, further boots are free.
 
     Each boot gets its OWN log, so the cached boots can be asserted on for
     what they did NOT say as well as for what they did (D26). The first boot
@@ -311,13 +316,15 @@ def test_a_degraded_layer_is_not_cached_either(probe, cache_file, ttl):
         '{"schema": 1, "ok": true}',
         '{"schema": 1, "ok": true, "at": "soon"}',
         '{"schema": 1, "ok": true, "at": NaN}',
+        '{"schema": 1, "ok": true, "at": ' + "9" * 400 + "}",
         '{"schema": 1, "ok": true, "at": 1700009999.0}',
     ],
     ids=[
         "empty", "truncated", "null", "array", "garbage",
         "schema-99", "schema-2", "schema-0",
         "recorded-failure", "ok-not-boolean", "no-timestamp",
-        "timestamp-not-a-number", "timestamp-nan", "timestamp-in-the-future",
+        "timestamp-not-a-number", "timestamp-nan", "timestamp-overflows-a-float",
+        "timestamp-in-the-future",
     ],
 )
 def test_an_unusable_cache_entry_is_a_miss(probe, cache_file, ttl, blob):
@@ -335,6 +342,15 @@ def test_an_unusable_cache_entry_is_a_miss(probe, cache_file, ttl, blob):
     let an entry outlive its TTL by an arbitrary amount (D25); `timestamp-nan`
     is `json.loads` accepting bare `NaN`, which then makes every comparison
     false.
+
+    `timestamp-overflows-a-float` is the one that has to be a MISS rather than
+    an exception, and it is why the whole parse lives inside the total guard
+    instead of behind a tuple of expected exception types. `json.loads` builds
+    an arbitrary-precision int, and `float()` of a 400-digit one raises
+    `OverflowError` — not a `ValueError`, not a `TypeError`. Escaping
+    `run_smoke`, it reaches research-agent as `scanner_unavailable:OverflowError`
+    and the server stays DEGRADED; the file persists, so every pane and every
+    recheck repeats it until a human clears the cache directory.
     """
     ttl(3600)
     cache_file.parent.mkdir(parents=True, exist_ok=True)

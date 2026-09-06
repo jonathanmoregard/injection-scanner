@@ -428,6 +428,15 @@ def _require_own_directory(state_dir: Path) -> None:
     own safe default — the limiter's `ERROR` -> `limiter-error` fail-closed
     reject, the liveness cache's "miss, probe as before".
 
+    What is checked is OWNERSHIP, not permissions: a directory this uid owns
+    is trusted whatever its mode. `mkdir(mode=0o700)` makes that safe for a
+    directory this module created, but `exist_ok=True` accepts a pre-existing
+    one, so a 0777 directory the uid owns — or one whose mode a later `chmod`
+    widened — passes. Anyone able to change the mode of a directory this uid
+    owns is already inside that uid's trust boundary; the shapes worth
+    refusing are the ones a STRANGER can arrange under a world-writable temp
+    dir, and those are exactly the two above.
+
     Only the FINAL component is checked: a hostile ancestor is beyond what a
     cache path can defend against and belongs to whoever configured
     `INJECTION_SCANNER_CACHE_DIR`.
