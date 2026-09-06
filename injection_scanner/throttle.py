@@ -71,6 +71,7 @@ import fcntl
 import json
 import math
 import os
+import tempfile
 import time
 from dataclasses import dataclass
 from datetime import timezone
@@ -228,16 +229,34 @@ def cache_dir() -> Path:
     and this runs inside `from_env()`, which callers reach outside
     `acquire`'s try/except — an escaping exception there would abort the whole
     scan instead of failing it closed.
+
+    That contract is why the WHOLE body is guarded and not just the
+    `expanduser()` call. `Path.home()` raises `RuntimeError` too, whenever
+    `HOME` is unset AND the uid has no `/etc/passwd` entry — the ordinary
+    state of a scratch container, a `docker run --user 1234`, and some CI
+    runners. There is no home directory to name in that case, so the fallback
+    is a per-uid directory under the system temp dir: ABSOLUTE, because a
+    relative path gives every process its own private budget and silently
+    recreates the storm this module exists to stop; and PER-UID, because a
+    fixed name under a world-writable `/tmp` would collide with (or be
+    unwritable because of) another user's file. It is not durable across
+    reboots, which costs one reset bucket — strictly better than a scan that
+    aborts. Paired with `lakera.check`, which wraps the `from_env()` +
+    `acquire()` pair so even a failure here fails the report closed rather
+    than crashing the scan.
     """
-    raw = os.environ.get(ENV_CACHE_DIR)
-    if raw:
-        try:
-            path = Path(raw).expanduser()
-        except (RuntimeError, OSError, ValueError):
-            path = Path(raw)
-        if path.is_absolute():
-            return path
-    return Path.home() / ".cache" / "injection-scanner"
+    try:
+        raw = os.environ.get(ENV_CACHE_DIR)
+        if raw:
+            try:
+                path = Path(raw).expanduser()
+            except (RuntimeError, OSError, ValueError):
+                path = Path(raw)
+            if path.is_absolute():
+                return path
+        return Path.home() / ".cache" / "injection-scanner"
+    except Exception:  # noqa: BLE001 — TOTAL by contract; see the docstring
+        return Path(tempfile.gettempdir()) / f"injection-scanner-{os.getuid()}"
 
 
 def default_max_wait_s() -> float:

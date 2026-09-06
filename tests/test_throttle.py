@@ -26,6 +26,7 @@ import json
 import os
 import subprocess
 import sys
+import tempfile
 from dataclasses import dataclass, field
 from email.utils import formatdate
 from pathlib import Path
@@ -187,6 +188,49 @@ def test_a_non_absolute_cache_dir_falls_back_to_the_default(monkeypatch, raw):
     """
     monkeypatch.setenv("INJECTION_SCANNER_CACHE_DIR", raw)
     assert throttle.cache_dir() == Path.home() / ".cache" / "injection-scanner"
+
+
+def test_a_host_with_no_home_directory_still_gets_a_state_directory(monkeypatch):
+    """`cache_dir()` is TOTAL, and `Path.home()` is the part that isn't.
+
+    `Path.home()` raises RuntimeError when `HOME` is unset AND the uid has no
+    passwd entry — the ordinary state of a scratch container or anything
+    started with `docker run --user 1234`. `cache_dir()` is reached from
+    `from_env()`, which `lakera.check` calls outside `acquire`'s own guard, so
+    a raise here would abort the scan rather than fail it closed. The fallback
+    is absolute (a relative one would give every process its own private
+    budget) and per-uid (a shared `/tmp` path would be another user's file).
+    """
+    monkeypatch.delenv(throttle.ENV_CACHE_DIR, raising=False)
+    monkeypatch.delenv("HOME", raising=False)
+
+    def _no_home(*_a, **_kw):
+        raise RuntimeError("Could not determine home directory.")
+
+    monkeypatch.setattr(Path, "home", _no_home)
+
+    got = throttle.cache_dir()
+    assert got == Path(tempfile.gettempdir()) / f"injection-scanner-{os.getuid()}"
+    assert got.is_absolute()
+
+
+def test_an_unresolvable_tilde_with_no_home_falls_back_rather_than_raising(monkeypatch):
+    """The same totality, reached the other way round.
+
+    `~nosuchuser` makes `expanduser()` raise, which degrades to the default
+    branch — and on a host with no home directory that branch raises too.
+    Neither may escape.
+    """
+    monkeypatch.setenv(throttle.ENV_CACHE_DIR, "~nosuchuser/x")
+    monkeypatch.delenv("HOME", raising=False)
+
+    def _no_home(*_a, **_kw):
+        raise RuntimeError("Could not determine home directory.")
+
+    monkeypatch.setattr(Path, "home", _no_home)
+
+    got = throttle.cache_dir()
+    assert got == Path(tempfile.gettempdir()) / f"injection-scanner-{os.getuid()}"
 
 
 # ---------- the token bucket ----------
