@@ -562,8 +562,45 @@ def _main(argv: list[str] | None = None) -> int:
             f"--lakera-max-wait must be a finite number of seconds >= 0, got "
             f"{args.lakera_max_wait!r}"
         )
+    if args.confirm_disagreements < 0:
+        # `evaluate` raises ValueError on this, and that exception escaped
+        # `_main` uncaught — which Python renders as exit 1, the code the
+        # epilog reserves for "a threshold failed". A mistyped budget therefore
+        # reported a recall regression. Rejected here at parse time instead,
+        # the same treatment `--lakera-max-wait` gets one branch up, so the
+        # usage error leaves through the usage exit and costs no scan.
+        parser.error(
+            f"--confirm-disagreements must be an integer >= 0, got "
+            f"{args.confirm_disagreements!r}"
+        )
 
-    cases = load_jsonl(args.corpus)
+    # The corpus is an ARGUMENT, so a bad one is a usage error like any other.
+    # Everything `load_jsonl` can raise means the same thing — this path does
+    # not name a readable, well-formed corpus — and none of it was caught: a
+    # missing file, a directory, a permission error, a torn JSON line, a row
+    # missing a field or carrying a label outside the vocabulary all escaped as
+    # an uncaught exception, i.e. exit 1 plus a traceback over the operator's
+    # terminal. Exit 1 is the threshold code, so CI read "recall regressed"
+    # from a typo'd path.
+    #
+    # Caught as a group rather than one type at a time: `FileNotFoundError` is
+    # the obvious one and the least interesting, `IsADirectoryError` and
+    # `PermissionError` are equally ordinary operator mistakes, and a row that
+    # is a JSON list rather than an object raises `TypeError` from the
+    # subscript. `json.JSONDecodeError` is a `ValueError` subclass and
+    # `FileNotFoundError` an `OSError` subclass; both are named anyway so the
+    # roster reads as the intended set rather than as an accident of the
+    # hierarchy.
+    #
+    # `str(exc)` is safe to show here and is what makes the message useful: it
+    # is argparse's own diagnostic surface, the corpus is operator-authored
+    # (not a scanned report), and `load_jsonl` builds its messages from the
+    # path, the line number and the missing FIELD NAME — never from case text.
+    try:
+        cases = load_jsonl(args.corpus)
+    except (OSError, ValueError, TypeError, KeyError, json.JSONDecodeError) as exc:
+        parser.error(f"cannot read corpus {args.corpus!r}: {exc}")
+
     try:
         card = evaluate(
             cases,

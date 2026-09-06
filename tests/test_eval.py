@@ -598,3 +598,95 @@ def test_a_sane_wait_budget_is_accepted(
     log = _reason_scan(monkeypatch, {"a": ["pass"]})
     assert _main([str(corpus), "--lakera-max-wait", good]) == 0
     assert log[0]["lakera_max_wait_s"] == expected
+
+
+# ---------------------------------------------------------------------------
+# Usage errors leave through the usage-error exit (added 2026-09-06).
+#
+# The epilog promises four exhaustive exit codes: 0 measured, 1 a threshold
+# failed, 2 usage, 3 an outage. Three inputs escaped that promise by raising
+# out of `_main` uncaught, and Python renders an uncaught exception as exit 1
+# — the code CI reads as "recall regressed". A missing corpus, a corrupt one,
+# and `--confirm-disagreements -1` therefore all reported a scoring failure
+# and printed a traceback over the operator's terminal.
+#
+# The corpus is an ARGUMENT, so a bad one is a usage error like any other:
+# `parser.error` names the cause, argparse exits 2, and no traceback is
+# printed. Nothing is scanned in any of these cases.
+# ---------------------------------------------------------------------------
+
+
+def _usage_error(monkeypatch, argv: list[str], capsys) -> str:
+    """Run `_main(argv)`, assert exit 2, return what argparse said on stderr."""
+    log = _reason_scan(monkeypatch, {})
+    with pytest.raises(SystemExit) as excinfo:
+        _main(argv)
+    assert excinfo.value.code == 2
+    assert log == [], "a rejected run must not scan anything"
+    return capsys.readouterr().err
+
+
+def test_a_missing_corpus_is_a_usage_error_not_a_threshold_failure(
+    monkeypatch, tmp_path: Path, capsys
+) -> None:
+    err = _usage_error(monkeypatch, [str(tmp_path / "nope.jsonl")], capsys)
+    assert "corpus" in err
+    assert "Traceback" not in err
+
+
+def test_an_unreadable_corpus_is_a_usage_error(
+    monkeypatch, tmp_path: Path, capsys
+) -> None:
+    """A DIRECTORY where a file was named: an OSError, not a FileNotFoundError,
+    so catching the narrower type alone would still traceback."""
+    err = _usage_error(monkeypatch, [str(tmp_path)], capsys)
+    assert "corpus" in err
+
+
+@pytest.mark.parametrize(
+    "line, id",
+    [
+        pytest.param("{not json at all}\n", "invalid-json", id="invalid-json"),
+        pytest.param('{"id": "a", "text": "a"}\n', "missing-field", id="missing-field"),
+        pytest.param(
+            '{"id": "a", "text": "a", "expected": "maybe"}\n', "bad-label",
+            id="bad-label",
+        ),
+        pytest.param("[1, 2, 3]\n", "not-an-object", id="not-an-object"),
+    ],
+)
+def test_a_malformed_corpus_row_is_a_usage_error(
+    monkeypatch, tmp_path: Path, capsys, line: str, id: str
+) -> None:
+    corpus = tmp_path / "c.jsonl"
+    corpus.write_text(line, encoding="utf-8")
+    err = _usage_error(monkeypatch, [str(corpus)], capsys)
+    assert "corpus" in err
+    assert "Traceback" not in err
+
+
+def test_a_negative_confirmation_budget_is_a_usage_error(
+    monkeypatch, tmp_path: Path, capsys
+) -> None:
+    """`evaluate` raises ValueError on this; escaping `_main` it became exit 1.
+    Rejected at parse time now, the same treatment `--lakera-max-wait` gets."""
+    corpus = tmp_path / "c.jsonl"
+    corpus.write_text(
+        '{"id": "a", "text": "a", "expected": "pass"}\n', encoding="utf-8"
+    )
+    err = _usage_error(
+        monkeypatch, [str(corpus), "--confirm-disagreements", "-1"], capsys
+    )
+    assert "--confirm-disagreements" in err
+
+
+def test_a_valid_run_still_exits_zero(monkeypatch, tmp_path: Path) -> None:
+    """The control: none of the above narrows what a good run does."""
+    corpus = tmp_path / "c.jsonl"
+    corpus.write_text(
+        '{"id": "a", "text": "a", "expected": "pass"}\n', encoding="utf-8"
+    )
+    _reason_scan(monkeypatch, {"a": ["pass"]})
+    assert _main([str(corpus)]) == 0
+    _reason_scan(monkeypatch, {"a": ["pass"]})
+    assert _main([str(corpus), "--confirm-disagreements", "0"]) == 0
