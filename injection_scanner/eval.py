@@ -89,12 +89,25 @@ _INFRA_BARE_REASONS = frozenset({"no-key", "key-config-error", "bad-response"})
 class EvalInfraError(RuntimeError):
     """A scanner outage during an eval run — not a classification.
 
-    Carries the case that hit it and the scanner's own reason. Both are
-    scanner-synthesized, closed-vocabulary strings (a layer name, a condition,
-    an exception TYPE name, a bounded HTTP status), which is why `_main` can
-    print them: setup and infra failures are meant to be readable without a
-    dive into the isolation zone. Nothing derived from the scanned text is in
-    either field.
+    Carries the case that hit it and the scanner's own reason. `_main` prints
+    the pair as `INFRA <case_id> <reason>` on stderr, so what each field can
+    contain is load-bearing, and the two fields are NOT the same kind of
+    string:
+
+      * `reason` is scanner-synthesized closed vocabulary — a layer name, a
+        condition, an exception TYPE name, a bounded HTTP status. Nothing
+        derived from the scanned text is in it.
+      * `case_id` is OPERATOR-AUTHORED: it comes off the corpus row verbatim.
+        It is constrained instead by `_validate_case_id`, which every
+        `EvalCase` runs at construction, so by the time one can reach this
+        exception it is single-line printable ASCII of bounded length.
+
+    That validation is what makes the INFRA line printable at all. Free text
+    here would let a corpus row carrying a newline forge a SECOND INFRA line
+    naming any reason it liked, and one carrying an ESC byte write terminal
+    control sequences into a CI log — into the exact channel that is read
+    outside the isolation zone precisely because it was promised to be
+    content-free. See `_validate_case_id`.
     """
 
     def __init__(self, case_id: str, reason: str) -> None:
@@ -133,6 +146,55 @@ def _is_infra_reason(reason: object) -> bool:
     return reason in _INFRA_BARE_REASONS
 
 
+# The case id crosses the scanner boundary — `_main` prints it on the
+# `INFRA <case_id> <reason>` line that a CI log and research-agent's diagnosis
+# both read — but unlike everything else on that line it is operator-authored
+# free text off a corpus row. So it is constrained to a shape that cannot
+# forge structure in the channel it travels through.
+#
+# Single-LINE is the load-bearing half: a `\n` in an id makes one INFRA line
+# into two, and the forged one can claim any reason it likes. Printable ASCII
+# covers the rest of the ways a byte can mean something to a reader rather than
+# say something — ESC opens a terminal control sequence, NUL and the other C0
+# codes truncate or corrupt log lines, and non-ASCII brings homoglyphs and bidi
+# overrides, which is the same family of trick `unicode_sanitize` strips from
+# report text one layer down. A length cap keeps a single id from swamping the
+# line, and non-empty makes `INFRA  <reason>` — an id-shaped hole — impossible.
+#
+# 64 characters is set from the corpus that exists (the longest seed id,
+# `fp_agent_tooling_prose.md`, is 25) with room for a descriptive name; it is a
+# limit on a NAME, not a tuned constant. Raising it is safe and changes nothing
+# structural.
+_MAX_CASE_ID_LEN = 64
+_PRINTABLE_ASCII = frozenset(chr(c) for c in range(0x20, 0x7F))
+
+
+def _validate_case_id(case_id: object) -> str:
+    """Return `case_id` if it is a legal id, else raise `ValueError`.
+
+    The message NEVER echoes the offending id. Whatever made it illegal — an
+    escape sequence, a newline, a NUL — would do exactly the same thing to
+    this message, which travels to the operator's terminal through
+    `parser.error`. So the rule is stated and the value is not, except for its
+    length, which is a bounded integer.
+    """
+    if not isinstance(case_id, str):
+        raise ValueError(f"case id must be a string, got {type(case_id).__name__}")
+    if not case_id.strip():
+        raise ValueError("case id must not be empty or blank")
+    if len(case_id) > _MAX_CASE_ID_LEN:
+        raise ValueError(
+            f"case id must be at most {_MAX_CASE_ID_LEN} characters, "
+            f"got {len(case_id)}"
+        )
+    if not set(case_id) <= _PRINTABLE_ASCII:
+        raise ValueError(
+            "case id must be a single line of printable ASCII "
+            "(no newlines, control characters or non-ASCII)"
+        )
+    return case_id
+
+
 @dataclass
 class EvalCase:
     id: str
@@ -140,6 +202,12 @@ class EvalCase:
     expected: str  # "block" or "pass"
 
     def __post_init__(self) -> None:
+        # Validated HERE rather than in each loader, so no `EvalCase` can exist
+        # with an id that would misbehave on the INFRA line — `load_jsonl`,
+        # `load_corpus_dir` and a direct construction in a test all get the
+        # same rule from one place. `_main` renders the ValueError as a usage
+        # error (exit 2), so a bad corpus never starts a run.
+        _validate_case_id(self.id)
         if self.expected not in _VALID:
             raise ValueError(
                 f"case {self.id!r}: expected must be one of {sorted(_VALID)}, "
@@ -453,6 +521,12 @@ def load_jsonl(path: str | Path) -> list[EvalCase]:
                 raise ValueError(
                     f"{path}:{lineno}: missing required field {exc}"
                 ) from exc
+            except ValueError as exc:
+                # `EvalCase.__post_init__` rejects an illegal id or label. It
+                # cannot know which line it came from, and the line number is
+                # the whole of what an operator needs to fix it — the id
+                # itself is deliberately not echoed (see `_validate_case_id`).
+                raise ValueError(f"{path}:{lineno}: {exc}") from exc
     return cases
 
 

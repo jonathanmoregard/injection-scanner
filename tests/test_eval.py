@@ -10,6 +10,7 @@ signal the gap has closed, and they should be tightened at that point.
 """
 from __future__ import annotations
 
+import json
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -690,3 +691,71 @@ def test_a_valid_run_still_exits_zero(monkeypatch, tmp_path: Path) -> None:
     assert _main([str(corpus)]) == 0
     _reason_scan(monkeypatch, {"a": ["pass"]})
     assert _main([str(corpus), "--confirm-disagreements", "0"]) == 0
+
+
+# ---------------------------------------------------------------------------
+# The case id is OPERATOR text, and the INFRA line is parsed downstream.
+#
+# `EvalInfraError`'s docstring claimed both its fields were
+# scanner-synthesized closed vocabulary. `reason` is; `case_id` is not — it
+# comes off the corpus row verbatim. `_main` prints `INFRA <case_id> <reason>`
+# to stderr, which is what a CI log and research-agent's diagnosis read, so an
+# id carrying a newline forges a second INFRA line (any reason it likes), and
+# one carrying an ESC byte writes terminal control sequences into the log.
+#
+# The corpus is operator-authored, so this is a usage error rather than an
+# attack — but the id crosses a boundary where a closed vocabulary is the
+# rule, so it is validated at LOAD time and a bad one never reaches a run.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "case_id",
+    [
+        pytest.param("a\nINFRA forged lakera_unavailable:no-key", id="newline"),
+        pytest.param("a\rb", id="carriage-return"),
+        pytest.param("a\x1b[31mb", id="escape-byte"),
+        pytest.param("a\x00b", id="nul"),
+        pytest.param("", id="empty"),
+        pytest.param("   ", id="blank"),
+        pytest.param("a" * 65, id="too-long"),
+        pytest.param("café", id="non-ascii"),
+    ],
+)
+def test_an_unprintable_case_id_is_refused_at_load(
+    monkeypatch, tmp_path: Path, capsys, case_id: str
+) -> None:
+    corpus = tmp_path / "c.jsonl"
+    corpus.write_text(
+        json.dumps({"id": case_id, "text": "a", "expected": "pass"}) + "\n",
+        encoding="utf-8",
+    )
+    err = _usage_error(monkeypatch, [str(corpus)], capsys)
+    assert "corpus" in err
+    # The offending id is NOT echoed back: whatever made it unprintable would
+    # do the same to this message.
+    assert "\x1b" not in err and "\x00" not in err
+
+
+@pytest.mark.parametrize("case_id", ["a", "fp_research_prose.md", "a" * 64])
+def test_an_ordinary_case_id_still_loads(tmp_path: Path, case_id: str) -> None:
+    corpus = tmp_path / "c.jsonl"
+    corpus.write_text(
+        json.dumps({"id": case_id, "text": "a", "expected": "pass"}) + "\n",
+        encoding="utf-8",
+    )
+    assert [c.id for c in load_jsonl(corpus)] == [case_id]
+
+
+def test_the_infra_line_for_a_valid_id_is_unchanged(
+    monkeypatch, tmp_path: Path, capsys
+) -> None:
+    """The control for the whole section: validation changes nothing about
+    what a legitimate outage reports."""
+    corpus = tmp_path / "c.jsonl"
+    corpus.write_text(
+        '{"id": "a", "text": "a", "expected": "pass"}\n', encoding="utf-8"
+    )
+    _reason_scan(monkeypatch, {"a": ["lakera_unavailable:throttled"]})
+    assert _main([str(corpus)]) == 3
+    assert capsys.readouterr().err.strip() == "INFRA a lakera_unavailable:throttled"
