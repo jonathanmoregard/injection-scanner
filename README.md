@@ -72,7 +72,7 @@ Ownership of that directory is verified before every use. A symlink, or a direct
 
 `run_smoke()` has two phases: deterministic canaries that touch no network, and one live probe that calls Lakera and the honeypot providers. Measured 2026-09-06, research-agent boot smokes alone ran **~632 per day** — one per server spawn, plus one per degraded recheck — about 19,000 a month against a 10,000-a-month quota, before a single report is scanned. Spawn frequency, not scan volume, is what exhausts the account, and one Claude Code session restore spawns six panes at once. The limiter bounds the RATE; only this reduces the DEMAND.
 
-So a passing probe is recorded in `smoke-liveness.json` and trusted fleet-wide for `INJECTION_SCANNER_SMOKE_LIVENESS_TTL_S` seconds. A six-pane session restore then costs one Lakera call instead of six, and so does a six-pane recovery after an outage, since degraded rechecks call `run_smoke()` too.
+So a passing probe is recorded in `smoke-liveness.json` and trusted fleet-wide for `INJECTION_SCANNER_SMOKE_LIVENESS_TTL_S` seconds: the second and every later spawn inside the TTL costs zero vendor calls. There is deliberately no single-flight, so panes that boot simultaneously — before the first probe has finished and recorded — all miss and all probe, a burst the limiter is there to bound. Recovery after an outage works the same way: degraded rechecks call `run_smoke()` too, so once one pane's recheck passes and records, every other pane's next recheck is served from the cache.
 
 It is a cache in front of a probe, not a gate:
 
@@ -110,7 +110,7 @@ The live pipeline lives in `.github/workflows/live-eval.yml` and runs **nightly 
 gh workflow run live-eval.yml --ref <branch>
 ```
 
-That dispatch is deliberately a human gesture, like the merge click. What moved off the gate is the sampled-model *benchmark* — recall and FP rate over the labelled corpus — which was never deterministic; **production's own boot smoke, which runs on every research-agent spawn and is agent-readable, remains the real-time canary for vendor drift**, and that is where such drift actually bites.
+That dispatch is deliberately a human gesture, like the merge click. What moved off the gate is the sampled-model *benchmark* — recall and FP rate over the labelled corpus — which was never deterministic; **production's boot smoke — a live vendor probe at most once per liveness TTL, plus every real report scan — remains the day-to-day canary for vendor drift, and CI's nightly is the benchmark**. Both are agent-readable, and production is where such drift actually bites.
 
 The relations inside `live-eval.yml` are asserted by `tests/test_ci_relations.py`, so a later edit cannot quietly undo them:
 

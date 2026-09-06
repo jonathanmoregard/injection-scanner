@@ -7,10 +7,11 @@ name: live-eval
 # correctness the offline SDK-over-stub-transport tests do not already buy.
 #
 # What this workflow IS: a benchmark (recall / FP over the labelled corpus,
-# which was never deterministic) plus a vendor canary. Nightly is often
-# enough for both, because production's own boot smoke — every research-agent
-# spawn, agent-readable since 2026-09-05 — is the real-time canary for vendor
-# drift, which is where such drift actually bites.
+# which was never deterministic) plus a vendor canary. Nightly is often enough
+# for both, because production's boot smoke — a live vendor probe at most once
+# per liveness TTL (smoke.py, 3600 s by default), plus every real report scan —
+# is the day-to-day canary for vendor drift, agent-readable since 2026-09-05,
+# and production is where such drift actually bites.
 on:
   schedule:
     # Once nightly, off the hour: GitHub's scheduler queues heavily at :00.
