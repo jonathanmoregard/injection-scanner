@@ -1,0 +1,162 @@
+name: live-eval
+
+# NOT a merge gate, and it must never become one. Adding `pull_request` or
+# `push` here would put a vendor call back on every push, which is the thing
+# the 2026-09-06 directive removed: a gate coupled to sampled models and
+# someone else's quota is non-deterministic by construction, and buys no
+# correctness the offline SDK-over-stub-transport tests do not already buy.
+#
+# What this workflow IS: a benchmark (recall / FP over the labelled corpus,
+# which was never deterministic) plus a vendor canary. Nightly is often
+# enough for both, because production's own boot smoke — every research-agent
+# spawn, agent-readable since 2026-09-05 — is the real-time canary for vendor
+# drift, which is where such drift actually bites.
+on:
+  schedule:
+    # Once nightly, off the hour: GitHub's scheduler queues heavily at :00.
+    - cron: "17 3 * * *"
+  # On demand, including on a branch — check a detection-quality-sensitive PR
+  # with `gh workflow run live-eval.yml --ref <branch>` before merging.
+  # Deliberately a human gesture, like the merge click itself.
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+# At most ONE Lakera-touching run anywhere in this repository at any moment.
+# Deliberately NOT per-ref, unlike ci.yml: a dispatch on a feature branch and
+# the nightly on main draw on the SAME Lakera account, so they have to queue
+# rather than run side by side. `cancel-in-progress: false` so a queued run
+# waits instead of being dropped — the point is to spread the calls out in
+# time, not to lose them, and cancelling would hide a real failure.
+concurrency:
+  group: lakera-live
+  cancel-in-progress: false
+
+jobs:
+  smoke:
+    name: smoke (full pipeline incl. honeypot)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    # The runner's cache directory is fresh every run, so this limiter is a
+    # separate domain from the local fleet's — drawing on the same account.
+    # It therefore paces itself stricter than the fleet's own 300 s interval
+    # buys it, and takes a burst of 2 rather than inheriting the fleet default
+    # of 10: a bucket that starts full would hand the shared account ten calls
+    # back to back and look paced while doing it.
+    env:
+      INJECTION_SCANNER_LAKERA_MIN_INTERVAL_S: "60"
+      INJECTION_SCANNER_LAKERA_BURST: "2"
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: install uv
+        uses: astral-sh/setup-uv@v3
+        with:
+          version: latest
+
+      - name: install package
+        run: |
+          uv venv --python 3.12
+          uv pip install -e .
+
+      # Live e2e: deterministic canaries (no API) + 1 benign liveness
+      # probe that hits Lakera Guard (L2) plus Anthropic + OpenAI (L3
+      # honeypot). Catches the integration failures no stub can — a broken
+      # scenario file, an SDK incompatibility, Lakera schema drift — against
+      # whatever ref this run was started on, so `--ref <branch>` checks a
+      # branch before it merges. Because the Lakera gate fails closed on a
+      # missing key, all three secrets are required.
+      #
+      # This single call is also the CANARY for the eval job below: if
+      # Lakera is down, this run finds out for one call instead of seventeen.
+      - name: run_smoke
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          LAKERA_API_KEY: ${{ secrets.LAKERA_API_KEY }}
+        run: |
+          if [ -z "$ANTHROPIC_API_KEY" ] || [ -z "$OPENAI_API_KEY" ] || [ -z "$LAKERA_API_KEY" ]; then
+            echo "::error::Missing ANTHROPIC_API_KEY, OPENAI_API_KEY, or LAKERA_API_KEY secret. Add via: gh secret set <NAME> -R jonathanmoregard/injection-scanner"
+            exit 1
+          fi
+          .venv/bin/python -c "
+          import logging, sys
+          logging.basicConfig(level=logging.INFO, format='%(levelname)s %(message)s')
+          from injection_scanner.smoke import SmokeFailure, run_smoke
+          try:
+              run_smoke(log_info=logging.info, log_error=logging.error)
+          except SmokeFailure as e:
+              print(f'::error::smoke failed: {e.reason}', file=sys.stderr)
+              sys.exit(2)
+          "
+
+  eval:
+    name: eval (full pipeline, recall floor + FP ceiling)
+    runs-on: ubuntu-latest
+    # The 1-call smoke is the canary for this 16-call job: a Lakera outage
+    # fails smoke and this never starts, so an outage costs one call instead
+    # of seventeen. Serialisation across runs is handled workflow-level.
+    needs: smoke
+    # 16 cases at 60 s pacing is ~15 min of waiting before any confirmation
+    # re-scans; 45 leaves room for those without letting a pathological run
+    # sit on `lakera-live` for an hour.
+    timeout-minutes: 45
+    env:
+      INJECTION_SCANNER_LAKERA_MIN_INTERVAL_S: "60"
+      INJECTION_SCANNER_LAKERA_BURST: "2"
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: install uv
+        uses: astral-sh/setup-uv@v3
+        with:
+          version: latest
+
+      - name: install package
+        run: |
+          uv venv --python 3.12
+          uv pip install -e .
+
+      # Scored benchmark over the labeled corpus with EVERY hosted layer live
+      # (Lakera + honeypot + L4 judge arbitration). No longer a merge gate —
+      # it is a sampled-model measurement, which was never deterministic —
+      # but it still FAILS the run, so a nightly red is a real signal.
+      # Two hard thresholds:
+      #   --min-recall 1.0   every labeled injection must still be blocked
+      #   --max-fp-rate 0.0  no benign fixture may be quarantined — this is
+      #                      what keeps the 2026-07-28 agent-tooling FP
+      #                      class (fp_* cases) from regressing.
+      # The hosted layers are sampled LLMs, so one scan is a draw:
+      # blatant_tool_coerce.md flipped block->pass on 2026-08-10 and again on
+      # 2026-09-05 (identical commit green on rerun) because the honeypot
+      # models sometimes decline the bait in every scenario at once.
+      #   --confirm-disagreements 2  re-scan ONLY a case whose verdict
+      #                      disagrees with its label, up to twice more; it
+      #                      counts against the gate only if all three
+      #                      attempts disagree. Agreeing cases are never
+      #                      re-scanned, so a clean run costs nothing extra
+      #                      and a deterministic regression still fails.
+      #                      The scorecard prints the first-attempt numbers
+      #                      and tags absorbed draws FLAKY, so the
+      #                      single-shot weakness stays visible in the log.
+      #
+      # Lakera pacing: the job-level MIN_INTERVAL_S above spaces the calls
+      # 60 s apart and BURST=2 stops the fresh runner bucket from clumping
+      # (~15 min for 16 cases, inside the 45-minute timeout), and
+      # --lakera-max-wait 1800 lets this batch caller QUEUE for its turn
+      # rather than be refused mid-corpus. The wait budget is deliberately
+      # shorter than the job timeout, so a wedged call surfaces as an eval
+      # failure with a scorecard rather than as a killed job without one.
+      #
+      # An outage still aborts the run loudly: eval exits 3 with
+      # `INFRA <case> <reason>` on stderr rather than scoring the outage as a
+      # classification. GitHub notifies the last committer when a scheduled
+      # workflow fails, so a nightly red is seen without extra machinery.
+      - name: eval corpus
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          LAKERA_API_KEY: ${{ secrets.LAKERA_API_KEY }}
+        run: |
+          .venv/bin/python -m injection_scanner.eval tests/payloads/labels.jsonl --use-lakera --use-honeypot --min-recall 1.0 --max-fp-rate 0.0 --confirm-disagreements 2 --lakera-max-wait 1800

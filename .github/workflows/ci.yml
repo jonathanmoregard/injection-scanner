@@ -9,6 +9,17 @@ on:
 permissions:
   contents: read
 
+# Superseded PR pushes are cancelled; pushes to main queue behind each other.
+#
+# Nothing here calls a vendor any more, so this is now about runner minutes
+# rather than about someone else's quota: a PR that gets three pushes in a
+# minute should run its suite once, not three times. A main push is never
+# cancelled, because nothing that reached the default branch may go
+# unverified.
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 jobs:
   test:
     name: pytest (python ${{ matrix.python }})
@@ -34,102 +45,14 @@ jobs:
       # is key-free (measured 2026-09-05: 436 passed with ANTHROPIC_API_KEY,
       # OPENAI_API_KEY and LAKERA_API_KEY all unset), so it runs in full here.
       # It used to run an explicit four-file list, which left test_judge.py
-      # out — so the anthropic-SDK signature break only surfaced in the
-      # live-key `eval` job. test_payload.py is a CLI tool with no test_
+      # out — so the anthropic-SDK signature break only surfaced once a
+      # live-key job hit it. test_judge.py drives the real SDK over a stub
+      # transport, which is what makes THIS job sufficient as the merge gate
+      # for that class of break. test_payload.py is a CLI tool with no test_
       # functions; pytest collects nothing from it.
+      #
+      # This job is the whole gate. The live smoke and corpus eval moved to
+      # .github/workflows/live-eval.yml (nightly + workflow_dispatch) on
+      # 2026-09-06: "ci tests should not call external services in general".
       - name: pytest
         run: .venv/bin/python -m pytest tests/ -v
-
-  smoke:
-    name: smoke (full pipeline incl. honeypot)
-    runs-on: ubuntu-latest
-    needs: test
-    # Skip on forks — secrets aren't available there, and we don't want
-    # CI to fail for outside contributors. Maintainers re-run via PR
-    # from a branch in this repo.
-    if: github.event.pull_request.head.repo.full_name == github.repository || github.event_name == 'push'
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: install uv
-        uses: astral-sh/setup-uv@v3
-        with:
-          version: latest
-
-      - name: install package
-        run: |
-          uv venv --python 3.12
-          uv pip install -e .
-
-      # Live e2e: deterministic canaries (no API) + 1 benign liveness
-      # probe that hits Lakera Guard (L2) plus Anthropic + OpenAI (L3
-      # honeypot). Runs against the SHA being merged so a PR that breaks
-      # L2/L3 integration (broken scenario file, SDK incompat, Lakera
-      # schema drift, etc.) cannot reach main. Because the Lakera gate
-      # fails closed on a missing key, LAKERA_API_KEY is now required.
-      - name: run_smoke
-        env:
-          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
-          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
-          LAKERA_API_KEY: ${{ secrets.LAKERA_API_KEY }}
-        run: |
-          if [ -z "$ANTHROPIC_API_KEY" ] || [ -z "$OPENAI_API_KEY" ] || [ -z "$LAKERA_API_KEY" ]; then
-            echo "::error::Missing ANTHROPIC_API_KEY, OPENAI_API_KEY, or LAKERA_API_KEY secret. Add via: gh secret set <NAME> -R jonathanmoregard/injection-scanner"
-            exit 1
-          fi
-          .venv/bin/python -c "
-          import logging, sys
-          logging.basicConfig(level=logging.INFO, format='%(levelname)s %(message)s')
-          from injection_scanner.smoke import SmokeFailure, run_smoke
-          try:
-              run_smoke(log_info=logging.info, log_error=logging.error)
-          except SmokeFailure as e:
-              print(f'::error::smoke failed: {e.reason}', file=sys.stderr)
-              sys.exit(2)
-          "
-
-  eval:
-    name: eval (full pipeline, recall floor + FP ceiling)
-    runs-on: ubuntu-latest
-    needs: test
-    # Same fork guard as smoke: secrets aren't available on fork PRs.
-    if: github.event.pull_request.head.repo.full_name == github.repository || github.event_name == 'push'
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: install uv
-        uses: astral-sh/setup-uv@v3
-        with:
-          version: latest
-
-      - name: install package
-        run: |
-          uv venv --python 3.12
-          uv pip install -e .
-
-      # Scored gate over the labeled corpus with EVERY hosted layer live
-      # (Lakera + honeypot + L4 judge arbitration). Two hard thresholds:
-      #   --min-recall 1.0   every labeled injection must still be blocked
-      #   --max-fp-rate 0.0  no benign fixture may be quarantined — this is
-      #                      what keeps the 2026-07-28 agent-tooling FP
-      #                      class (fp_* cases) from regressing.
-      # The hosted layers are sampled LLMs, so one scan is a draw:
-      # blatant_tool_coerce.md flipped block->pass on 2026-08-10 and again on
-      # 2026-09-05 (identical commit green on rerun) because the honeypot
-      # models sometimes decline the bait in every scenario at once.
-      #   --confirm-disagreements 2  re-scan ONLY a case whose verdict
-      #                      disagrees with its label, up to twice more; it
-      #                      counts against the gate only if all three
-      #                      attempts disagree. Agreeing cases are never
-      #                      re-scanned, so a clean run costs nothing extra
-      #                      and a deterministic regression still fails.
-      #                      The scorecard prints the first-attempt numbers
-      #                      and tags absorbed draws FLAKY, so the
-      #                      single-shot weakness stays visible in the log.
-      - name: eval corpus
-        env:
-          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
-          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
-          LAKERA_API_KEY: ${{ secrets.LAKERA_API_KEY }}
-        run: |
-          .venv/bin/python -m injection_scanner.eval tests/payloads/labels.jsonl --use-lakera --use-honeypot --min-recall 1.0 --max-fp-rate 0.0 --confirm-disagreements 2
