@@ -397,7 +397,7 @@ def test_a_decode_crash_fails_closed_and_does_not_escape(monkeypatch):
     )
     v = intercept.scan_text("clean text", use_honeypot=False, use_lakera=False)
     assert v.ok is False
-    assert v.reason == "decode_unavailable:RuntimeError"
+    assert v.reason == "decode_unavailable:unhandled:RuntimeError"
     assert v.layers["decode"] == "unhandled:RuntimeError"
 
 
@@ -415,7 +415,7 @@ def test_a_crash_scanning_a_decoded_blob_also_fails_closed(monkeypatch):
         f"report body\n\n{blob}\n", use_honeypot=False, use_lakera=False
     )
     assert v.ok is False
-    assert v.reason == "decode_unavailable:ValueError"
+    assert v.reason == "decode_unavailable:unhandled:ValueError"
 
 
 def test_the_decode_outage_reason_carries_no_exception_text(monkeypatch):

@@ -299,6 +299,14 @@ def scan_text(
     # classify this as the outage it is with no new vocabulary crossing the
     # boundary.
     #
+    # `<layer>_unavailable:unhandled:<ExcType>` is the exact shape all four
+    # sibling blanket-excepts use (unicode_sanitize, secret_shapes, honeypot,
+    # judge). The `unhandled:` segment is what distinguishes an outage a layer
+    # DIAGNOSED — `lakera_unavailable:HTTPError:429`, which `lakera.check`
+    # builds deliberately — from one it merely fell over on, and this is the
+    # latter. Spelled identically to its siblings so the five read as one
+    # vocabulary rather than four plus an exception.
+    #
     # The guard covers the decode WORK and nothing else: `layers` and the
     # detection return are built after it, so a rejecting Verdict can never be
     # swallowed by the except that exists to reject.
@@ -315,7 +323,7 @@ def scan_text(
         layers["decode"] = f"unhandled:{type(e).__name__}"
         return Verdict(
             ok=False,
-            reason=f"decode_unavailable:{type(e).__name__}",
+            reason=f"decode_unavailable:unhandled:{type(e).__name__}",
             layers=layers,
             sanitize_stats=asdict(san),
             sanitized_text=san.text,
