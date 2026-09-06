@@ -53,8 +53,8 @@ Goals:
 
 Non-goals (deliberately out of scope):
 
-- A shared smoke-verdict cache or singleflight across panes (option B). Revisit only if the 00:12
-  measurement shows boot bursts still matter with the limiter in place.
+- Singleflight / a shared verdict cache for per-report scans (the larger half of option B). The
+  boot-smoke liveness cache (§3.8) is the one piece of B the 2026-09-06 measurement made necessary.
 - Changing the Lakera plan, or a dedicated CI key/project to split budgets. Operator decision after
   the measurement; the design works either way.
 - `selfupdate.py` (inert, fate decided separately).
@@ -187,22 +187,32 @@ Read by `CrossProcessLimiter.from_env()` with tolerant parsing (malformed → de
 
 | environment variable | default | clamp | meaning |
 |---|---|---|---|
-| `INJECTION_SCANNER_LAKERA_MIN_INTERVAL_S` | `15` | `[0, 3600]` | sustained fleet-wide interval; `0` disables the bucket (breaker still applies) |
-| `INJECTION_SCANNER_LAKERA_BURST` | `2` | `[1, 1000]` | bucket capacity |
-| `INJECTION_SCANNER_LAKERA_BACKOFF_BASE_S` | `30` | `[0, 3600]` | breaker delay after the first 429 without `Retry-After` |
-| `INJECTION_SCANNER_LAKERA_BACKOFF_MAX_S` | `600` | `[0, 86400]` | cap on every breaker delay, `Retry-After` included |
+| `INJECTION_SCANNER_LAKERA_MIN_INTERVAL_S` | `300` | `[0, 3600]` | sustained fleet-wide interval; `0` disables the bucket (breaker still applies) |
+| `INJECTION_SCANNER_LAKERA_BURST` | `10` | `[1, 1000]` | bucket capacity |
+| `INJECTION_SCANNER_LAKERA_BACKOFF_BASE_S` | `300` | `[0, 3600]` | breaker delay after the first 429 without `Retry-After` |
+| `INJECTION_SCANNER_LAKERA_BACKOFF_MAX_S` | `3600` | `[0, 86400]` | cap on every breaker delay, `Retry-After` included |
 | `INJECTION_SCANNER_LAKERA_LOCK_WAIT_S` | `2` | `[0, 60]` | bounded flock wait before `ERROR` |
 | `INJECTION_SCANNER_LAKERA_MAX_WAIT_S` | `0` | `[0, 86400]` | default `max_wait_s` for `check()` when the caller passes none |
+| `INJECTION_SCANNER_SMOKE_LIVENESS_TTL_S` | `3600` | `[0, 86400]` | how long one passing liveness probe is trusted fleet-wide (§3.8); `0` disables the cache |
 | `INJECTION_SCANNER_CACHE_DIR` | `~/.cache/injection-scanner` | — | state directory (same dir `selfupdate.py` already uses) |
+
+Defaults revised 2026-09-06 from measurement (details in
+`~/.local/state/claude-tasks/research-agent/findings-lakera-limits.md`): Lakera publishes exactly one
+limit — the Community plan's 10,000 requests per month, i.e. 13.9 per hour, one every 4.3 minutes —
+and that equals the throttled trickle measured on 2026-09-05 ("one success per 4–5 minutes fleet-wide
+regardless of attempt count"). Overnight, 25 calls in 30 minutes were accepted before ~40 minutes of
+429s, so Lakera's own bucket is roughly 25–50 deep with a slow refill. The defaults sit under that:
+12 per hour sustained, a burst of 10 so a multi-pane session restore passes, and a breaker that waits
+minutes rather than seconds because recovery was observed to take tens of minutes. The plan tier is
+visible only on the Lakera dashboard; on a paid tier every knob loosens via env, the algorithm does
+not change.
 
 There is no feature flag. "Off" is `MIN_INTERVAL_S=0` (bucket always full) plus `BACKOFF_MAX_S=0`
 (breaker delay clamps to zero); nobody should want that in production, and a switch that ships
 defaulted-off is the failure mode the `avoiding-unrequested-feature-flags` rule exists to prevent.
 
-The defaults encode today's best guess: the healthy pre-onset fleet averaged ~0.6 calls/min with
-zero failures, and the interval keeps the worst case (fleet + CI) at ~6 calls/min. They are
-PROVISIONAL and are retuned from the 2026-09-06 00:12 measurement of Lakera's actual limits — by
-changing env values, or these defaults in a follow-up commit, never by editing the algorithm.
+The defaults remain inputs: when the dashboard shows the real tier, or Lakera support states a QPS
+ceiling, they change by env or by a one-line commit — never by editing the algorithm.
 
 ### 3.3 `lakera.py` integration
 
@@ -285,14 +295,16 @@ jobs:
   smoke:
     timeout-minutes: 10
     env:
-      INJECTION_SCANNER_LAKERA_MIN_INTERVAL_S: "30"   # CI paces itself stricter than the fleet
+      INJECTION_SCANNER_LAKERA_MIN_INTERVAL_S: "60"   # runner's own bucket: 17 calls over ~17 min
+      INJECTION_SCANNER_LAKERA_BURST: "2"             # never a burst from CI, whatever the default
     ...                                             # the former ci.yml smoke job, keys via secrets
   eval:
     needs: smoke                    # the 1-call smoke is the canary for the 16-call eval
-    timeout-minutes: 30
+    timeout-minutes: 45
     env:
-      INJECTION_SCANNER_LAKERA_MIN_INTERVAL_S: "30"
-    ...                                             # the former eval job, plus --lakera-max-wait 900
+      INJECTION_SCANNER_LAKERA_MIN_INTERVAL_S: "60"
+      INJECTION_SCANNER_LAKERA_BURST: "2"
+    ...                                             # the former eval job, plus --lakera-max-wait 1800
 ```
 
 Relations this encodes: PR CI touches no vendor, needs no secret, and cannot go red because a
@@ -313,8 +325,51 @@ the sampled-model *benchmark* (recall / FP over the labelled corpus), which was 
 
 ### 3.7 README
 
-A "Lakera rate limiting" section: the env table from §3.2, the two new reasons, the CI relations
-paragraph, and the note that defaults are provisional pending the 2026-09-06 measurement.
+A "Lakera rate limiting" section: the env table from §3.2, the two new reasons, the liveness cache
+(§3.8), the CI relations paragraph, and the measurement the defaults rest on (10k/month Community
+quota ≈ one call per 4.3 min; loosen via env on a paid tier).
+
+### 3.8 Boot-smoke liveness cache — one probe per fleet, not one per spawn
+
+Measured 2026-09-06: research-agent boot smokes alone ran ~632 per day (one per server spawn, plus
+one per degraded recheck) ≈ 19k per month — about twice the entire Community quota before a single
+report is scanned. Spawn frequency, not scan volume, is what exhausts the account. This is the case
+the spec deferred as "option B, only if measurement shows boot bursts still matter"; measurement
+says they are the dominant cost, so the smallest form of B ships in this PR.
+
+`smoke.run_smoke` Phase 2 (the single live probe that touches Lakera and the honeypot providers)
+consults `<INJECTION_SCANNER_CACHE_DIR>/smoke-liveness.json`, read and written under the same
+flock discipline as the limiter:
+
+- If the file holds `{"schema": 1, "ok": true, "at": <epoch>}` and
+  `now - at <= INJECTION_SCANNER_SMOKE_LIVENESS_TTL_S`, Phase 2 is skipped. `run_smoke` logs
+  `liveness probe: cached pass, <age>s old` via `log_info` and returns success. Phase 1 (the
+  deterministic canaries, no network) always runs — it checks this process's own code, not the
+  fleet's vendors.
+- Otherwise the probe runs exactly as today. A PASS writes the file (tmp + `os.replace`). A FAILURE
+  writes nothing, raises `SmokeFailure` as today, and leaves any older entry as it was (it is already
+  older than the TTL, or the probe would not have run).
+- The probe's own Lakera call still goes through the limiter (§3.3), so a burst of cache misses is
+  still bounded.
+- A missing, corrupt, foreign-schema, or unreadable file is a cache miss; an unwritable directory
+  means the pass is simply not recorded. This is a cache in front of a probe, not a gate: the gate
+  semantics of the probe itself are unchanged, so cache failure degrades to today's behaviour, not to
+  fail-open. A TTL of `0` disables it.
+- The file carries a boolean and a timestamp — no reason string, no report bytes — so Invariant 4
+  holds trivially.
+- research-agent's degraded rechecks call `run_smoke` too, so once one pane's recheck passes, every
+  other pane's next recheck passes from the cache: recovery of a six-pane fleet costs one Lakera
+  call instead of six.
+
+What a stale cached pass can hide: an outage that began within the last hour. Then the server starts
+"healthy" and the first real scan fails closed with the agent-readable infra reason — fail-closed and
+visibility are both preserved; only the moment of discovery moves from spawn to first use.
+
+Tests (`tests/test_smoke_liveness.py`, key-free): with `_scan_via_path` stubbed and a clock injected
+through `run_smoke(..., clock=...)` — fresh cache → probe runs once and the file is written; a second
+`run_smoke` within the TTL → probe not called, `log_info` carries the "cached pass" line; TTL expired
+→ probe runs; a failing probe writes nothing and raises; `TTL=0` → probe every time; corrupt file →
+probe runs and the file is rewritten on pass; Phase 1 canaries run on every call regardless.
 
 ## 4. Failure semantics
 
@@ -385,10 +440,12 @@ Verifier: `uv run --extra test pytest -q tests/` in the worktree, plus `python -
 
 1. This PR (injection-scanner, branch `feat/lakera-debounce`).
 2. After merge: research-agent PR bumping `uv.lock` to the new scanner SHA (the only way a scanner
-   change reaches production, see the inert-updater finding), and adding `throttled` /
-   `limiter_error` to `_InfraCondition`.
-3. After the 2026-09-06 00:12 measurement: retune the defaults in §3.2 (env or one-line PR) and, if
-   boot bursts still register, reopen option B.
+   change reaches production, see the inert-updater finding), adding `throttled` / `limiter_error`
+   to `_InfraCondition`, and passing a wait budget on the per-report scan path
+   (`scan(path, lakera_max_wait_s=…)`, e.g. 300 s) so a report queues behind the fleet's budget
+   instead of being quarantined; boot smokes and rechecks keep wait 0 (their wall-clock bound is
+   120 s).
+3. When the Lakera dashboard shows the plan tier: confirm or loosen the §3.2 defaults via env.
 
 ## 7. Decisions taken by discernment (and why)
 
@@ -407,5 +464,10 @@ Verifier: `uv run --extra test pytest -q tests/` in the worktree, plus `python -
   the offline SDK-over-stub-transport tests do not already buy. The live pipeline is a benchmark
   plus a vendor canary: nightly + on-demand, serialised, paced — and production's boot smoke stays
   the real-time canary.
-- **No verdict cache for CI.** Caching security verdicts to save calls is a second system with its
-  own staleness and poisoning questions; out of scope.
+- **No verdict cache for CI or for report scans.** Caching security verdicts to save calls is a
+  second system with its own staleness and poisoning questions; out of scope.
+- **A liveness cache for the boot probe, though (§3.8).** It caches a boolean about the vendors, not
+  a verdict about content; measurement showed spawn-driven probes alone exceed the quota; and its
+  failure mode is "probe as before", never fail-open.
+- **Defaults follow the one published number.** 10k/month is the only limit Lakera documents and it
+  matches the measured trickle; guessing higher would rediscover the 429s in production.
