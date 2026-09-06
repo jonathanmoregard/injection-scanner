@@ -11,7 +11,10 @@ from __future__ import annotations
 
 import io
 import json
+import threading
 from http.client import HTTPMessage
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from types import SimpleNamespace
 from urllib.error import HTTPError, URLError
 
 import pytest
@@ -929,3 +932,122 @@ def test_a_malformed_timeout_degrades_to_the_default(monkeypatch):
     _with_key(monkeypatch)
     monkeypatch.setenv("INJECTION_SCANNER_LAKERA_TIMEOUT", "abc")
     assert _captured_timeout(monkeypatch) == lakera.DEFAULT_TIMEOUT_S
+
+
+# ---------- (i) a 3xx is an outage, never a second request ------------------
+#
+# `_post` went out through `urllib.request.urlopen`, i.e. the DEFAULT opener,
+# which follows 3xx. urllib strips only the `Content-*` headers when it builds
+# the follow-up request, so `Authorization: Bearer <the shared Lakera key>` is
+# re-sent — to whatever host the `Location` names, cross-origin included. A
+# redirecting endpoint (a captive portal, a hijacked DNS answer, a vendor URL
+# that moved) therefore hands the fleet's key to a third party silently, and
+# the scan still returns a normal verdict so nothing ever says so.
+#
+# These two run against a real loopback HTTP server rather than a monkeypatched
+# `_post`, deliberately: the thing under test IS the opener `_post` uses, and a
+# stub of `_post` would assert nothing about it. The server records every
+# request it receives, so "no second request" is observed rather than inferred.
+
+_KEY_MARKER = "lk-loopback-key-DO-NOT-FORWARD"
+
+# Filled by the fixture below; the handler is a class, so its state is here.
+_PROBE_LOG: list[tuple[str, str, str | None]] = []
+_PROBE_MODE: dict = {}
+
+
+class _LoopbackHandler(BaseHTTPRequestHandler):
+    """Records (method, path, Authorization) for every request, then answers
+    per `_PROBE_MODE`. `/guard` is the endpoint under test; any other path is
+    the redirect target, and a request landing there is the exfiltration."""
+
+    protocol_version = "HTTP/1.0"
+
+    def _record(self) -> None:
+        _PROBE_LOG.append(
+            (self.command, self.path, self.headers.get("Authorization"))
+        )
+
+    def do_GET(self) -> None:  # a followed POST 302 arrives as a GET
+        self._record()
+        self._respond()
+
+    def do_POST(self) -> None:
+        self._record()
+        length = int(self.headers.get("Content-Length") or 0)
+        if length:
+            self.rfile.read(length)
+        self._respond()
+
+    def _respond(self) -> None:
+        target = _PROBE_MODE.get("redirect_to")
+        if target and self.path == "/guard":
+            self.send_response(302)
+            self.send_header("Location", target)
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+            return
+        body = _PROBE_MODE.get("body", b'{"flagged": false, "breakdown": []}')
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def log_message(self, *args) -> None:  # keep the pytest output clean
+        return
+
+
+@pytest.fixture
+def loopback():
+    """A recording HTTP server on 127.0.0.1. Hermetic — no external host."""
+    _PROBE_LOG.clear()
+    _PROBE_MODE.clear()
+    srv = ThreadingHTTPServer(("127.0.0.1", 0), _LoopbackHandler)
+    thread = threading.Thread(target=srv.serve_forever, daemon=True)
+    thread.start()
+    try:
+        yield SimpleNamespace(
+            base=f"http://127.0.0.1:{srv.server_port}",
+            log=_PROBE_LOG,
+            mode=_PROBE_MODE,
+        )
+    finally:
+        srv.shutdown()
+        srv.server_close()
+        thread.join(timeout=5)
+
+
+def _loopback_post(url: str, body: bytes = b"{}", timeout: float = 5.0):
+    return lakera._post(
+        url,
+        body,
+        {
+            "Authorization": f"Bearer {_KEY_MARKER}",
+            "Content-Type": "application/json",
+        },
+        timeout,
+    )
+
+
+def test_a_redirect_is_an_outage_and_never_forwards_the_key(loopback):
+    loopback.mode["redirect_to"] = f"{loopback.base}/elsewhere"
+    with pytest.raises(HTTPError) as excinfo:
+        _loopback_post(f"{loopback.base}/guard")
+    assert excinfo.value.code == 302
+    # The existing fail-closed path renders it like any other HTTP outage.
+    assert lakera._transport_reason(excinfo.value) == "lakera_unavailable:HTTPError:302"
+    # Exactly ONE request, and it went to the configured endpoint. Anything at
+    # `/elsewhere` would mean the key left the account it belongs to.
+    assert [(m, p) for m, p, _ in loopback.log] == [("POST", "/guard")]
+    assert not any(_KEY_MARKER in (auth or "") for _, p, auth in loopback.log if p != "/guard")
+
+
+def test_a_two_hundred_still_parses_through_the_same_opener(loopback):
+    """The control: suppressing redirects must not change the ordinary path."""
+    loopback.mode["body"] = json.dumps({"flagged": False, "breakdown": []}).encode()
+    assert _loopback_post(f"{loopback.base}/guard") == {
+        "flagged": False,
+        "breakdown": [],
+    }
+    assert [(m, p) for m, p, _ in loopback.log] == [("POST", "/guard")]

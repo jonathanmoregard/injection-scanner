@@ -100,6 +100,41 @@ class LakeraResult:
     categories: list[str] = field(default_factory=list)
 
 
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    """A redirect handler that refuses to redirect.
+
+    Returning `None` from `redirect_request` makes `http_error_3xx` fall
+    through the handler chain to `HTTPDefaultErrorHandler`, which raises
+    `HTTPError` carrying the original status — so a 3xx arrives at
+    `_transport_reason` exactly like a 500 does, and no second request is
+    ever issued.
+    """
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
+
+
+# Built once, at import: the default opener FOLLOWS 3xx, and urllib strips only
+# the `Content-*` headers when it builds the follow-up request — so
+# `Authorization: Bearer <the shared Lakera key>` is re-sent to whatever host
+# the `Location` names, cross-origin included. A redirecting endpoint (a
+# captive portal, a hijacked DNS answer, a vendor URL that moved) would
+# therefore hand the fleet's key to a third party, silently, while the scan
+# returned an ordinary verdict.
+#
+# Suppressed rather than validated, because a `Location` check is a race: the
+# host that answers the second request need not be the host that was checked.
+# There is no legitimate redirect on this endpoint, so the whole behaviour goes
+# away and a 3xx becomes what it already is for this caller — an outage. The
+# `Location` value is neither read nor logged.
+#
+# `build_opener` replaces its default `HTTPRedirectHandler` with any SUBCLASS
+# passed in, which is why `_NoRedirect` derives from it rather than standing
+# alone. Everything else (proxy, cookie-less HTTP/HTTPS, the error processor)
+# stays as `urlopen` had it.
+_OPENER = urllib.request.build_opener(_NoRedirect())
+
+
 def _post(url: str, body: bytes, headers: dict, timeout: float) -> dict:
     """Isolated stdlib POST -> parsed JSON dict.
 
@@ -107,9 +142,12 @@ def _post(url: str, body: bytes, headers: dict, timeout: float) -> dict:
     responses (or raise) without any network access. Raises on network /
     HTTP / decode errors; the caller's blanket except turns those into a
     fail-closed reject.
+
+    Goes through `_OPENER`, not `urlopen`: see the comment on it for why a
+    followed redirect is a key-exfiltration bug rather than a convenience.
     """
     req = urllib.request.Request(url, data=body, headers=headers, method="POST")
-    with urllib.request.urlopen(req, timeout=timeout) as resp:
+    with _OPENER.open(req, timeout=timeout) as resp:
         raw = resp.read()
     return json.loads(raw.decode("utf-8"))
 
