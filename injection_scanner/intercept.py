@@ -185,22 +185,39 @@ class Verdict(QuarantineFieldsCoerced):
         return d
 
 
-def scan(path: Path, use_honeypot: bool = True, use_lakera: bool = True) -> Verdict:
+def scan(
+    path: Path,
+    use_honeypot: bool = True,
+    use_lakera: bool = True,
+    lakera_max_wait_s: float | None = None,
+) -> Verdict:
     """Run all layers on the file at `path`. Returns a Verdict.
 
     `use_honeypot` and `use_lakera` default to True and are kept only so
     tests can force them off for unit runs that must not hit an external
     API. In production call paths, callers should NOT pass these — the
     honeypot and the Lakera gate are always on.
+
+    `lakera_max_wait_s` is how long the L2 call may wait for its turn in the
+    fleet-wide Lakera budget. `None` (the default) means "whatever
+    INJECTION_SCANNER_LAKERA_MAX_WAIT_S says", which is 0 — an interactive
+    scan refuses immediately rather than parking a report. Batch callers pass
+    a real budget so they queue instead of failing.
     """
     return scan_text(
         path.read_text(encoding="utf-8", errors="replace"),
         use_honeypot=use_honeypot,
         use_lakera=use_lakera,
+        lakera_max_wait_s=lakera_max_wait_s,
     )
 
 
-def scan_text(raw: str, use_honeypot: bool = True, use_lakera: bool = True) -> Verdict:
+def scan_text(
+    raw: str,
+    use_honeypot: bool = True,
+    use_lakera: bool = True,
+    lakera_max_wait_s: float | None = None,
+) -> Verdict:
     """Run all layers on pre-read `raw` text. Returns a Verdict.
 
     Separate entry point so callers that need symlink/TOCTOU-safe reads can
@@ -212,6 +229,9 @@ def scan_text(raw: str, use_honeypot: bool = True, use_lakera: bool = True) -> V
     Invariant 3: any exception inside a layer must reduce to *reject*, not
     propagate. The exception *type name* lands in the reason — never
     `str(e)`, which can echo input bytes back to the caller.
+
+    `lakera_max_wait_s` is passed straight to `lakera.check`; nothing here
+    interprets it. See `scan` for what it means.
     """
     layers: dict[str, str] = {}
     # Audit-only provider diagnostics from L3; stays empty unless a honeypot
@@ -320,7 +340,7 @@ def scan_text(raw: str, use_honeypot: bool = True, use_lakera: bool = True) -> V
     # measurement runs that must not depend on a live key or hit the network.
     lakera_deferred = False
     if use_lakera:
-        res = lakera.check(san.text)
+        res = lakera.check(san.text, max_wait_s=lakera_max_wait_s)
         layers["lakera"] = res.reason
         if not res.ok:
             if res.reason == "lakera:prompt_attack" and use_honeypot:

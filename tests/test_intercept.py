@@ -207,7 +207,7 @@ def test_orchestrator_strips_but_passes_single_zw():
 
 # ----- L4 arbitration wiring (lakera flag + honeypot clean -> judge) -----
 
-def _flagged(_text):
+def _flagged(_text, **_kw):
     from injection_scanner.lakera import LakeraResult
     return LakeraResult(ok=False, flagged=True, reason="lakera:prompt_attack")
 
@@ -260,7 +260,7 @@ def test_lakera_flag_honeypot_triggered_rejects_without_judge(monkeypatch):
 def test_lakera_outage_hard_rejects_without_judge(monkeypatch):
     from injection_scanner import intercept, judge, lakera
     from injection_scanner.lakera import LakeraResult
-    monkeypatch.setattr(lakera, "check", lambda _t: LakeraResult(
+    monkeypatch.setattr(lakera, "check", lambda _t, **_kw: LakeraResult(
         ok=False, reason="lakera_unavailable:no-key"))
     monkeypatch.setattr(judge, "check", lambda _t: (_ for _ in ()).throw(
         AssertionError("judge must not run on lakera outage")))
@@ -280,7 +280,9 @@ def test_lakera_flag_without_honeypot_hard_rejects(monkeypatch):
 def test_lakera_clean_never_calls_judge(monkeypatch):
     from injection_scanner import intercept, judge, lakera
     from injection_scanner.lakera import LakeraResult
-    monkeypatch.setattr(lakera, "check", lambda _t: LakeraResult(ok=True, reason="pass"))
+    monkeypatch.setattr(
+        lakera, "check", lambda _t, **_kw: LakeraResult(ok=True, reason="pass")
+    )
     monkeypatch.setattr(intercept, "honeypot_check", _hp_clean)
     monkeypatch.setattr(judge, "check", lambda _t: (_ for _ in ()).throw(
         AssertionError("judge must not run when lakera passes")))
@@ -299,3 +301,55 @@ def test_judge_crash_fails_closed(monkeypatch):
     assert not v.ok
     assert v.reason == "judge_unavailable:unhandled:RuntimeError"
     assert "infra down" not in v.reason
+
+
+# ----- the batch wait budget reaches L2 (2026-09-05) -----
+#
+# `eval` is always a batch caller: it would rather queue behind the fleet's
+# budget than be refused. That preference is the caller's, so it travels as a
+# keyword from the caller to `lakera.check` and nothing in between interprets
+# it.
+
+def test_lakera_max_wait_s_reaches_the_lakera_layer(monkeypatch):
+    from injection_scanner import intercept, lakera
+    from injection_scanner.lakera import LakeraResult
+
+    seen: list[float | None] = []
+
+    def _spy(text, *, max_wait_s=None):
+        seen.append(max_wait_s)
+        return LakeraResult(ok=True, reason="pass")
+
+    monkeypatch.setattr(lakera, "check", _spy)
+
+    v = intercept.scan_text(
+        "clean prose", use_honeypot=False, use_lakera=True, lakera_max_wait_s=900.0
+    )
+    assert v.ok
+    assert seen == [900.0]
+
+    # Absent means absent: `lakera.check` resolves the default from the
+    # environment, so intercept must not substitute a number of its own.
+    intercept.scan_text("clean prose", use_honeypot=False, use_lakera=True)
+    assert seen == [900.0, None]
+
+
+def test_scan_forwards_lakera_max_wait_s_from_the_disk_entry_point(monkeypatch, tmp_path):
+    from injection_scanner import intercept, lakera
+    from injection_scanner.lakera import LakeraResult
+
+    seen: list[float | None] = []
+
+    def _spy(text, *, max_wait_s=None):
+        seen.append(max_wait_s)
+        return LakeraResult(ok=True, reason="pass")
+
+    monkeypatch.setattr(lakera, "check", _spy)
+    report = tmp_path / "report.md"
+    report.write_text("# Report\n\nClean prose.\n", encoding="utf-8")
+
+    v = intercept.scan(
+        report, use_honeypot=False, use_lakera=True, lakera_max_wait_s=120.0
+    )
+    assert v.ok
+    assert seen == [120.0]
