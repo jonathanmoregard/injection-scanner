@@ -163,6 +163,32 @@ def test_the_cache_dir_env_var_selects_the_state_directory(monkeypatch, tmp_path
     assert throttle.cache_dir() == Path.home() / ".cache" / "injection-scanner"
 
 
+def test_a_tilde_in_the_cache_dir_is_expanded(monkeypatch):
+    """`~` is shell syntax, not path syntax.
+
+    An operator exporting the documented default by hand writes
+    `~/.cache/injection-scanner`, and a bare `Path()` would make a literal
+    directory NAMED `~` under the cwd — a private budget nobody shares and
+    nobody finds.
+    """
+    monkeypatch.setenv("INJECTION_SCANNER_CACHE_DIR", "~/.cache/injection-scanner")
+    assert throttle.cache_dir() == Path.home() / ".cache" / "injection-scanner"
+
+
+@pytest.mark.parametrize("raw", ["state", "./state", "../state", "~nosuchuser/x"])
+def test_a_non_absolute_cache_dir_falls_back_to_the_default(monkeypatch, raw):
+    """A relative directory splits the fleet into one budget per cwd.
+
+    That is the failure this whole module exists to prevent, and it would
+    happen SILENTLY: every process would find its own full bucket and pace
+    itself perfectly against nobody. A path that cannot name the same
+    directory from every process is a misconfiguration, and degrades to the
+    default exactly as an out-of-range number degrades to its clamp.
+    """
+    monkeypatch.setenv("INJECTION_SCANNER_CACHE_DIR", raw)
+    assert throttle.cache_dir() == Path.home() / ".cache" / "injection-scanner"
+
+
 # ---------- the token bucket ----------
 
 def test_a_fresh_bucket_allows_the_first_call(tmp_path):
@@ -267,9 +293,10 @@ def test_a_numeric_retry_after_is_honoured_and_spends_no_token(tmp_path):
     fake = _Fake()
     lim = _limiter(tmp_path, fake, min_interval_s=10.0, burst=5)
     assert lim.acquire() is Decision.ALLOWED
-    tokens_before = _state(lim)["tokens"]
 
     lim.record_throttled("30")
+    tokens_before = _state(lim)["tokens"]
+
     assert lim.acquire() is Decision.THROTTLED
     assert _state(lim)["tokens"] == tokens_before, (
         "a call refused by the breaker never happened and must not be billed"
@@ -369,17 +396,108 @@ def test_record_success_closes_the_breaker_and_resets_the_backoff(tmp_path):
     assert _open_for(lim, fake) == 10.0
 
 
-def test_the_breaker_half_opens_and_a_further_throttle_reopens_it_longer(tmp_path):
+def test_the_breaker_half_opens_with_one_probe_not_a_herd(tmp_path):
+    """At the DEFAULT burst, exactly one call goes out when the breaker closes.
+
+    A bucket that refills through the outage is what turns a recovery into a
+    stampede: ten tokens are sitting ready the instant `open_until` passes,
+    and the fleet answers a server that has only just stopped refusing with
+    ten simultaneous calls — the herd that re-trips the breaker and earns the
+    next, longer backoff. Two rules prevent it: a throttle caps the bucket at
+    a single token, and time spent shut does not refill it.
+
+    Written at `burst=10` on purpose. The earlier version of this test used
+    `burst=1`, where the bucket cannot hold a herd in the first place, so it
+    demonstrated half-open behaviour that said nothing about the
+    configuration anybody actually runs.
+    """
     fake = _Fake()
     lim = _limiter(
-        tmp_path, fake, min_interval_s=0.0, burst=1,
-        backoff_base_s=10.0, backoff_max_s=600.0,
+        tmp_path, fake, min_interval_s=300.0, burst=10,
+        backoff_base_s=300.0, backoff_max_s=3600.0,
+    )
+    assert lim.acquire() is Decision.ALLOWED       # a full bucket: 10 -> 9
+
+    lim.record_throttled(None)                     # shut for 300 s
+    assert lim.acquire() is Decision.THROTTLED
+
+    fake.now += 301.0
+    assert lim.acquire() is Decision.ALLOWED, "half-open: one probe gets out"
+    assert lim.acquire() is Decision.THROTTLED, "...and exactly one, not ten"
+
+    # The probe was refused too: the breaker reopens for longer, and the
+    # bucket that probe drained is what paces the next one.
+    lim.record_throttled(None)
+    assert _open_for(lim, fake) == 600.0
+    fake.now += 601.0
+    assert lim.acquire() is Decision.THROTTLED, "no tokens banked while shut"
+    fake.now += 300.0
+    assert lim.acquire() is Decision.ALLOWED, "one interval buys the next probe"
+
+
+def test_normal_refill_resumes_once_a_success_closes_the_breaker(tmp_path):
+    """Suppressing refill while shut is pacing for the outage, not a penalty
+    after it. Once a call succeeds the bucket fills at exactly the configured
+    rate again, measured from the moment the breaker closed, and climbs all
+    the way back to `burst`."""
+    fake = _Fake()
+    lim = _limiter(
+        tmp_path, fake, min_interval_s=300.0, burst=10,
+        backoff_base_s=300.0, backoff_max_s=3600.0,
     )
     lim.record_throttled(None)
-    fake.now += 11.0
-    assert lim.acquire() is Decision.ALLOWED, "half-open: one probe gets through"
-    lim.record_throttled(None)
-    assert _open_for(lim, fake) == 20.0
+    assert lim.acquire() is Decision.THROTTLED
+    lim.record_success()                           # the probe got through
+
+    assert lim.acquire() is Decision.ALLOWED       # the capped token, spent
+    assert lim.acquire() is Decision.THROTTLED
+    fake.now += 300.0
+    assert lim.acquire() is Decision.ALLOWED, "one interval, one token"
+    assert lim.acquire() is Decision.THROTTLED
+
+    fake.now += 3000.0                             # ten intervals: back to full
+    for _ in range(10):
+        assert lim.acquire() is Decision.ALLOWED
+    assert lim.acquire() is Decision.THROTTLED, "and no further than burst"
+
+
+def test_a_breaker_parked_beyond_the_cap_reopens_on_its_own(tmp_path):
+    """`backoff_max_s` has to bound the delays this module OBEYS, not only the
+    ones it writes.
+
+    `open_until` is an absolute wall-clock instant, written by whichever
+    process saw the 429 and read later by processes that did not exist then.
+    A clock that steps BACKWARDS — an NTP correction, a VM resume, a laptop
+    waking in another timezone-confused state — leaves that instant sitting
+    arbitrarily far in the future, and nothing recovers from it: no call is
+    ever made, so no 200 ever arrives, so `record_success` can never fire to
+    clear it. The fleet would stay shut until someone deleted the file by
+    hand. Clamping on the way IN is what makes the cap self-healing, and it
+    is a no-op for every value this module legitimately writes.
+    """
+    fake = _Fake()
+    lim = _limiter(
+        tmp_path, fake, min_interval_s=0.0, burst=1, backoff_max_s=600.0
+    )
+    lim.state_path.parent.mkdir(parents=True, exist_ok=True)
+    lim.state_path.write_text(
+        json.dumps(
+            {
+                "schema": 1,
+                "tokens": 0.0,
+                "updated_at": fake.now,
+                "open_until": fake.now + 30 * 86400.0,   # thirty days out
+                "failures": 1,
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    assert lim.acquire() is Decision.THROTTLED
+    fake.now += 599.0
+    assert lim.acquire() is Decision.THROTTLED
+    fake.now += 2.0
+    assert lim.acquire() is Decision.ALLOWED, "capped at backoff_max_s, not 30 d"
 
 
 def test_a_shorter_retry_after_never_shrinks_an_already_open_breaker(tmp_path):
@@ -630,9 +748,19 @@ def test_the_budget_is_shared_across_processes(tmp_path):
         for _ in range(3)
     ]
     results = []
-    for p in procs:
-        out, err = p.communicate(timeout=60)
-        assert p.returncode == 0, f"child failed: {err}"
-        results.append(int(out.strip()))
+    try:
+        for p in procs:
+            out, err = p.communicate(timeout=60)
+            assert p.returncode == 0, f"child failed: {err}"
+            results.append(int(out.strip()))
+    finally:
+        # A child wedged on the flock (or on a loaded runner) must not be left
+        # behind holding the lock: every later test in this file would then
+        # time out too, and the failure would be reported against whichever
+        # one ran next rather than against this one.
+        for p in procs:
+            if p.poll() is None:
+                p.kill()
+                p.wait()
 
     assert sum(results) == 2, f"per-child allowances: {results}"

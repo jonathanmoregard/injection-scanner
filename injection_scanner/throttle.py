@@ -46,7 +46,9 @@ direction. `Retry-After` is server-supplied TEXT and a hostile or buggy server
 can put anything in it. It is parsed into a clamped number INSIDE this module
 (`_parse_retry_after`) and the string itself is never stored in the state
 file, never logged, and never interpolated into a reason. `backoff_max_s` caps
-the PARSED value too, so an absurd header cannot park the fleet indefinitely.
+the PARSED value both when it is WRITTEN and again when state is READ back,
+so neither an absurd header nor a wall clock that stepped backwards can park
+the fleet for longer than one `backoff_max_s`.
 
 There is NO on/off switch. "Off" is `min_interval_s=0` (bucket always full)
 plus `backoff_max_s=0` (every breaker delay clamps to zero); the test suite
@@ -203,12 +205,38 @@ def _env_int(name: str, default: int, bounds: tuple[int, int]) -> int:
 def cache_dir() -> Path:
     """The limiter's state directory.
 
-    Same directory `selfupdate.py` already uses, so an operator has one place
-    to look and one place to clear.
+    The DEFAULT is the directory `selfupdate.py` defaults to as well, so an
+    operator has one place to look and one place to clear. That is a shared
+    default, not a shared setting: `selfupdate.py` takes its directory as a
+    parameter and never reads this environment variable, so pointing
+    `INJECTION_SCANNER_CACHE_DIR` elsewhere moves the limiter's state alone.
+
+    Two ways an operator's value can fail to name one directory fleet-wide,
+    both handled here rather than discovered later:
+
+      * `~` is shell syntax, not path syntax. Unexpanded it becomes a literal
+        directory NAMED `~` under whatever the cwd happens to be.
+      * a RELATIVE path resolves per process, so every process finds its own
+        full bucket and paces itself perfectly against nobody — silently
+        recreating the exact failure this module exists to prevent.
+
+    So the value is expanded, and anything still not absolute degrades to the
+    default: a misconfigured directory falls back to a sane one, the same way
+    an out-of-range number falls back to its clamp.
+
+    TOTAL by contract. `expanduser()` RAISES on a `~user` it cannot resolve,
+    and this runs inside `from_env()`, which callers reach outside
+    `acquire`'s try/except — an escaping exception there would abort the whole
+    scan instead of failing it closed.
     """
     raw = os.environ.get(ENV_CACHE_DIR)
     if raw:
-        return Path(raw)
+        try:
+            path = Path(raw).expanduser()
+        except (RuntimeError, OSError, ValueError):
+            path = Path(raw)
+        if path.is_absolute():
+            return path
     return Path.home() / ".cache" / "injection-scanner"
 
 
@@ -237,7 +265,9 @@ class LimiterConfig:
 
     backoff_max_s: float
     """Cap on EVERY breaker delay, a server-supplied `Retry-After` included.
-    One knob, and it bounds the blast radius of a bad header."""
+    Applied on write and again on read, so it bounds the blast radius of a
+    bad header AND of a stored instant a backwards clock left in the
+    future — one knob, and no way to be shut for longer than it says."""
 
     lock_wait_s: float
     """Bounded wait for the flock before `acquire` gives up with `ERROR`."""
@@ -309,9 +339,9 @@ def _parse_retry_after(value: object, now: float) -> float | None:
             if not math.isfinite(seconds) or seconds < 0.0:
                 return None
             return seconds
+        # Raises on anything it cannot read (it does not return None on
+        # Python >= 3.10), which the surrounding `except` turns into `None`.
         parsed = parsedate_to_datetime(text)
-        if parsed is None:
-            return None
         if parsed.tzinfo is None:
             # HTTP-dates are GMT by definition; a date without a zone is
             # malformed, but reading it as UTC is strictly better than
@@ -368,6 +398,15 @@ class CrossProcessLimiter:
         `ALLOWED` or `THROTTLED`, sub-millisecond, no network. A positive
         budget blocks until a token is available AND the breaker is closed, or
         the deadline passes.
+
+        Note what the `0.0` in the signature is and is not. It is this
+        method's own default, NOT the value of
+        `INJECTION_SCANNER_LAKERA_MAX_WAIT_S`: nothing here reads that
+        variable, and it takes effect only where a caller threads
+        `default_max_wait_s()` through — which `lakera.check` does for callers
+        that name no budget of their own. Calling `acquire()` bare therefore
+        ignores the operator's configured wait, deliberately, so that a
+        caller which has not thought about waiting never blocks by accident.
 
         Never raises. Every failure of the limiter itself becomes `ERROR`,
         which the caller renders as a fail-closed reject. That is deliberately
@@ -440,6 +479,15 @@ class CrossProcessLimiter:
                     delay = 0.0
                 delay = min(delay, self._config.backoff_max_s)
                 st.open_until = max(st.open_until, now + delay)
+                # Cap the bucket at a single token, so that what comes out the
+                # far side of the outage is a PROBE and not a herd. Without
+                # this a full default bucket (ten) is still sitting there when
+                # `open_until` passes, and the fleet answers a server that has
+                # only just stopped refusing with ten simultaneous calls — the
+                # stampede that re-trips the breaker and earns the next,
+                # longer backoff. Paired with the refill rule in `_attempt`,
+                # which keeps the shut period from converting into tokens.
+                st.tokens = min(st.tokens, 1.0)
                 self._save(st)
         except Exception:  # noqa: BLE001 — see the docstring
             return
@@ -457,7 +505,19 @@ class CrossProcessLimiter:
         with self._locked():
             now = self._clock()
             st = self._load(now)
-            elapsed = max(0.0, now - st.updated_at)  # clock stepped back -> 0
+            # Time spent with the breaker OPEN does not refill the bucket, so
+            # refill is measured from the later of "last touched" and "the
+            # breaker closed". Two things follow, and both are the point:
+            # while shut this is zero, so nothing accrues; and once it opens
+            # the outage cannot be redeemed retroactively for the tokens it
+            # would have earned. Advancing `updated_at` alone is not enough —
+            # if no caller happens to arrive during the outage, the whole shut
+            # window is still sitting in the gap when the next one does.
+            # `max(0.0, ...)` is the separate guard for a clock that stepped
+            # BACKWARDS: elapsed goes to zero rather than negative, so a step
+            # can delay calls but never mint or confiscate tokens.
+            refill_since = max(st.updated_at, st.open_until)
+            elapsed = max(0.0, now - refill_since)
             if self._config.min_interval_s <= 0.0:
                 st.tokens = float(self._config.burst)
             else:
@@ -493,6 +553,23 @@ class CrossProcessLimiter:
         open file description, and each `os.open` makes its own. flock is
         released by the kernel when the holder dies, so there are no stale
         locks to reap after a crash.
+
+        Two limits on that guarantee, both real and both accepted:
+
+          * the lock lives on an INODE, not on a path. Deleting the lock file
+            while a holder still has it open lets the next opener create a
+            fresh inode and lock that instead, and the two then run
+            concurrently believing they are exclusive. So a wipe of the cache
+            directory is the one window in which exclusion is genuinely lost
+            — and it is also the only way two processes can collide on the
+            shared `.tmp` name in `_save`. Clearing the directory is an
+            operator action on state that is rebuilt on the next call, so the
+            cost of losing that race is one reset bucket.
+          * flock is advisory and is EMULATED on some filesystems. Over NFS it
+            is mapped onto POSIX locks, and on some overlay and network mounts
+            it degrades to a no-op. The cache directory is expected to be
+            local disk; a fleet sharing it over NFS gets pacing that is
+            best-effort rather than guaranteed.
 
         `LOCK_NB` plus a retry, rather than a blocking `LOCK_EX`, because the
         wait has to be BOUNDED: a wedged peer must degrade to `ERROR` (a
@@ -553,7 +630,17 @@ class CrossProcessLimiter:
         return _State(
             tokens=min(max(tokens, 0.0), float(self._config.burst)),
             updated_at=updated_at,
-            open_until=open_until,
+            # `backoff_max_s` has to bound the delays this module OBEYS, not
+            # merely the ones it writes. `open_until` is an ABSOLUTE instant,
+            # written by whichever process saw the 429 and read by processes
+            # that did not exist then; a clock stepping BACKWARDS (NTP
+            # correction, VM resume) leaves it arbitrarily far in the future
+            # with nothing able to recover — no call is made, so no 200
+            # arrives, so `record_success` can never fire to clear it, and the
+            # fleet stays shut until a human deletes the file. Clamping on the
+            # way in makes the cap self-healing, and is a no-op for every
+            # value `record_throttled` legitimately stores.
+            open_until=min(open_until, now + self._config.backoff_max_s),
             failures=max(failures, 0),
         )
 
@@ -561,10 +648,23 @@ class CrossProcessLimiter:
         """Write via `<file>.tmp` + `os.replace`, inside the lock.
 
         The replace is atomic, so a reader without the lock — or a process
-        killed mid-write — never sees a half-written bucket. Only the five
-        fields below are written; the payload is built by NAMING them, so a
-        field added to `_State` tomorrow is invisible until it is added here
-        on purpose.
+        killed mid-write — never sees a half-written bucket. There is
+        deliberately NO fsync: this is a pacing hint rebuilt on the next call,
+        not a ledger, and paying a disk flush on every scan to protect it
+        would be the wrong trade. The exposure is a power loss, after which
+        the file may be torn or empty; `_load` reads that as unusable and
+        returns `_fresh`, a full bucket with the breaker closed. That is the
+        fail-OPEN direction, and it is the deliberate choice: a machine that
+        just lost power must come back able to scan, and the breaker re-learns
+        within one 429.
+
+        The file is created 0o600 explicitly rather than inheriting whatever
+        umask is in force, so it does not depend on this module having been
+        the one to create the 0o700 directory around it.
+
+        Only the five fields below are written; the payload is built by NAMING
+        them, so a field added to `_State` tomorrow is invisible until it is
+        added here on purpose.
         """
         payload = {
             "schema": _SCHEMA,
@@ -574,5 +674,7 @@ class CrossProcessLimiter:
             "failures": st.failures,
         }
         tmp = self._state_path.parent / (self._state_path.name + ".tmp")
-        tmp.write_text(json.dumps(payload), encoding="utf-8")
+        fd = os.open(tmp, os.O_CREAT | os.O_WRONLY | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            fh.write(json.dumps(payload))
         os.replace(tmp, self._state_path)
