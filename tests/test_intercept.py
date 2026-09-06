@@ -310,16 +310,33 @@ def test_judge_crash_fails_closed(monkeypatch):
 # keyword from the caller to `lakera.check` and nothing in between interprets
 # it.
 
-def test_lakera_max_wait_s_reaches_the_lakera_layer(monkeypatch):
-    from injection_scanner import intercept, lakera
+# The spy's default is a SENTINEL, not None: `None` is a value intercept is
+# required to forward, so a default of None would make "keyword omitted" and
+# "keyword passed as None" record identically, and a conditional call site
+# (`check(t)` when the budget is unset, `check(t, max_wait_s=v)` otherwise)
+# would still satisfy `seen == [900.0, None]`. With the sentinel, an omitted
+# keyword records `_UNSET` and the assertion fails — which is exactly the
+# mutant D12 in the plan rules out.
+_UNSET = object()
+
+
+def _wait_spy():
+    """Return `(spy, seen)`: a `lakera.check` stand-in recording `max_wait_s`."""
     from injection_scanner.lakera import LakeraResult
 
-    seen: list[float | None] = []
+    seen: list[object] = []
 
-    def _spy(text, *, max_wait_s=None):
+    def _spy(text, *, max_wait_s=_UNSET):
         seen.append(max_wait_s)
         return LakeraResult(ok=True, reason="pass")
 
+    return _spy, seen
+
+
+def test_lakera_max_wait_s_reaches_the_lakera_layer(monkeypatch):
+    from injection_scanner import intercept, lakera
+
+    _spy, seen = _wait_spy()
     monkeypatch.setattr(lakera, "check", _spy)
 
     v = intercept.scan_text(
@@ -329,21 +346,16 @@ def test_lakera_max_wait_s_reaches_the_lakera_layer(monkeypatch):
     assert seen == [900.0]
 
     # Absent means absent: `lakera.check` resolves the default from the
-    # environment, so intercept must not substitute a number of its own.
+    # environment, so intercept must not substitute a number of its own — and
+    # must not drop the keyword either, which the sentinel default catches.
     intercept.scan_text("clean prose", use_honeypot=False, use_lakera=True)
     assert seen == [900.0, None]
 
 
 def test_scan_forwards_lakera_max_wait_s_from_the_disk_entry_point(monkeypatch, tmp_path):
     from injection_scanner import intercept, lakera
-    from injection_scanner.lakera import LakeraResult
 
-    seen: list[float | None] = []
-
-    def _spy(text, *, max_wait_s=None):
-        seen.append(max_wait_s)
-        return LakeraResult(ok=True, reason="pass")
-
+    _spy, seen = _wait_spy()
     monkeypatch.setattr(lakera, "check", _spy)
     report = tmp_path / "report.md"
     report.write_text("# Report\n\nClean prose.\n", encoding="utf-8")
