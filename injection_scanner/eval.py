@@ -16,8 +16,14 @@ CLI:
     python -m injection_scanner.eval <corpus.jsonl>
     python -m injection_scanner.eval <corpus.jsonl> --min-recall 0.8
 
-Always exits 0 (measurement, not a gate) UNLESS --min-recall is passed, in
-which case it exits 1 when recall falls below the floor (lets CI enforce it).
+Exit codes:
+    0  measured (the default: a run with no threshold flag is not a gate)
+    1  a threshold failed — --min-recall / --max-fp-rate, so CI can hold a
+       floor and a ceiling
+    2  usage error
+    3  a scanner OUTAGE — see `_is_infra_reason`. An outage is not a
+       measurement, so nothing is scored and no scorecard is printed; the
+       diagnosis goes to stderr as `INFRA <case_id> <reason>`.
 
 With the hosted layers live, one scan is a sample from an LLM. Pass
 --confirm-disagreements N to re-scan only the cases whose verdict disagrees
@@ -29,6 +35,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import sys
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -41,6 +48,173 @@ PASS = "pass"
 _VALID = {BLOCK, PASS}
 
 
+# ---------------------------------------------------------------------------
+# Infra classification.
+#
+# An OUTAGE is not a classification. `scan_text` fails closed, so a degraded
+# layer returns ok=False and therefore AGREES with every injection-labelled
+# case: a Lakera outage would score recall 1.0 on a scanner that classified
+# nothing, and the gate would go green. Measured 2026-09-05: with Lakera
+# answering 429 to ~3 of every 4 calls, this harness would have reported a
+# perfect scorecard.
+#
+# The rule below is a VERBATIM port of research-agent's
+# `mcp_server/server.py::_is_infra_reason`, deliberately: the two repositories
+# have to agree on what "the scanner is down" looks like, and a rule that
+# drifts is worse than no rule. It is head-ANCHORED and CLOSED — never a
+# substring search, and the default is False, so an unrecognised reason is
+# treated as content-derived and still scores.
+# ---------------------------------------------------------------------------
+
+# The head segment of every layer outage reason: `lakera_unavailable`,
+# `honeypot_unavailable`, `judge_unavailable`, `unicode_sanitize_unavailable`,
+# `secret_shapes_unavailable`.
+_INFRA_REASON_HEAD_SUFFIX = "_unavailable"
+
+# Reason prefixes that WRAP another layer's reason. `intercept.py` re-emits
+# the honeypot's own result reason under `honeypot:` and the L4 judge's under
+# `lakera_arbitration:`, so a genuine outage arrives one segment deeper than
+# it was raised. An explicit set rather than "look at segment 1 too", so that
+# `secret_shape:thing_unavailable` — a rule NAME that merely ends in the
+# suffix — cannot be mistaken for an outage. Pinned by
+# `tests/test_eval.py::test_a_detection_that_merely_ends_in_the_suffix_still_scores`.
+_INFRA_WRAPPER_PREFIXES = frozenset({"honeypot", "lakera_arbitration"})
+
+# Standalone setup codes. Today they only appear as the tail of
+# `lakera_unavailable:<code>`; listed so a future call site emitting one bare
+# is still classified as infra rather than silently scored.
+_INFRA_BARE_REASONS = frozenset({"no-key", "key-config-error", "bad-response"})
+
+
+class EvalInfraError(RuntimeError):
+    """A scanner outage during an eval run — not a classification.
+
+    Carries the case that hit it and the scanner's own reason. `_main` prints
+    the pair as `INFRA <case_id> <reason>` on stderr, so what each field can
+    contain is load-bearing, and the two fields are NOT the same kind of
+    string:
+
+      * `reason` is scanner-synthesized closed vocabulary — a layer name, a
+        condition, an exception TYPE name, a bounded HTTP status. Nothing
+        derived from the scanned text is in it.
+      * `case_id` is OPERATOR-AUTHORED: it comes off the corpus row verbatim.
+        It is constrained instead by `_validate_case_id`, which every
+        `EvalCase` runs at construction, so by the time one can reach this
+        exception it is single-line printable ASCII of bounded length.
+
+    That validation is what makes the INFRA line printable at all. Free text
+    here would let a corpus row carrying a newline forge a SECOND INFRA line
+    naming any reason it liked, and one carrying an ESC byte write terminal
+    control sequences into a CI log — into the exact channel that is read
+    outside the isolation zone precisely because it was promised to be
+    content-free. See `_validate_case_id`.
+    """
+
+    def __init__(self, case_id: str, reason: str) -> None:
+        super().__init__(f"{case_id} {reason}")
+        self.case_id = case_id
+        self.reason = reason
+
+
+def _infra_segments(reason: str) -> list[str]:
+    """Split a reason into tokens, dropping the `+skipped=N/M` suffix.
+
+    The honeypot appends `+skipped=<n>/<total>` to its top-line reason, which
+    would otherwise glue itself to the last token and defeat the match.
+    """
+    return [seg.split("+", 1)[0] for seg in reason.split(":")]
+
+
+def _is_infra_reason(reason: object) -> bool:
+    """True iff `reason` is a positively-recognised setup/infra outage code.
+
+    Default False: an unrecognised or malformed reason is treated as
+    content-derived and still scores. Matching is anchored at the head segment
+    (or at segment 1 behind a known wrapper prefix), never a substring search.
+    """
+    if not isinstance(reason, str) or not reason:
+        return False
+    segments = _infra_segments(reason)
+    if segments[0].endswith(_INFRA_REASON_HEAD_SUFFIX):
+        return True
+    if (
+        segments[0] in _INFRA_WRAPPER_PREFIXES
+        and len(segments) > 1
+        and segments[1].endswith(_INFRA_REASON_HEAD_SUFFIX)
+    ):
+        return True
+    return reason in _INFRA_BARE_REASONS
+
+
+# The case id crosses the scanner boundary — `_main` prints it on the
+# `INFRA <case_id> <reason>` line that a CI log and research-agent's diagnosis
+# both read — but unlike everything else on that line it is operator-authored
+# free text off a corpus row. So it is constrained to a shape that cannot
+# forge structure in the channel it travels through.
+#
+# Single-LINE is the load-bearing half: a `\n` in an id makes one INFRA line
+# into two, and the forged one can claim any reason it likes. Printable ASCII
+# covers the rest of the ways a byte can mean something to a reader rather than
+# say something — ESC opens a terminal control sequence, NUL and the other C0
+# codes truncate or corrupt log lines, and non-ASCII brings homoglyphs and bidi
+# overrides, which is the same family of trick `unicode_sanitize` strips from
+# report text one layer down. A length cap keeps a single id from swamping the
+# line, and non-empty makes `INFRA  <reason>` — an id-shaped hole — impossible.
+#
+# 64 characters is set from the corpus that exists (the longest seed id,
+# `fp_agent_tooling_prose.md`, is 25) with room for a descriptive name; it is a
+# limit on a NAME, not a tuned constant. Raising it is safe and changes nothing
+# structural.
+#
+# The id is ALSO a path: `load_corpus_dir` reads `<directory>/<id>` for any row
+# that omits `text`. Printable ASCII includes `/`, `\` and `.`, so before this
+# rule a row could name `../../.ssh/id_ed25519` or `/etc/hostname` and pull any
+# readable file on the box into a case's text — where the honeypot and the
+# Lakera layer then hand it to third-party providers. So an id is a single NAME
+# and never a path: no separator in either spelling, and never a relative-path
+# component. Enforced here rather than in the loader so `load_jsonl`,
+# `load_corpus_dir` and a direct construction all get the same rule; the
+# loader's own resolved-path check is the second guard, for the shapes a string
+# rule cannot see (a symlink planted inside the corpus).
+_MAX_CASE_ID_LEN = 64
+_PRINTABLE_ASCII = frozenset(chr(c) for c in range(0x20, 0x7F))
+
+
+def _validate_case_id(case_id: object) -> str:
+    """Return `case_id` if it is a legal id, else raise `ValueError`.
+
+    The message NEVER echoes the offending id. Whatever made it illegal — an
+    escape sequence, a newline, a NUL — would do exactly the same thing to
+    this message, which travels to the operator's terminal through
+    `parser.error`. So the rule is stated and the value is not, except for its
+    length, which is a bounded integer.
+    """
+    if not isinstance(case_id, str):
+        raise ValueError(f"case id must be a string, got {type(case_id).__name__}")
+    if not case_id.strip():
+        raise ValueError("case id must not be empty or blank")
+    if len(case_id) > _MAX_CASE_ID_LEN:
+        raise ValueError(
+            f"case id must be at most {_MAX_CASE_ID_LEN} characters, "
+            f"got {len(case_id)}"
+        )
+    if not set(case_id) <= _PRINTABLE_ASCII:
+        raise ValueError(
+            "case id must be a single line of printable ASCII "
+            "(no newlines, control characters or non-ASCII)"
+        )
+    if "/" in case_id or "\\" in case_id:
+        raise ValueError(
+            "case id must be a single file name, not a path "
+            "(no '/' or '\\' separators)"
+        )
+    # With both separators refused the id is exactly one path component, so
+    # `.` and `..` are the whole of what is left to reject.
+    if case_id in (".", ".."):
+        raise ValueError("case id must not be a relative-path component")
+    return case_id
+
+
 @dataclass
 class EvalCase:
     id: str
@@ -48,6 +222,12 @@ class EvalCase:
     expected: str  # "block" or "pass"
 
     def __post_init__(self) -> None:
+        # Validated HERE rather than in each loader, so no `EvalCase` can exist
+        # with an id that would misbehave on the INFRA line — `load_jsonl`,
+        # `load_corpus_dir` and a direct construction in a test all get the
+        # same rule from one place. `_main` renders the ValueError as a usage
+        # error (exit 2), so a bad corpus never starts a run.
+        _validate_case_id(self.id)
         if self.expected not in _VALID:
             raise ValueError(
                 f"case {self.id!r}: expected must be one of {sorted(_VALID)}, "
@@ -243,6 +423,7 @@ def evaluate(
     use_honeypot: bool = False,
     use_lakera: bool = False,
     confirm_disagreements: int = 0,
+    lakera_max_wait_s: float | None = None,
 ) -> Scorecard:
     """Run scan_text over each case and score against expected labels.
 
@@ -273,6 +454,18 @@ def evaluate(
     outcome is kept on each row and reported by `Scorecard.format` as the
     single-shot numbers, because one scan per report is what production
     gets: the weakness is surfaced, not absorbed.
+
+    `lakera_max_wait_s` is how long each L2 call may queue for its turn in the
+    fleet-wide Lakera budget. A batch run would rather wait than be refused,
+    which is the opposite of what an interactive scan wants — hence a
+    parameter rather than a global.
+
+    Raises `EvalInfraError` on the FIRST verdict whose reason is a recognised
+    outage, before any further case is scanned. An outage is not a
+    classification: `scan_text` fails closed, so a degraded layer agrees with
+    every injection label and would inflate recall. Aborting also bounds the
+    cost — a throttled Lakera pays for one probe per breaker window rather
+    than one per case.
     """
     if confirm_disagreements < 0:
         raise ValueError(
@@ -285,8 +478,18 @@ def evaluate(
         while True:
             attempts += 1
             verdict = scan_text(
-                case.text, use_honeypot=use_honeypot, use_lakera=use_lakera
+                case.text,
+                use_honeypot=use_honeypot,
+                use_lakera=use_lakera,
+                lakera_max_wait_s=lakera_max_wait_s,
             )
+            if _is_infra_reason(verdict.reason):
+                # Stop the whole run, here, before this verdict is turned into
+                # a prediction. Scoring it would credit the scorecard for a
+                # layer that never classified anything, and re-scanning it
+                # under `confirm_disagreements` would just spend more of the
+                # budget on a layer that is down.
+                raise EvalInfraError(case.id, verdict.reason)
             predicted = PASS if verdict.ok else BLOCK
             if first_predicted is None:
                 first_predicted = predicted
@@ -338,6 +541,12 @@ def load_jsonl(path: str | Path) -> list[EvalCase]:
                 raise ValueError(
                     f"{path}:{lineno}: missing required field {exc}"
                 ) from exc
+            except ValueError as exc:
+                # `EvalCase.__post_init__` rejects an illegal id or label. It
+                # cannot know which line it came from, and the line number is
+                # the whole of what an operator needs to fix it — the id
+                # itself is deliberately not echoed (see `_validate_case_id`).
+                raise ValueError(f"{path}:{lineno}: {exc}") from exc
     return cases
 
 
@@ -347,11 +556,29 @@ def load_corpus_dir(directory: str | Path) -> list[EvalCase]:
     The labels file gives one line per case. If a line omits `text`, the text
     is read from `<directory>/<id>` (the fixture file), letting a corpus store
     labels separately from the raw fixtures on disk.
+
+    The id is therefore a PATH here, and it is checked BEFORE anything is
+    opened — the read used to happen first, with `EvalCase` validating the id
+    only afterwards, so a row naming `../../.ssh/id_ed25519` had already been
+    read by the time anything objected. Two guards, because neither covers the
+    other:
+
+      * `_validate_case_id` refuses separators and relative-path components,
+        so an id is a single NAME;
+      * the RESOLVED fixture path must still sit inside the resolved corpus
+        directory, which is what catches a symlink planted inside the corpus —
+        a shape no string rule can see. The cost is that a corpus cannot share
+        fixtures by linking out of its own directory, which is the right trade
+        for a loader whose input decides what gets sent to a provider.
+
+    Both raise `ValueError`, which `_main` renders as a usage error (exit 2)
+    like any other unreadable corpus, and neither message echoes the id.
     """
     directory = Path(directory)
     labels_path = directory / "labels.jsonl"
     if not labels_path.exists():
         raise FileNotFoundError(f"no labels.jsonl in {directory}")
+    base = directory.resolve()
     cases: list[EvalCase] = []
     with open(labels_path, encoding="utf-8") as fh:
         for lineno, line in enumerate(fh, start=1):
@@ -359,11 +586,23 @@ def load_corpus_dir(directory: str | Path) -> list[EvalCase]:
             if not line:
                 continue
             obj = json.loads(line)
+            try:
+                case_id = _validate_case_id(obj["id"])
+            except ValueError as exc:
+                # The line number is the whole of what an operator needs; the
+                # id is deliberately not echoed (see `_validate_case_id`).
+                raise ValueError(f"{labels_path}:{lineno}: {exc}") from exc
             text = obj.get("text")
             if text is None:
-                text = (directory / obj["id"]).read_text(encoding="utf-8")
+                fixture = (base / case_id).resolve()
+                if not fixture.is_relative_to(base):
+                    raise ValueError(
+                        f"{labels_path}:{lineno}: fixture path resolves outside "
+                        "the corpus directory"
+                    )
+                text = fixture.read_text(encoding="utf-8")
             cases.append(
-                EvalCase(id=obj["id"], text=text, expected=obj["expected"])
+                EvalCase(id=case_id, text=text, expected=obj["expected"])
             )
     return cases
 
@@ -372,6 +611,16 @@ def _main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         prog="python -m injection_scanner.eval",
         description="Score the scanner against a labeled corpus.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=(
+            "exit codes:\n"
+            "  0  measured (a run with no threshold flag is not a gate)\n"
+            "  1  a threshold failed (--min-recall / --max-fp-rate)\n"
+            "  2  usage error\n"
+            "  3  a scanner OUTAGE: a layer was down, so nothing was\n"
+            "     measured. No scorecard is printed; the diagnosis goes to\n"
+            "     stderr as `INFRA <case_id> <reason>`.\n"
+        ),
     )
     parser.add_argument("corpus", help="path to a JSONL corpus file")
     parser.add_argument(
@@ -412,15 +661,88 @@ def _main(argv: list[str] | None = None) -> int:
         "still fails). Agreeing cases are never re-scanned. The scorecard "
         "reports the first-attempt numbers alongside. Default 0: single shot.",
     )
-    args = parser.parse_args(argv)
-
-    cases = load_jsonl(args.corpus)
-    card = evaluate(
-        cases,
-        use_honeypot=args.use_honeypot,
-        use_lakera=args.use_lakera,
-        confirm_disagreements=args.confirm_disagreements,
+    parser.add_argument(
+        "--lakera-max-wait",
+        type=float,
+        default=900.0,
+        metavar="SECONDS",
+        help="how long each Lakera call may WAIT for its turn in the "
+        "fleet-wide budget before it is refused. An eval run is always a "
+        "batch caller, so it queues rather than failing; the default is 900 "
+        "(15 minutes). 0 refuses immediately, which is what an interactive "
+        "scan does. On the CLI rather than in the environment because being "
+        "correct by default beats depending on the operator remembering.",
     )
+    args = parser.parse_args(argv)
+    if not math.isfinite(args.lakera_max_wait) or args.lakera_max_wait < 0:
+        # A typo must not be able to disguise itself as an outage. The limiter
+        # clamps a negative or non-finite budget to 0.0 — refuse immediately —
+        # so under fleet contention the first case would come back
+        # `lakera_unavailable:throttled` and the run would exit 3 reporting a
+        # scanner outage that was really a mistyped flag. `evaluate` already
+        # rejects `confirm_disagreements < 0`; this is the same treatment, and
+        # exit 2 keeps a usage error out of the outage channel.
+        parser.error(
+            f"--lakera-max-wait must be a finite number of seconds >= 0, got "
+            f"{args.lakera_max_wait!r}"
+        )
+    if args.confirm_disagreements < 0:
+        # `evaluate` raises ValueError on this, and that exception escaped
+        # `_main` uncaught — which Python renders as exit 1, the code the
+        # epilog reserves for "a threshold failed". A mistyped budget therefore
+        # reported a recall regression. Rejected here at parse time instead,
+        # the same treatment `--lakera-max-wait` gets one branch up, so the
+        # usage error leaves through the usage exit and costs no scan.
+        parser.error(
+            f"--confirm-disagreements must be an integer >= 0, got "
+            f"{args.confirm_disagreements!r}"
+        )
+
+    # The corpus is an ARGUMENT, so a bad one is a usage error like any other.
+    # Everything `load_jsonl` can raise means the same thing — this path does
+    # not name a readable, well-formed corpus — and none of it was caught: a
+    # missing file, a directory, a permission error, a torn JSON line, a row
+    # missing a field or carrying a label outside the vocabulary all escaped as
+    # an uncaught exception, i.e. exit 1 plus a traceback over the operator's
+    # terminal. Exit 1 is the threshold code, so CI read "recall regressed"
+    # from a typo'd path.
+    #
+    # Caught as a group rather than one type at a time: `FileNotFoundError` is
+    # the obvious one and the least interesting, `IsADirectoryError` and
+    # `PermissionError` are equally ordinary operator mistakes, and a row that
+    # is a JSON list rather than an object raises `TypeError` from the
+    # subscript. `json.JSONDecodeError` is a `ValueError` subclass and
+    # `FileNotFoundError` an `OSError` subclass; both are named anyway so the
+    # roster reads as the intended set rather than as an accident of the
+    # hierarchy.
+    #
+    # `str(exc)` is safe to show here and is what makes the message useful: it
+    # is argparse's own diagnostic surface, the corpus is operator-authored
+    # (not a scanned report), and `load_jsonl` builds its messages from the
+    # path, the line number and the missing FIELD NAME — never from case text.
+    try:
+        cases = load_jsonl(args.corpus)
+    except (OSError, ValueError, TypeError, KeyError, json.JSONDecodeError) as exc:
+        parser.error(f"cannot read corpus {args.corpus!r}: {exc}")
+
+    try:
+        card = evaluate(
+            cases,
+            use_honeypot=args.use_honeypot,
+            use_lakera=args.use_lakera,
+            confirm_disagreements=args.confirm_disagreements,
+            lakera_max_wait_s=args.lakera_max_wait,
+        )
+    except EvalInfraError as e:
+        # Exit 3, distinct from 1 (a threshold failed) and 2 (argparse usage),
+        # so a CI log says "the scanner was down" rather than "recall
+        # regressed". No scorecard is printed: there isn't one, and printing a
+        # partial card is how an outage gets mistaken for a measurement.
+        #
+        # Both fields are scanner-synthesized closed-vocabulary strings, which
+        # is why they can be said out loud here.
+        print(f"INFRA {e.case_id} {e.reason}", file=sys.stderr)
+        return 3
     print(card.format())
 
     failed = False

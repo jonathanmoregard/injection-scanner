@@ -35,6 +35,13 @@ test = [
     # not otherwise installed and a clean `.[test]` install failed at
     # collection once CI started running the whole tests/ tree.
     "httpx>=0.28,<1",
+    # tests/test_ci_relations.py parses .github/workflows/{ci,live-eval}.yml
+    # to assert that the merge gate stays hermetic and the live jobs stay
+    # serialised. TEST-only: the scanner itself parses no YAML and must not
+    # gain a runtime dependency for a CI guard. Major-version ceiling for the
+    # same reason as the SDK pins above — the next major is a reviewed
+    # change, not a silent one.
+    "pyyaml>=6,<7",
 ]
 
 [tool.setuptools.packages.find]
