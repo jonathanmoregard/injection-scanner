@@ -46,6 +46,12 @@ _EPOCH = 1_700_000_000.0
 # arithmetic rather than as a magic 3.
 _CANARIES_PER_RUN = 3
 
+# The completion line the probe emits when it really did contact the vendors.
+# On a cache hit it must NOT appear (D26): consumers key on the smoke
+# completing, and reusing a line that claims "lakera + honeypot live via
+# scan(Path)" would make the log say a vendor was called when it was not.
+_LIVE_LINE = "live via scan(Path)"
+
 
 @dataclass
 class _Fake:
@@ -166,21 +172,36 @@ def test_a_fresh_cache_runs_the_probe_and_records_the_pass(probe, cache_file, tt
 
 def test_a_second_boot_inside_the_ttl_skips_the_probe(probe, ttl):
     """The property the whole file exists for: a six-pane session restore
-    costs ONE Lakera call, not six."""
+    costs ONE Lakera call, not six.
+
+    Each boot gets its OWN log, so the cached boots can be asserted on for
+    what they did NOT say as well as for what they did (D26). The first boot
+    legitimately emits the vendor-contact line; a cached one that reused it
+    would be claiming a call it never made.
+    """
     ttl(3600)
     fake, log = _Fake(), _Log()
     _run(fake, log)
     assert probe.probes == 1
+    assert _LIVE_LINE in log.text(), "the first boot really did call out"
 
     fake.now += 120.0
-    _run(fake, log)
+    cached = _Log()
+    _run(fake, cached)
     assert probe.probes == 1, "a fresh cached pass must not be re-probed"
-    assert "liveness probe: cached pass, 120s old" in log.text()
+    assert "liveness probe: cached pass, 120s old" in cached.text()
+    assert "liveness from cache" in cached.text()
+    assert _LIVE_LINE not in cached.text(), (
+        "a cache hit must not report the vendors as freshly contacted"
+    )
 
     fake.now += 3400.0                     # 3520 s total, still inside 3600
-    _run(fake, log)
+    later = _Log()
+    _run(fake, later)
     assert probe.probes == 1
-    assert "liveness probe: cached pass, 3520s old" in log.text()
+    assert "liveness probe: cached pass, 3520s old" in later.text()
+    assert "liveness from cache" in later.text()
+    assert _LIVE_LINE not in later.text()
 
 
 def test_an_expired_entry_is_probed_again_and_rewritten(probe, cache_file, ttl):
@@ -283,6 +304,8 @@ def test_a_degraded_layer_is_not_cached_either(probe, cache_file, ttl):
         "[]",
         "not json at all",
         '{"schema": 99, "ok": true, "at": 1700000000.0}',
+        '{"schema": 2, "ok": true, "at": 1700000000.0}',
+        '{"schema": 0, "ok": true, "at": 1700000000.0}',
         '{"schema": 1, "ok": false, "at": 1700000000.0}',
         '{"schema": 1, "ok": "yes", "at": 1700000000.0}',
         '{"schema": 1, "ok": true}',
@@ -291,7 +314,8 @@ def test_a_degraded_layer_is_not_cached_either(probe, cache_file, ttl):
         '{"schema": 1, "ok": true, "at": 1700009999.0}',
     ],
     ids=[
-        "empty", "truncated", "null", "array", "garbage", "foreign-schema",
+        "empty", "truncated", "null", "array", "garbage",
+        "schema-99", "schema-2", "schema-0",
         "recorded-failure", "ok-not-boolean", "no-timestamp",
         "timestamp-not-a-number", "timestamp-nan", "timestamp-in-the-future",
     ],
@@ -301,8 +325,11 @@ def test_an_unusable_cache_entry_is_a_miss(probe, cache_file, ttl, blob):
     must degrade to "run the probe", which is today's behaviour.
 
     Every blob here carries a timestamp that WOULD be fresh, so each case
-    fails for its own stated reason rather than for age. `foreign-schema` is
-    an older or newer scanner sharing the cache directory; `recorded-failure`
+    fails for its own stated reason rather than for age. The three `schema-*`
+    cases are an older or newer scanner sharing the cache directory, and they
+    bracket the current value on BOTH sides on purpose: the contract is exact
+    equality with 1, so a check widened to `>= 1` or to "1 or 2" has to fail
+    here rather than quietly trust a shape it cannot read. `recorded-failure`
     and `ok-not-boolean` are the two ways `ok` can be anything but literally
     `true`; `timestamp-in-the-future` is a clock step, and trusting it would
     let an entry outlive its TTL by an arbitrary amount (D25); `timestamp-nan`
@@ -379,9 +406,19 @@ def test_a_cache_directory_this_uid_does_not_own_is_a_miss(
     `throttle.file_lock` refuses the directory before it locks anything and
     the refusal lands in the ordinary miss path: probe as before, write
     nothing, log no error.
+
+    A PERFECTLY VALID, perfectly fresh entry is planted behind the link
+    first. Without it the boot would miss on `FileNotFoundError` and the test
+    would pass for the wrong reason — proving nothing about ownership, and
+    passing just as happily if the read stopped going through `file_lock` at
+    all. With it, the only thing standing between the planted file and a
+    cache hit is the refusal.
     """
     real = tmp_path / "real-cache"
     real.mkdir(mode=0o700)
+    planted = real / "smoke-liveness.json"
+    entry = {"schema": 1, "ok": True, "at": _EPOCH}
+    planted.write_text(json.dumps(entry), encoding="utf-8")
     link = tmp_path / "linked-cache"
     link.symlink_to(real, target_is_directory=True)
     monkeypatch.setenv("INJECTION_SCANNER_CACHE_DIR", str(link))
@@ -392,7 +429,9 @@ def test_a_cache_directory_this_uid_does_not_own_is_a_miss(
     _run(fake, log)
 
     assert probe.probes == 2, "a foreign directory must never yield a hit"
-    assert list(real.iterdir()) == [], "and nothing was written through it"
+    assert "cached pass" not in log.text()
+    assert list(real.iterdir()) == [planted], "nothing was written through it"
+    assert json.loads(planted.read_text(encoding="utf-8")) == entry
     assert log.error == []
 
 
