@@ -927,3 +927,117 @@ def test_the_budget_is_shared_across_processes(tmp_path):
                 p.wait()
 
     assert sum(results) == 2, f"per-child allowances: {results}"
+
+
+# ---------------------------------------------------------------------------
+# `file_lock`'s wait budget is sanitised too (added 2026-09-06).
+#
+# `acquire` coerces and range-checks its own budget before using it —
+# non-numeric, non-finite or negative all become 0.0 — precisely because a
+# budget that survives into the arithmetic decides whether the loop can ever
+# end. `file_lock` did the same arithmetic (`deadline = clock() + wait_s`) on
+# an unsanitised value.
+#
+# NaN is the one that bites: `deadline` becomes NaN, `clock() >= deadline` is
+# False for every clock reading there will ever be, and a contended lock spins
+# at 20 polls a second forever. That is a HANG in a module whose whole contract
+# is that a wedged peer degrades to a bounded `TimeoutError` — and it hangs the
+# scan rather than failing it closed. `+inf` is the same shape by another route.
+#
+# `file_lock` is public and shared with `smoke.py`'s liveness cache, so the
+# guard belongs at the boundary rather than in each caller. Both callers today
+# pass an `env_float`-clamped value, which is why this was reachable only by a
+# new call site — the kind of footgun worth closing before it is stepped on.
+# ---------------------------------------------------------------------------
+
+
+class _CappedFake(_Fake):
+    """A `_Fake` whose `sleep` refuses to be called more than `cap` times.
+
+    An unbounded poll loop is a HANG, and a hanging test reports as a suite
+    timeout against whatever ran next. This turns it into an ordinary failure
+    at the point of the defect.
+    """
+
+    cap: int = 50
+
+    def sleep(self, seconds: float) -> None:
+        if len(self.sleeps) >= self.cap:
+            raise AssertionError(
+                f"file_lock polled {self.cap} times without reaching its "
+                "deadline — the wait budget never bounded the loop"
+            )
+        super().sleep(seconds)
+
+
+@pytest.mark.parametrize(
+    "wait_s",
+    [
+        pytest.param(float("nan"), id="nan"),
+        pytest.param(float("inf"), id="inf"),
+        pytest.param(float("-inf"), id="negative-inf"),
+        pytest.param(-5.0, id="negative"),
+        pytest.param("soon", id="non-numeric-string"),
+        pytest.param(None, id="none"),
+    ],
+)
+def test_an_unusable_lock_wait_budget_makes_one_attempt_and_gives_up(
+    tmp_path, wait_s
+):
+    """Same coercion `acquire` applies to its budget, pointing the same way:
+    an unusable value is 0.0 — one non-blocking attempt, then `TimeoutError`.
+
+    "Unusable" is exactly `acquire`'s set, which is why a NUMERIC string is
+    absent from it: `float("2")` is 2.0 and a legitimate budget, in both
+    places, deliberately.
+    """
+    lock_path = tmp_path / "cache" / "x.lock"
+    lock_path.parent.mkdir(parents=True, mode=0o700)
+    holder = os.open(str(lock_path), os.O_CREAT | os.O_RDWR, 0o600)
+    fake = _CappedFake()
+    try:
+        fcntl.flock(holder, fcntl.LOCK_EX)
+        with pytest.raises(TimeoutError):
+            with throttle.file_lock(
+                lock_path, wait_s, clock=fake.time, sleep=fake.sleep
+            ):
+                raise AssertionError("the lock was held; this must not be reached")
+        assert fake.sleeps == [], "a zeroed budget must not poll at all"
+    finally:
+        fcntl.flock(holder, fcntl.LOCK_UN)
+        os.close(holder)
+
+
+def test_a_sane_lock_wait_budget_still_waits_for_it(tmp_path):
+    """The control: sanitising the unusable values changes nothing for a real
+    budget, which still polls at 50 ms until it is spent."""
+    lock_path = tmp_path / "cache" / "x.lock"
+    lock_path.parent.mkdir(parents=True, mode=0o700)
+    holder = os.open(str(lock_path), os.O_CREAT | os.O_RDWR, 0o600)
+    fake = _CappedFake()
+    try:
+        fcntl.flock(holder, fcntl.LOCK_EX)
+        with pytest.raises(TimeoutError):
+            with throttle.file_lock(
+                lock_path, 1.0, clock=fake.time, sleep=fake.sleep
+            ):
+                pass
+        assert set(fake.sleeps) == {0.05}
+        assert abs(sum(fake.sleeps) - 1.0) < 0.1
+    finally:
+        fcntl.flock(holder, fcntl.LOCK_UN)
+        os.close(holder)
+
+
+def test_an_uncontended_lock_is_taken_whatever_the_budget_says(tmp_path):
+    """A zeroed budget is one ATTEMPT, not a refusal: the uncontended case —
+    which is every case in production — still succeeds on the first pass."""
+    lock_path = tmp_path / "cache" / "x.lock"
+    fake = _CappedFake()
+    entered = False
+    with throttle.file_lock(
+        lock_path, float("nan"), clock=fake.time, sleep=fake.sleep
+    ):
+        entered = True
+    assert entered
+    assert fake.sleeps == []

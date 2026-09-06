@@ -486,6 +486,30 @@ def file_lock(lock_path: Path, wait_s: float, *, clock=time.time, sleep=time.sle
     """
     lock_path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
     _require_own_directory(lock_path.parent)
+    # Same coercion `acquire` applies to its own budget, and it points the same
+    # way: an unusable value becomes 0.0, i.e. one non-blocking attempt and
+    # then `TimeoutError`. The budget is what BOUNDS the loop below, so a value
+    # that survives into the arithmetic decides whether the loop can end at
+    # all, and the failure is not a wrong wait — it is a hang.
+    #
+    # NaN is the case that matters. `deadline` becomes NaN, `clock() >=
+    # deadline` is False for every clock reading there will ever be, and a
+    # contended lock polls at 20/s forever — in a function whose entire
+    # contract is that a wedged peer degrades to a BOUNDED `TimeoutError`
+    # rather than hanging a scan or a boot. `+inf` is the same shape by another
+    # route, and a non-numeric value raised `TypeError` out of a context
+    # manager whose callers are written to expect `TimeoutError`.
+    #
+    # Sanitised HERE rather than in the callers because `file_lock` is public
+    # and shared: the limiter and `smoke.py`'s liveness cache both reach it,
+    # both happen to pass an `env_float`-clamped value today, and the next
+    # caller should not have to know that this arithmetic is load-bearing.
+    try:
+        wait_s = float(wait_s)
+    except (TypeError, ValueError):
+        wait_s = 0.0
+    if not math.isfinite(wait_s) or wait_s < 0.0:
+        wait_s = 0.0
     deadline = clock() + wait_s
     fd = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o600)
     try:
