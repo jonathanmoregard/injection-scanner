@@ -429,7 +429,7 @@ def test_record_success_closes_the_breaker_and_resets_the_backoff(tmp_path):
     lim.record_throttled(None)
     assert lim.acquire() is Decision.THROTTLED
 
-    lim.record_success()
+    lim.record_success(fake.now)
     assert lim.acquire() is Decision.ALLOWED
     st = _state(lim)
     assert st["failures"] == 0
@@ -438,6 +438,79 @@ def test_record_success_closes_the_breaker_and_resets_the_backoff(tmp_path):
     # Back to the BASE delay, not to where the doubling had climbed.
     lim.record_throttled(None)
     assert _open_for(lim, fake) == 10.0
+
+
+def test_a_success_issued_before_the_trip_does_not_close_the_breaker(tmp_path):
+    """The straggler, and the reason `record_success` takes a timestamp.
+
+    At the default burst the OPENING calls of an outage are in flight together
+    across the fleet: ten tokens are available, so ten processes call, and
+    their answers come back interleaved. If one of those calls happens to
+    succeed — issued BEFORE Lakera started refusing, answered after — an
+    unconditional reset would let that single straggler cancel a breaker that
+    the other nine just opened, and the fleet would walk straight back into
+    the throttle it had correctly detected.
+
+    So a success only clears what it can vouch for: the state it reports on
+    must be no older than the trip. `started_at` is the wall-clock moment the
+    call was ISSUED, which is why `lakera.check` reads it immediately after
+    `acquire` returns rather than when the response lands.
+    """
+    fake = _Fake()
+    lim = _limiter(
+        tmp_path, fake, min_interval_s=0.0, burst=10,
+        backoff_base_s=300.0, backoff_max_s=3600.0,
+    )
+    started_at = fake.now       # this call goes out while the gate is open...
+    fake.now += 0.2             # ...and is still in flight when Lakera turns
+    for _ in range(7):          # ...as seven peers collect their 429s
+        lim.record_throttled(None)
+
+    st = _state(lim)
+    assert st["failures"] == 7
+    open_until = st["open_until"]
+    assert open_until > fake.now, "the breaker really is shut"
+
+    lim.record_success(started_at)
+
+    st = _state(lim)
+    assert st["failures"] == 7, "a straggler must not reset the backoff"
+    assert st["open_until"] == open_until, "nor reopen the gate"
+    assert lim.acquire() is Decision.THROTTLED
+
+
+def test_a_success_issued_after_the_trip_closes_the_breaker(tmp_path):
+    """The half-open probe, which is the whole point of reopening: a call
+    issued after the trip DOES report on the current state, so it clears."""
+    fake = _Fake()
+    lim = _limiter(
+        tmp_path, fake, min_interval_s=0.0, burst=10,
+        backoff_base_s=300.0, backoff_max_s=3600.0,
+    )
+    lim.record_throttled(None)
+    assert _state(lim)["failures"] == 1
+
+    fake.now += 400.0           # the breaker's own delay elapses
+    started_at = fake.now       # the probe is issued after the trip
+    fake.now += 0.2
+    lim.record_success(started_at)
+
+    st = _state(lim)
+    assert st["failures"] == 0
+    assert st["open_until"] == 0.0
+    assert lim.acquire() is Decision.ALLOWED
+
+
+def test_a_success_on_a_never_tripped_limiter_is_a_harmless_no_op(tmp_path):
+    """Fresh state has no trip to be older than, so the ordinary case — a 200
+    on a fleet that was never throttled — neither raises nor writes nonsense."""
+    fake = _Fake()
+    lim = _limiter(tmp_path, fake, min_interval_s=0.0, burst=1)
+    lim.record_success(fake.now)
+    assert lim.acquire() is Decision.ALLOWED
+    st = _state(lim)
+    assert st["failures"] == 0
+    assert st["open_until"] == 0.0
 
 
 def test_the_breaker_half_opens_with_one_probe_not_a_herd(tmp_path):
@@ -491,7 +564,7 @@ def test_normal_refill_resumes_once_a_success_closes_the_breaker(tmp_path):
     )
     lim.record_throttled(None)
     assert lim.acquire() is Decision.THROTTLED
-    lim.record_success()                           # the probe got through
+    lim.record_success(fake.now)                   # the probe got through
 
     assert lim.acquire() is Decision.ALLOWED       # the capped token, spent
     assert lim.acquire() is Decision.THROTTLED
@@ -532,6 +605,7 @@ def test_a_breaker_parked_beyond_the_cap_reopens_on_its_own(tmp_path):
                 "updated_at": fake.now,
                 "open_until": fake.now + 30 * 86400.0,   # thirty days out
                 "failures": 1,
+                "tripped_at": fake.now,
             }
         ),
         encoding="utf-8",
@@ -584,16 +658,18 @@ def test_a_shorter_retry_after_never_shrinks_an_already_open_breaker(tmp_path):
         '"open_until": 9999999999.0, "failures": 7}',
         '{"schema": 1, "tokens": "lots"}',
         '{"schema": 1, "tokens": NaN, "updated_at": 0.0, '
-        '"open_until": 0.0, "failures": 0}',
+        '"open_until": 0.0, "failures": 0, "tripped_at": 0.0}',
         '{"schema": 1, "tokens": 0.0, "updated_at": 0.0, '
-        '"open_until": NaN, "failures": 0}',
+        '"open_until": NaN, "failures": 0, "tripped_at": 0.0}',
         '{"schema": 1, "tokens": 0.0, "updated_at": 0.0, '
-        '"open_until": Infinity, "failures": 0}',
+        '"open_until": Infinity, "failures": 0, "tripped_at": 0.0}',
+        '{"schema": 1, "tokens": 0.0, "updated_at": 0.0, '
+        '"open_until": 9999999999.0, "failures": 7}',
     ],
     ids=[
         "empty", "truncated", "null", "array", "garbage",
         "foreign-schema", "wrong-type", "nan-tokens",
-        "nan-open-until", "inf-open-until",
+        "nan-open-until", "inf-open-until", "missing-tripped-at",
     ],
 )
 def test_an_unusable_state_file_is_a_reset_not_an_error(tmp_path, blob):
@@ -614,7 +690,11 @@ def test_an_unusable_state_file_is_a_reset_not_an_error(tmp_path, blob):
 
     The foreign-schema case carries an `open_until` far in the future AND
     `failures: 7` on purpose: a breaker this limiter cannot read must be able
-    neither to park it nor to hand it a backoff it never earned.
+    neither to park it nor to hand it a backoff it never earned. The
+    missing-field case is the same file WITHOUT `tripped_at`: every field is
+    required, so a file that predates one is a reset rather than a state with
+    a guessed default — a `tripped_at` defaulted to 0 would mark a genuinely
+    open breaker as never tripped and let the next stale success clear it.
     """
     fake = _Fake()
     lim = _limiter(tmp_path, fake, min_interval_s=10.0, burst=3)
@@ -628,6 +708,7 @@ def test_an_unusable_state_file_is_a_reset_not_an_error(tmp_path, blob):
     assert st["tokens"] == 2.0
     assert st["open_until"] == 0.0, "a breaker that cannot be read is CLOSED"
     assert st["failures"] == 0
+    assert st["tripped_at"] == 0.0
 
 
 def test_an_unusable_state_directory_is_an_error_and_never_raises(tmp_path):
@@ -650,7 +731,45 @@ def test_an_unusable_state_directory_is_an_error_and_never_raises(tmp_path):
     # The recorders swallow their own errors — a broken limiter must not
     # become an exception in the middle of a fail-closed result.
     lim.record_throttled("30")
-    lim.record_success()
+    lim.record_success(fake.now)
+
+
+def test_a_symlinked_state_directory_is_an_error_and_writes_nothing(tmp_path):
+    """The state directory must be a REAL directory that this uid owns.
+
+    `mkdir(exist_ok=True)` accepts whatever is already there, and the
+    fallback directory lives under a world-writable temp dir, so "already
+    there" can be somebody else's: a symlink pointing the limiter's writes
+    into a directory of their choosing, or a pre-made 0777 directory they can
+    also write. Either one turns the fleet's shared budget into an object
+    another user controls — they could hold the breaker open (a denial of the
+    scanner) or keep it closed (the storm this module prevents).
+
+    `lstat` is the check, so the symlink is seen rather than followed. The
+    refusal is an ordinary limiter failure: `ERROR`, which `lakera.check`
+    renders as the fail-closed `limiter-error`.
+    """
+    real = tmp_path / "real-state"
+    real.mkdir(mode=0o700)
+    link = tmp_path / "linked-state"
+    link.symlink_to(real, target_is_directory=True)
+
+    fake = _Fake()
+    lim = CrossProcessLimiter(
+        link,
+        LimiterConfig(
+            min_interval_s=0.0, burst=1, backoff_base_s=30.0,
+            backoff_max_s=600.0, lock_wait_s=2.0,
+        ),
+        clock=fake.time,
+        sleep=fake.sleep,
+    )
+    assert lim.acquire() is Decision.ERROR
+    assert list(real.iterdir()) == [], "nothing was written through the link"
+    # And the recorders stay total, as on every other broken-limiter path.
+    lim.record_throttled("30")
+    lim.record_success(fake.now)
+    assert list(real.iterdir()) == []
 
 
 def test_a_lock_held_past_the_wait_budget_is_an_error(tmp_path):
@@ -741,7 +860,7 @@ def test_a_failed_write_leaves_the_previous_state_intact(tmp_path, monkeypatch):
     # Fail-closed rather than raising, and the recorders swallow their own.
     assert lim.acquire() is Decision.ERROR
     lim.record_throttled("30")
-    lim.record_success()
+    lim.record_success(fake.now)
 
     assert lim.state_path.read_bytes() == before, (
         "a failed write must not damage the state that was already there"

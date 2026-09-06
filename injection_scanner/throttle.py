@@ -24,6 +24,17 @@ comparable across processes, and this state is read by processes that did not
 exist when it was written. A clock that steps BACKWARDS is handled by clamping
 elapsed at zero, so a step can delay calls but can never mint tokens.
 
+A 429 or 503 opens the breaker and a 200 closes it — but NOT every 200. At the
+default burst the OPENING calls of an outage are in flight together across the
+fleet, so a call issued while Lakera was still answering can land after its
+peers have already collected their 429s and shut the gate. Letting that
+straggler reset the breaker would cancel a decision nine other processes just
+made and walk the fleet straight back into the throttle it had correctly
+detected. So the state carries `tripped_at`, `record_success` takes the moment
+its own call was ISSUED, and a success older than the trip is ignored.
+`lakera.check` reads that moment immediately after `acquire` returns, off the
+same wall clock this module writes.
+
 Fail-closed, like every other layer. The three outcomes are `ALLOWED`,
 `THROTTLED` (bucket empty or breaker open beyond the caller's wait budget) and
 `ERROR` (the limiter itself is unusable — unwritable directory, lock wait
@@ -71,6 +82,7 @@ import fcntl
 import json
 import math
 import os
+import stat
 import tempfile
 import time
 from dataclasses import dataclass
@@ -244,6 +256,10 @@ def cache_dir() -> Path:
     aborts. Paired with `lakera.check`, which wraps the `from_env()` +
     `acquire()` pair so even a failure here fails the report closed rather
     than crashing the scan.
+
+    The per-uid NAME does not by itself make the directory private — anyone
+    can create it first under a world-writable temp dir — so ownership is
+    verified before every use, in `_require_own_directory`.
     """
     try:
         raw = os.environ.get(ENV_CACHE_DIR)
@@ -327,6 +343,12 @@ class _State:
     updated_at: float
     open_until: float
     failures: int
+
+    tripped_at: float
+    """When the breaker was last opened or extended. `record_success`
+    compares the moment ITS call was issued against this, so a straggler
+    answered after the trip cannot clear a breaker it predates. 0.0 means
+    never tripped, which makes every success on a healthy fleet count."""
 
 
 def _parse_retry_after(value: object, now: float) -> float | None:
@@ -456,20 +478,50 @@ class CrossProcessLimiter:
         except Exception:  # noqa: BLE001 — see the docstring
             return Decision.ERROR
 
-    def record_success(self) -> None:
-        """Called on any HTTP 200, flagged or not.
+    def record_success(self, started_at: float) -> None:
+        """Called on any HTTP 200, flagged or not, by the caller that got it.
 
         A 200 means the account is evidently not throttling us, so the breaker
-        closes and the consecutive-failure count resets. Swallows its own
-        errors: if the state cannot be written, the next `acquire` fails the
-        same way and refuses.
+        closes and the consecutive-failure count resets — provided this call
+        can actually vouch for the present. `started_at` is the wall-clock
+        instant the call was ISSUED (the caller reads the clock right after
+        `acquire` returns `ALLOWED`), and a success that STARTED before the
+        breaker tripped is discarded.
+
+        Without that rule one straggler undoes the fleet's whole decision. At
+        the default burst ten processes call at once; when Lakera turns, their
+        429s arrive and shut the gate while an earlier call is still in
+        flight, and its 200 — describing a Lakera that no longer exists —
+        would reset `failures` and `open_until` outright. Measured on the
+        pre-fix code: seven `record_throttled` calls (failures=7, shut for
+        3600 s) followed by one stale `record_success` left failures=0 and the
+        gate wide open. Pinned by
+        tests/test_throttle.py::test_a_success_issued_before_the_trip_does_not_close_the_breaker
+        and its `_after_` twin, which keeps the half-open probe working.
+
+        Swallows its own errors: if the state cannot be written, the next
+        `acquire` fails the same way and refuses.
         """
         try:
+            # Same coercion `acquire` applies to its budget, and the fallback
+            # points the same way: an unusable timestamp reads as the epoch,
+            # i.e. older than any trip, so it is DISCARDED rather than allowed
+            # to clear a breaker it cannot describe.
+            try:
+                started_at = float(started_at)
+            except (TypeError, ValueError):
+                started_at = 0.0
+            if not math.isfinite(started_at):
+                started_at = 0.0
+
             with self._locked():
                 now = self._clock()
                 st = self._load(now)
+                if started_at < st.tripped_at:
+                    return
                 st.failures = 0
                 st.open_until = 0.0
+                st.tripped_at = 0.0
                 self._save(st)
         except Exception:  # noqa: BLE001 — see the docstring
             return
@@ -498,6 +550,11 @@ class CrossProcessLimiter:
                     delay = 0.0
                 delay = min(delay, self._config.backoff_max_s)
                 st.open_until = max(st.open_until, now + delay)
+                # The instant the fleet learned it was being refused. Every
+                # throttle refreshes it, so a success must have been issued
+                # after the MOST RECENT trip to be allowed to clear it — see
+                # `record_success`.
+                st.tripped_at = now
                 # Cap the bucket at a single token, so that what comes out the
                 # far side of the outage is a PROBE and not a herd. Without
                 # this a full default bucket (ten) is still sitting there when
@@ -595,6 +652,7 @@ class CrossProcessLimiter:
         fail-closed reject) rather than hanging a scan forever.
         """
         self._state_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+        self._require_own_directory()
         deadline = self._clock() + self._config.lock_wait_s
         fd = os.open(self._lock_path, os.O_CREAT | os.O_RDWR, 0o600)
         try:
@@ -615,12 +673,46 @@ class CrossProcessLimiter:
         finally:
             os.close(fd)
 
+    def _require_own_directory(self) -> None:
+        """Refuse a state directory this uid does not own.
+
+        `mode=0o700` on `mkdir` applies only when THIS process creates the
+        directory; `exist_ok=True` accepts whatever is already at the path.
+        And the path is not always private: with no home directory the default
+        falls back under the system temp dir, which is world-writable, so
+        another user can get there first. Two shapes matter, and `lstat`
+        catches both because it does not follow the link:
+
+          * a SYMLINK, which redirects every state write to a directory of
+            their choosing;
+          * a directory owned by someone else (0777 or otherwise), which they
+            can also write.
+
+        Either turns the fleet's shared budget into an object a third party
+        controls — they could hold the breaker open and deny the scanner, or
+        keep it closed and restore the storm this module exists to stop. It is
+        also the one place attacker-influenced state could re-enter the
+        limiter, so the answer is to refuse, not to repair.
+
+        Raises, and every caller reaches this inside `acquire`'s guard or a
+        recorder's, so the outcome is the ordinary `ERROR` -> `limiter-error`
+        fail-closed reject. Only the FINAL component is checked: a hostile
+        ancestor is beyond what a cache path can defend against and belongs to
+        whoever configured `INJECTION_SCANNER_CACHE_DIR`.
+        """
+        info = os.lstat(self._state_dir)
+        if not stat.S_ISDIR(info.st_mode):
+            raise NotADirectoryError("limiter state path is not a real directory")
+        if info.st_uid != os.getuid():
+            raise PermissionError("limiter state directory belongs to another user")
+
     def _fresh(self, now: float) -> _State:
         return _State(
             tokens=float(self._config.burst),
             updated_at=now,
             open_until=0.0,
             failures=0,
+            tripped_at=0.0,
         )
 
     def _load(self, now: float) -> _State:
@@ -642,9 +734,12 @@ class CrossProcessLimiter:
             updated_at = float(obj["updated_at"])
             open_until = float(obj["open_until"])
             failures = int(obj["failures"])
+            tripped_at = float(obj["tripped_at"])
         except (OSError, ValueError, TypeError, KeyError):
             return self._fresh(now)
-        if not all(math.isfinite(v) for v in (tokens, updated_at, open_until)):
+        if not all(
+            math.isfinite(v) for v in (tokens, updated_at, open_until, tripped_at)
+        ):
             return self._fresh(now)
         return _State(
             tokens=min(max(tokens, 0.0), float(self._config.burst)),
@@ -661,6 +756,13 @@ class CrossProcessLimiter:
             # value `record_throttled` legitimately stores.
             open_until=min(open_until, now + self._config.backoff_max_s),
             failures=max(failures, 0),
+            # A trip cannot have happened in the future. A backwards clock
+            # would otherwise leave `tripped_at` ahead of every timestamp any
+            # caller can report, so every success would read as stale and the
+            # breaker would need a human to clear it. Clamping here is a no-op
+            # for every value `record_throttled` legitimately writes, exactly
+            # like the `open_until` cap above.
+            tripped_at=min(tripped_at, now),
         )
 
     def _save(self, st: _State) -> None:
@@ -681,7 +783,7 @@ class CrossProcessLimiter:
         umask is in force, so it does not depend on this module having been
         the one to create the 0o700 directory around it.
 
-        Only the five fields below are written; the payload is built by NAMING
+        Only the fields below are written; the payload is built by NAMING
         them, so a field added to `_State` tomorrow is invisible until it is
         added here on purpose.
         """
@@ -691,6 +793,7 @@ class CrossProcessLimiter:
             "updated_at": st.updated_at,
             "open_until": st.open_until,
             "failures": st.failures,
+            "tripped_at": st.tripped_at,
         }
         tmp = self._state_path.parent / (self._state_path.name + ".tmp")
         fd = os.open(tmp, os.O_CREAT | os.O_WRONLY | os.O_TRUNC, 0o600)

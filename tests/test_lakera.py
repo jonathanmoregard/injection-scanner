@@ -10,12 +10,15 @@ reason / categories strings.
 from __future__ import annotations
 
 import io
+import json
+from http.client import HTTPMessage
 from urllib.error import HTTPError, URLError
 
 import pytest
 
-from injection_scanner import keyloader, lakera
+from injection_scanner import keyloader, lakera, throttle
 from injection_scanner.intercept import scan_text
+from injection_scanner.throttle import CrossProcessLimiter, Decision, LimiterConfig
 
 # Env vars that influence key resolution / endpoint / timeout. Cleared before
 # every test so the host environment can't leak a real key into a unit run.
@@ -246,6 +249,23 @@ def test_input_text_never_leaks(monkeypatch):
 _SERVER_TEXT_MARKER = "SERVER_SUPPLIED_TEXT_KEEPOUT_31337"
 
 
+def _headers(fields: dict[str, str]) -> HTTPMessage:
+    """Response headers exactly as `urllib` builds them.
+
+    NOT a plain dict, deliberately. A dict satisfies the `.get("Retry-After")`
+    in `lakera._retry_after` and would make these fixtures pass, but real
+    `HTTPError.headers` is an `http.client.HTTPMessage`, whose lookup is
+    CASE-INSENSITIVE — as RFC 9110 requires and as real servers vary. A
+    dict-based fixture therefore cannot tell a correct lookup from one that
+    silently depends on the server capitalising the way we guessed, which is
+    the bug it would be there to catch.
+    """
+    msg = HTTPMessage()
+    for name, value in fields.items():
+        msg[name] = value
+    return msg
+
+
 def _http_error(code, msg: str = "Too Many Requests", body: bytes = b"") -> HTTPError:
     """A realistic `urllib.error.HTTPError`, exactly as `_post` would raise.
 
@@ -256,7 +276,7 @@ def _http_error(code, msg: str = "Too Many Requests", body: bytes = b"") -> HTTP
         "https://api.lakera.ai/v2/guard",
         code,
         msg,
-        {"X-Detail": _SERVER_TEXT_MARKER},  # type: ignore[arg-type]
+        _headers({"X-Detail": _SERVER_TEXT_MARKER}),  # type: ignore[arg-type]
         io.BytesIO(body),
     )
 
@@ -454,12 +474,6 @@ def test_scan_text_surfaces_the_http_status_without_server_text(monkeypatch):
 #   * the `Retry-After` header is server-supplied TEXT — it decides a number
 #     inside the limiter and reaches neither the reason nor the state file.
 
-import json as _json_mod
-
-from injection_scanner import throttle
-from injection_scanner.throttle import CrossProcessLimiter, Decision, LimiterConfig
-
-
 def _state_file():
     return throttle.cache_dir() / "lakera-throttle.json"
 
@@ -471,14 +485,14 @@ class _SpyLimiter:
         self.decision = decision
         self.acquired: list[float] = []
         self.throttled: list[object] = []
-        self.successes = 0
+        self.successes: list[float] = []
 
     def acquire(self, max_wait_s: float = 0.0) -> Decision:
         self.acquired.append(max_wait_s)
         return self.decision
 
-    def record_success(self) -> None:
-        self.successes += 1
+    def record_success(self, started_at: float) -> None:
+        self.successes.append(started_at)
 
     def record_throttled(self, retry_after) -> None:
         self.throttled.append(retry_after)
@@ -623,7 +637,7 @@ def test_a_hostile_retry_after_reaches_neither_the_reason_nor_the_state(monkeypa
         "https://api.lakera.ai/v2/guard",
         429,
         f"Too Many Requests {_SERVER_TEXT_MARKER}",
-        {"Retry-After": hostile, "X-Detail": _SERVER_TEXT_MARKER},  # type: ignore[arg-type]
+        _headers({"Retry-After": hostile, "X-Detail": _SERVER_TEXT_MARKER}),  # type: ignore[arg-type]
         io.BytesIO(f'{{"error": "{_SERVER_TEXT_MARKER}"}}'.encode()),
     )
 
@@ -665,7 +679,7 @@ def test_a_flagged_two_hundred_still_closes_the_breaker(monkeypatch):
     )
     seed.record_throttled(None)
     seed.record_throttled(None)
-    assert _json_mod.loads(seed.state_path.read_text(encoding="utf-8"))["failures"] == 2
+    assert json.loads(seed.state_path.read_text(encoding="utf-8"))["failures"] == 2
 
     monkeypatch.setattr(
         lakera, "_post",
@@ -676,9 +690,49 @@ def test_a_flagged_two_hundred_still_closes_the_breaker(monkeypatch):
     )
     res = lakera.check("attack text")
     assert res.reason == "lakera:prompt_attack"
-    st = _json_mod.loads(seed.state_path.read_text(encoding="utf-8"))
+    st = json.loads(seed.state_path.read_text(encoding="utf-8"))
     assert st["failures"] == 0
     assert st["open_until"] == 0.0
+
+
+def test_a_two_hundred_that_raced_a_trip_does_not_reopen_the_gate(monkeypatch):
+    """The straggler race, end to end through `check`.
+
+    At the default burst the fleet's calls go out together, so a call issued
+    while Lakera was still answering can land AFTER peers have collected their
+    429s and shut the breaker. `check` therefore reports the moment its call
+    was ISSUED — read immediately after `acquire` returns — and the limiter
+    ignores a success older than the trip.
+
+    Staged by having `_post` itself trip the breaker through a peer handle
+    before returning its 200, which is exactly the interleaving the fleet
+    produces and the one an unconditional reset gets wrong.
+    """
+    _with_key(monkeypatch)
+    monkeypatch.setenv("INJECTION_SCANNER_LAKERA_BACKOFF_MAX_S", "600")
+    peer = CrossProcessLimiter(
+        throttle.cache_dir(),
+        LimiterConfig(
+            min_interval_s=0.0, burst=10, backoff_base_s=300.0,
+            backoff_max_s=600.0, lock_wait_s=2.0,
+        ),
+    )
+
+    def _post_that_races_a_peer(*_a, **_kw):
+        # A peer process meets the throttle while THIS call is in flight.
+        peer.record_throttled(None)
+        return {
+            "flagged": False,
+            "breakdown": [{"detector_type": "prompt_attack", "detected": False}],
+        }
+
+    monkeypatch.setattr(lakera, "_post", _post_that_races_a_peer)
+    assert lakera.check("x").ok is True, "this call really did get a clean 200"
+
+    st = json.loads(peer.state_path.read_text(encoding="utf-8"))
+    assert st["failures"] == 1, "the straggler's 200 must not reset the backoff"
+    assert st["open_until"] > 0.0, "nor reopen a breaker it cannot vouch for"
+    assert lakera.check("y").reason == "lakera_unavailable:throttled"
 
 
 def test_the_max_wait_keyword_reaches_the_limiter(monkeypatch):
@@ -707,15 +761,24 @@ def test_an_absent_max_wait_falls_back_to_the_environment(monkeypatch):
     assert spy.acquired == [42.0]
 
 
-def test_the_raw_retry_after_header_is_handed_to_the_limiter_verbatim(monkeypatch):
+@pytest.mark.parametrize("header_name", ["Retry-After", "retry-after", "RETRY-AFTER"])
+def test_the_raw_retry_after_header_is_handed_to_the_limiter_verbatim(
+    monkeypatch, header_name
+):
     """It has to be, and that is safe: the limiter is the only thing that ever
-    looks at it, and it turns the string into a clamped float."""
+    looks at it, and it turns the string into a clamped float.
+
+    Parametrised over the CAPITALISATION because header field names are
+    case-insensitive (RFC 9110) and real servers differ. The lookup must find
+    the header whatever Lakera or an intermediary sends; a spelling-sensitive
+    one would silently skip the breaker's own backoff hint.
+    """
     _with_key(monkeypatch)
     spy = _SpyLimiter(Decision.ALLOWED)
     _install_spy(monkeypatch, spy)
     exc = HTTPError(
         "https://api.lakera.ai/v2/guard", 429, "Too Many Requests",
-        {"Retry-After": "17"},  # type: ignore[arg-type]
+        _headers({header_name: "17"}),  # type: ignore[arg-type]
         io.BytesIO(b""),
     )
 
@@ -725,7 +788,7 @@ def test_the_raw_retry_after_header_is_handed_to_the_limiter_verbatim(monkeypatc
     monkeypatch.setattr(lakera, "_post", _boom)
     assert lakera.check("x").reason == "lakera_unavailable:HTTPError:429"
     assert spy.throttled == ["17"]
-    assert spy.successes == 0
+    assert spy.successes == []
 
 
 def test_a_missing_retry_after_header_is_none_not_a_crash(monkeypatch):
@@ -752,7 +815,7 @@ def test_a_non_http_failure_leaves_the_breaker_alone(monkeypatch):
     monkeypatch.setattr(lakera, "_post", _boom)
     assert lakera.check("x").reason == "lakera_unavailable:URLError"
     assert spy.throttled == []
-    assert spy.successes == 0
+    assert spy.successes == []
 
 
 def test_a_rebound_status_code_cannot_decide_to_stop_the_fleet(monkeypatch):

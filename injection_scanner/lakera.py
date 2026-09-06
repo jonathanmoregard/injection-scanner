@@ -27,6 +27,20 @@ never any fragment of the scanned input, and never a stringified exception
 attacker-shaped bytes we sent). See `_transport_reason` for why the status
 code is on the safe side of that line.
 
+Every call is PACED. `check` is the only function in the package that talks to
+Lakera, and the whole fleet — a research-agent server per Claude Code pane, CI,
+local eval runs — shares one account, which it collectively pushed into HTTP
+429 for hours on 2026-09-05. So each call first spends a token from
+`throttle.CrossProcessLimiter`: a token bucket plus a circuit breaker held in
+one file under the cache directory, shared by every process on the machine. Key
+resolution runs BEFORE the limiter, so a call that cannot happen (no key, a
+botched `*_FILE` mount) spends nothing and cannot starve the panes that work.
+Two reasons come out of it, both fail-closed like every other outage and both
+fixed literals: `lakera_unavailable:throttled` when the budget is exhausted or
+the breaker is open, and `lakera_unavailable:limiter-error` when the limiter
+itself cannot keep state. A 429 or 503 from Lakera opens the breaker
+fleet-wide; any HTTP 200 closes it.
+
 No new dependency: the POST is issued with stdlib urllib.request, isolated in
 `_post` so tests can monkeypatch it and never touch the network.
 """
@@ -34,6 +48,7 @@ from __future__ import annotations
 
 import json
 import os
+import time
 import urllib.error
 import urllib.request
 from dataclasses import dataclass, field
@@ -221,11 +236,20 @@ def check(text: str, *, max_wait_s: float | None = None) -> LakeraResult:
     # `lakera.check` — so an exception escaping here would abort the whole
     # scan instead of rejecting one report. Both halves therefore collapse to
     # the same fail-closed reason.
+    started_at = 0.0
     try:
         limiter = CrossProcessLimiter.from_env()
         if max_wait_s is None:
             max_wait_s = default_max_wait_s()
         decision = limiter.acquire(max_wait_s)
+        # The moment this call is ISSUED, off the same wall clock the limiter
+        # writes into its state file. Read HERE, not when the response lands:
+        # a 200 may come back after peers have already shut the breaker, and
+        # `record_success` discards a success older than the trip so that one
+        # straggler cannot cancel the fleet's decision. Read after `acquire`
+        # rather than before it because a waiting `acquire` can block for
+        # minutes, and the call did not start until it returned.
+        started_at = time.time()
     except Exception:  # noqa: BLE001 — see the comment above; fails CLOSED
         decision = Decision.ERROR
     if decision is Decision.THROTTLED:
@@ -271,6 +295,13 @@ def check(text: str, *, max_wait_s: float | None = None) -> LakeraResult:
         # because Lakera is down. Either way the whole fleet should hold off,
         # not just this process — which is what `record_throttled` arranges.
         # The header goes straight into the limiter and nowhere else.
+        #
+        # Outside the try/except above, deliberately: Task 1's recorders are
+        # TOTAL by contract — they swallow their own errors, precisely so a
+        # broken limiter cannot raise in the middle of a fail-closed result.
+        # Pinned by tests/test_throttle.py::
+        # test_an_unusable_state_directory_is_an_error_and_never_raises and
+        # ::test_a_failed_write_leaves_the_previous_state_intact.
         if _breaker_code(e) in (429, 503):
             limiter.record_throttled(_retry_after(e))
         # Exception TYPE (+ bounded HTTP status) only — never str(e). Some
@@ -283,7 +314,10 @@ def check(text: str, *, max_wait_s: float | None = None) -> LakeraResult:
     # the account is evidently not throttling us, so the breaker closes and
     # the consecutive-failure count resets. Recorded here rather than in each
     # parse branch — one call site, and a future branch cannot forget it.
-    limiter.record_success()
+    # `started_at` is what lets the limiter tell this from a straggler whose
+    # 200 predates a trip. Unguarded for the same reason as the recorder
+    # above: total by contract, pinned by the same two tests.
+    limiter.record_success(started_at)
 
     # Parse defensively: a malformed / unexpected response shape must not
     # fail-open. Any parse error collapses to a fail-closed reject with only
