@@ -49,6 +49,7 @@ from __future__ import annotations
 
 import json
 import math
+import os
 import tempfile
 import time
 from dataclasses import dataclass
@@ -193,6 +194,14 @@ def _cached_liveness_age(now: float) -> float | None:
     refuses it, which lands in the guard below. Somebody else's file must not
     be able to suppress the fleet's vendor probe.
 
+    So is a SYMLINK at the entry's own fixed name, which the directory check
+    does not cover: `Path.read_text` follows one, so any file this uid can read
+    could be presented as the fleet's liveness claim, and a plausible
+    `{"ok": true}` anywhere on the box would suppress the probe. The read
+    therefore goes through `os.open(..., O_RDONLY | O_NOFOLLOW)`; the link
+    raises `ELOOP`, which the guard below turns into a miss like every other
+    unusable shape.
+
     THE WHOLE PARSE sits inside that one total guard, deliberately, rather
     than behind a tuple of expected exception types. The file is untrusted
     input, and naming the exceptions it may provoke is a list nobody can keep
@@ -218,7 +227,10 @@ def _cached_liveness_age(now: float) -> float | None:
         # and holding one across it would make every peer wait on this
         # process's arithmetic.
         with throttle.file_lock(lock_path, _liveness_lock_wait_s()):
-            obj = json.loads(state_path.read_text(encoding="utf-8"))
+            fd = os.open(state_path, os.O_RDONLY | os.O_NOFOLLOW)
+            with os.fdopen(fd, "r", encoding="utf-8") as fh:
+                raw = fh.read()
+        obj = json.loads(raw)
         if not isinstance(obj, dict) or obj.get("schema") != _LIVENESS_SCHEMA:
             return None
         if obj.get("ok") is not True:

@@ -1086,3 +1086,95 @@ def test_explicit_comparison_is_unaffected():
     assert Decision.ALLOWED != Decision.THROTTLED
     assert Decision("throttled") is Decision.THROTTLED
     assert len([d for d in Decision if d is not Decision.ALLOWED]) == 2
+
+
+# ---------- the fixed-name files are opened WITHOUT following a link --------
+#
+# Two halves of one hazard, and neither is enough on its own.
+#
+# `os.open` of a FIXED name (`<name>-throttle.lock`, `<name>-throttle.json.tmp`)
+# followed a symlink planted at that name. The tmp open carries `O_TRUNC`, so
+# whatever the link pointed at was truncated to zero and then filled with the
+# limiter's JSON — an arbitrary-file clobber restricted only to what this uid
+# can write, i.e. the user's own dotfiles, keys and mounted secrets.
+#
+# And planting the link had to be POSSIBLE, which is the second half:
+# `_require_own_directory` trusted a directory this uid owns "whatever its
+# mode", so a 0777 state directory — the fallback under a world-writable temp
+# dir, or one an earlier umask left wide — let any local user drop the link in.
+# Ownership alone is not a boundary when the mode invites everyone in.
+#
+# Sticky (`/tmp`-style, 0o1777) is the documented exception: a sticky directory
+# is the ancestor the tempdir fallback lives UNDER, and only the owner can
+# unlink or rename another's entry there. The per-uid state directory this
+# module creates is 0o700 and unaffected either way.
+
+_CANARY = "canary bytes that must survive\n"
+
+
+def test_a_symlinked_lock_file_is_an_error(tmp_path):
+    """The lock is `os.open`ed by a fixed name inside the state directory. A
+    link there put the fleet's flock on someone else's inode."""
+    fake = _Fake()
+    lim = _limiter(tmp_path, fake, min_interval_s=0.0)
+    canary = tmp_path / "canary.txt"
+    canary.write_text(_CANARY, encoding="utf-8")
+    lim.lock_path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    lim.lock_path.symlink_to(canary)
+
+    assert lim.acquire() is Decision.ERROR
+    assert canary.read_text(encoding="utf-8") == _CANARY
+    assert lim.lock_path.is_symlink(), "the link was neither followed nor replaced"
+
+
+def test_a_symlinked_tmp_file_is_an_error_and_truncates_nothing(tmp_path):
+    """`O_TRUNC` through a planted link is the file-clobber primitive."""
+    fake = _Fake()
+    lim = _limiter(tmp_path, fake, min_interval_s=0.0)
+    canary = tmp_path / "canary.txt"
+    canary.write_text(_CANARY, encoding="utf-8")
+    tmp_link = lim.state_path.parent / (lim.state_path.name + ".tmp")
+    tmp_link.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    tmp_link.symlink_to(canary)
+
+    assert lim.acquire() is Decision.ERROR
+    assert canary.read_text(encoding="utf-8") == _CANARY
+    # And the recorders stay total on this path like every other broken one.
+    lim.record_throttled("30")
+    lim.record_success(fake.now)
+    assert canary.read_text(encoding="utf-8") == _CANARY
+
+
+@pytest.mark.parametrize("mode", [0o777, 0o770, 0o707])
+def test_a_group_or_world_writable_state_directory_is_an_error(tmp_path, mode):
+    """Ownership was the whole check, so a widened mode passed — and a mode
+    anyone can write is exactly how the links above get planted."""
+    state = tmp_path / "state"
+    state.mkdir(mode=0o700)
+    fake = _Fake()
+    lim = _limiter(tmp_path, fake, min_interval_s=0.0)
+    assert lim.acquire() is Decision.ALLOWED, "0700 is the ordinary case"
+
+    os.chmod(state, mode)
+    try:
+        assert lim.acquire() is Decision.ERROR
+    finally:
+        os.chmod(state, 0o700)
+    assert lim.acquire() is Decision.ALLOWED, "and it recovers when narrowed"
+
+
+def test_a_sticky_world_writable_directory_is_still_usable(tmp_path):
+    """The control: `/tmp` itself is 0o1777, and only an entry's owner can
+    unlink or rename it there. Refusing sticky would break the documented
+    tempdir fallback for no gain."""
+    state = tmp_path / "state"
+    state.mkdir(mode=0o700)
+    fake = _Fake()
+    lim = _limiter(tmp_path, fake, min_interval_s=0.0)
+    assert lim.acquire() is Decision.ALLOWED
+
+    os.chmod(state, 0o1777)
+    try:
+        assert lim.acquire() is Decision.ALLOWED
+    finally:
+        os.chmod(state, 0o700)

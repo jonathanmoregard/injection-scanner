@@ -524,3 +524,34 @@ def test_the_clock_keyword_is_optional(probe, ttl):
 
     smoke.run_smoke()
     assert probe.probes == 2
+
+
+def test_a_symlinked_cache_entry_is_a_miss(probe, cache_file, tmp_path, ttl):
+    """The ENTRY itself is a link, not the directory around it.
+
+    `_require_own_directory` guards the directory, and the previous test
+    proves it; nothing guarded the fixed name inside it. `Path.read_text`
+    follows a link, so any file this uid can read could be presented as the
+    fleet's liveness claim — and a plausible-looking `{"ok": true}` anywhere
+    on the box would then suppress the vendor probe. The read goes through
+    `O_NOFOLLOW` now, so the link is a miss like every other unusable shape.
+
+    A perfectly valid, perfectly fresh entry sits behind the link, so the only
+    thing between it and a cache hit is the refusal to follow.
+    """
+    ttl(3600)
+    planted = tmp_path / "planted-liveness.json"
+    entry = {"schema": 1, "ok": True, "at": _EPOCH}
+    planted.write_text(json.dumps(entry), encoding="utf-8")
+    cache_file.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    cache_file.symlink_to(planted)
+
+    fake, log = _Fake(), _Log()
+    _run(fake, log)
+
+    assert probe.probes == 1, "a linked entry must never yield a hit"
+    assert "cached pass" not in log.text()
+    assert log.error == []
+    assert json.loads(planted.read_text(encoding="utf-8")) == entry, (
+        "and the recorded pass was not written through the link either"
+    )

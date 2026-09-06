@@ -450,14 +450,24 @@ def _require_own_directory(state_dir: Path) -> None:
     own safe default — the limiter's `ERROR` -> `limiter-error` fail-closed
     reject, the liveness cache's "miss, probe as before".
 
-    What is checked is OWNERSHIP, not permissions: a directory this uid owns
-    is trusted whatever its mode. `mkdir(mode=0o700)` makes that safe for a
-    directory this module created, but `exist_ok=True` accepts a pre-existing
-    one, so a 0777 directory the uid owns — or one whose mode a later `chmod`
-    widened — passes. Anyone able to change the mode of a directory this uid
-    owns is already inside that uid's trust boundary; the shapes worth
-    refusing are the ones a STRANGER can arrange under a world-writable temp
-    dir, and those are exactly the two above.
+    Ownership is necessary and NOT sufficient, which is the third shape:
+
+      * a directory this uid owns whose MODE grants group or world write.
+        `mkdir(mode=0o700)` applies only when this process creates it, so a
+        pre-existing directory — or one a later `chmod` widened, or one an
+        earlier permissive umask made — can be 0777 and still owned here.
+        Anyone who can write it can plant a symlink at either of the fixed
+        names inside (`<name>-throttle.lock`, `<name>-throttle.json.tmp`), and
+        the tmp open carries `O_TRUNC`. `O_NOFOLLOW` on those opens is the
+        other half of that fix; this is the half that keeps the link from
+        being plantable at all.
+
+    STICKY is the documented exception. `/tmp` is 0o1777 and is the ancestor
+    the tempdir fallback lives under, not the state directory itself (the
+    per-uid directory this module creates there is 0o700); in a sticky
+    directory only an entry's owner can unlink or rename it, which is exactly
+    the property the refusal is protecting. Refusing sticky would break the
+    fallback for no gain.
 
     Only the FINAL component is checked: a hostile ancestor is beyond what a
     cache path can defend against and belongs to whoever configured
@@ -468,6 +478,12 @@ def _require_own_directory(state_dir: Path) -> None:
         raise NotADirectoryError("cache state path is not a real directory")
     if info.st_uid != os.getuid():
         raise PermissionError("cache state directory belongs to another user")
+    widened = info.st_mode & (stat.S_IWGRP | stat.S_IWOTH)
+    if widened and not (info.st_mode & stat.S_ISVTX):
+        raise PermissionError(
+            "cache state directory is group- or world-writable without the "
+            "sticky bit"
+        )
 
 
 @contextlib.contextmanager
@@ -479,7 +495,9 @@ def file_lock(lock_path: Path, wait_s: float, *, clock=time.time, sleep=time.sle
     description, and each `os.open` makes its own. flock is released by the
     kernel when the holder dies, so there are no stale locks to reap after a
     crash. The parent directory is created `0700` if it is missing, and is then
-    refused unless this uid owns it (`_require_own_directory`).
+    refused unless this uid owns it AND its mode does not grant group or world
+    write (`_require_own_directory`). The lock itself is opened `O_NOFOLLOW`,
+    so a link planted at its fixed name is an error rather than a redirect.
 
     Two limits on that guarantee, both real and both accepted:
 
@@ -533,7 +551,14 @@ def file_lock(lock_path: Path, wait_s: float, *, clock=time.time, sleep=time.sle
     if not math.isfinite(wait_s) or wait_s < 0.0:
         wait_s = 0.0
     deadline = clock() + wait_s
-    fd = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o600)
+    # `O_NOFOLLOW`: the name is FIXED, so a link planted at it would put the
+    # fleet's flock on an inode of somebody else's choosing — and the file is
+    # created if absent, so the plant does not even have to race a writer. The
+    # link raises `ELOOP`, which is an ordinary `OSError` here: the limiter
+    # renders it `ERROR` -> `limiter-error`, the liveness cache renders it a
+    # miss. Paired with `_require_own_directory`, which is what keeps the link
+    # from being plantable, and with the same flag in `atomic_write_json`.
+    fd = os.open(lock_path, os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600)
     try:
         while True:
             try:
@@ -570,12 +595,18 @@ def atomic_write_json(path: Path, payload: dict) -> None:
 
     The file is created 0o600 explicitly rather than inheriting whatever umask
     is in force, so it does not depend on this module having been the one to
-    create the 0o700 directory around it.
+    create the 0o700 directory around it. And it is opened `O_NOFOLLOW`: the
+    tmp name is FIXED and this open carries `O_TRUNC`, so a symlink planted at
+    it was a write-anything primitive bounded only by what this uid can write
+    — the target truncated to zero, then filled with the limiter's JSON. The
+    link now raises `ELOOP`, which every caller already renders as its own
+    fail-closed default. `os.replace` needs no such flag: rename operates on
+    the link itself and never on what it points at.
 
     Shared with `smoke.py`'s liveness cache. Call it inside `file_lock`.
     """
     tmp = path.parent / (path.name + ".tmp")
-    fd = os.open(tmp, os.O_CREAT | os.O_WRONLY | os.O_TRUNC, 0o600)
+    fd = os.open(tmp, os.O_CREAT | os.O_WRONLY | os.O_TRUNC | os.O_NOFOLLOW, 0o600)
     with os.fdopen(fd, "w", encoding="utf-8") as fh:
         fh.write(json.dumps(payload))
     os.replace(tmp, path)
