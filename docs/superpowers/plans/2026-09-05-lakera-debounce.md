@@ -2,13 +2,13 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (default) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Put one cross-process token bucket plus one circuit breaker behind `lakera.check()` so the whole fleet (research-agent servers, CI, local eval) cannot collectively push Lakera Guard into HTTP 429 again, serialise and pace the two CI jobs that touch Lakera, and make `eval` abort on an outage instead of scoring it as a classification.
+**Goal:** Put one cross-process token bucket plus one circuit breaker behind `lakera.check()` so the whole fleet (research-agent servers, CI, local eval) cannot collectively push Lakera Guard into HTTP 429 again; stop the fleet spending its entire monthly quota on boot probes; take the vendor calls off the merge gate and pace the ones that remain; and make `eval` abort on an outage instead of scoring it as a classification.
 
-**Architecture:** A new stdlib-only module `injection_scanner/throttle.py` keeps a token bucket and a circuit breaker in one JSON file under `$INJECTION_SCANNER_CACHE_DIR` (default `~/.cache/injection-scanner`, the directory `selfupdate.py` already uses). Every operation is a read-modify-write under an exclusive `fcntl.flock`, so N processes share ONE budget and N does not appear in the bound. `lakera.check()` resolves the key first (a call that cannot happen spends no token), then `acquire()`s; `THROTTLED` and `ERROR` become the fail-closed reasons `lakera_unavailable:throttled` and `lakera_unavailable:limiter-error`. A 429 or 503 from Lakera opens the breaker fleet-wide; any HTTP 200 closes it. `intercept` plumbs one keyword through; `eval` gains a batch wait budget and aborts loudly on the first infra verdict; CI puts both Lakera-touching jobs in one `lakera-live` concurrency group and makes the 1-call smoke a canary for the 16-call eval.
+**Architecture:** A new stdlib-only module `injection_scanner/throttle.py` keeps a token bucket and a circuit breaker in one JSON file under `$INJECTION_SCANNER_CACHE_DIR` (default `~/.cache/injection-scanner`, the directory `selfupdate.py` already uses). Every operation is a read-modify-write under an exclusive `fcntl.flock`, so N processes share ONE budget and N does not appear in the bound. `lakera.check()` resolves the key first (a call that cannot happen spends no token), then `acquire()`s; `THROTTLED` and `ERROR` become the fail-closed reasons `lakera_unavailable:throttled` and `lakera_unavailable:limiter-error`. A 429 or 503 from Lakera opens the breaker fleet-wide; any HTTP 200 closes it. `intercept` plumbs one keyword through; `eval` gains a batch wait budget and aborts loudly on the first infra verdict. The limiter bounds the RATE but cannot reduce the DEMAND, and measurement showed the demand was mostly boot probes — so `smoke.run_smoke` gains a liveness cache in the same directory, under the same flock discipline, that trusts one passing probe fleet-wide for an hour. CI splits in two: a hermetic merge gate with no vendor call and no secret, and a nightly/on-demand live workflow whose two Lakera-touching jobs sit in one `lakera-live` concurrency group with the 1-call smoke as canary for the 16-call eval.
 
-**Tech Stack:** Python 3.12+, standard library only for the limiter (`fcntl`, `json`, `os`, `time`, `math`, `errno`, `enum`, `contextlib`, `dataclasses`, `email.utils`, `pathlib`, `datetime`). Tests: `pytest` (existing `[test]` extra), `pyyaml>=6,<7` added to that extra for the CI-relations guard only. No new runtime dependency.
+**Tech Stack:** Python 3.12+, standard library only for the limiter and the liveness cache (`fcntl`, `json`, `os`, `time`, `math`, `errno`, `enum`, `contextlib`, `dataclasses`, `email.utils`, `pathlib`, `datetime`). Tests: `pytest` (existing `[test]` extra), `pyyaml>=6,<7` added to that extra for the CI-relations guard only. No new runtime dependency.
 
-**Authoritative spec:** `docs/superpowers/specs/2026-09-05-lakera-debounce-design.md` (commit `cfe30f4`).
+**Authoritative spec:** `docs/superpowers/specs/2026-09-05-lakera-debounce-design.md` (commit `e002df6` — the 2026-09-06 revision: measured defaults in §3.2, hermetic CI in §3.6, the liveness cache in §3.8).
 **Binding constraints:** `tasks/session-constraints.md` — read in full before the first edit; paste verbatim into any sub-brief.
 
 ---
@@ -38,20 +38,24 @@ Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>
 
 | File | Created / Modified | Single responsibility |
 |---|---|---|
-| `injection_scanner/throttle.py` | **Create** | The whole limiter: config parsing + clamps, on-disk state, flock, token bucket, circuit breaker, `Retry-After` parsing. Knows nothing about HTTP, Lakera, or reasons. |
+| `injection_scanner/throttle.py` | **Create** (Task 1), then 3 helpers made public (Task 4b) | The whole limiter: config parsing + clamps, on-disk state, flock, token bucket, circuit breaker, `Retry-After` parsing. Knows nothing about HTTP, Lakera, or reasons. Also the home of the three primitives anything else in this package uses to keep state in the cache directory — `env_float`, `file_lock`, `atomic_write_json`. |
 | `injection_scanner/lakera.py` | Modify (`check`, + 2 private helpers) | The only place the limiter is wired to a real call: key first, `acquire`, `record_throttled` on 429/503, `record_success` on 200. Owns the two new reason literals. |
 | `injection_scanner/intercept.py` | Modify (`scan`, `scan_text` signatures + one call) | Plumbing only — one keyword from the caller to `lakera.check`. No behaviour change. |
 | `injection_scanner/eval.py` | Modify (`evaluate`, `_main`, + infra classifier) | Batch-caller policy: a wait budget on the CLI, and "an outage is not a classification" (`EvalInfraError`, exit 3). |
+| `injection_scanner/smoke.py` | Modify (`run_smoke` + 5 private helpers) | The boot probe's own pacing: Phase 1 canaries always run; Phase 2's single live probe is skipped while a fleet-wide cached PASS is still fresh. Owns the liveness-cache file and its TTL; borrows the limiter's flock and atomic-write primitives rather than re-implementing them. |
 | `.github/workflows/ci.yml` | Modify | The HERMETIC merge gate: the deterministic `test` job and nothing else — no vendor call, no secret, no fork guard. Plus per-ref concurrency so superseded PR pushes are cancelled. |
 | `.github/workflows/live-eval.yml` | **Create** | The live pipeline, off the merge gate: nightly + `workflow_dispatch`, one Lakera-touching job at a time, smoke as the canary for eval, stricter pacing, bounded job time. |
-| `README.md` | Modify | Operator-facing documentation of the env table, the two new reasons, and the CI relations. |
+| `README.md` | Modify | Operator-facing documentation of the env table, the measurement the defaults rest on, the two new reasons, the boot-smoke liveness cache, and the CI relations. |
 | `pyproject.toml` | Modify | `pyyaml>=6,<7` in the `[test]` extra (needed only by the CI guard test). |
-| `tests/conftest.py` | **Create** | Suite-wide isolation: every test gets its own limiter state directory and the documented "off" configuration, so no test touches `~/.cache` and no test is throttled by accident. |
+| `tests/conftest.py` | **Create** (Task 1), extended in Task 4b | Suite-wide isolation: every test gets its own cache directory and the documented "off" configuration — limiter off, liveness cache off — so no test touches `~/.cache`, no test is throttled by accident, and no test silently reuses a cached probe. |
 | `tests/test_throttle.py` | **Create** | Every limiter property, including the 3-subprocess cross-process budget test. |
 | `tests/test_lakera.py` | Modify (additions only) | The integration contract: new reasons, no token on the keyless paths, hostile `Retry-After` containment, 503 trips / 500 does not. |
 | `tests/test_intercept.py` | Modify (3 stubs + 2 new tests) | `lakera_max_wait_s` reaches `lakera.check` from both entry points. |
 | `tests/test_eval.py` | Modify (1 stub + new tests) | `--lakera-max-wait` plumbing, `_is_infra_reason`, the abort, exit code 3. |
+| `tests/test_smoke_liveness.py` | **Create** | The liveness cache's whole contract: hit, miss, expiry, failure, `TTL=0`, corruption, unwritable cache, and that Phase 1 canaries run on every call regardless. |
 | `tests/test_ci_relations.py` | **Create** | "No external services in CI" and "mind the relations" made executable: a future edit cannot quietly put a vendor call back on the merge gate, nor reintroduce overlapping Lakera jobs. |
+
+**A note on task numbering.** Spec §3.8 (the boot-smoke liveness cache) was added on 2026-09-06, after Tasks 1–7 had already been written and after implementer briefs had gone out referencing them by number. Renumbering would have invalidated those briefs, so the new work is inserted as **Task 4b**, between Task 4 and Task 5. Tasks 1, 2, 3, 4, 5, 6 and 7 keep the numbers they have always had. Execution order is 1, 2, 3, 4, 4b, 5, 6, 7 — Task 4b lands before Task 5 because Task 5's expected suite count includes Task 4b's tests.
 
 ---
 
@@ -62,7 +66,7 @@ Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>
 - Create: `injection_scanner/throttle.py`
 - Create: `tests/test_throttle.py`
 
-> **Decision (D1):** the autouse fixture pins the limiter to its documented "off" configuration — `INJECTION_SCANNER_LAKERA_MIN_INTERVAL_S=0` (bucket always full) and `INJECTION_SCANNER_LAKERA_BACKOFF_MAX_S=0` (every breaker delay clamps to zero) — on top of an isolated `INJECTION_SCANNER_CACHE_DIR`. Reason: with the production defaults (`burst=2`), the third `lakera.check()` inside `tests/test_lakera.py::test_throttling_is_distinguishable_from_an_expired_key` would return `lakera_unavailable:throttled`, and the 429 in that same test would open the breaker over the 401 and 503 calls that follow it. Limiter-behaviour tests opt back in explicitly.
+> **Decision (D1):** the autouse fixture pins the limiter to its documented "off" configuration — `INJECTION_SCANNER_LAKERA_MIN_INTERVAL_S=0` (bucket always full) and `INJECTION_SCANNER_LAKERA_BACKOFF_MAX_S=0` (every breaker delay clamps to zero) — on top of an isolated `INJECTION_SCANNER_CACHE_DIR`. Reason: the breaker. `tests/test_lakera.py::test_throttling_is_distinguishable_from_an_expired_key` raises a 429 on its first `check()` call, which under the production defaults opens the breaker for `backoff_base_s` = 300 s; the 401 and 503 calls that follow in the same test would then report `lakera_unavailable:throttled` instead of the status each is asserting. The bucket is the same hazard one step further out — a test making more than `burst` = 10 calls sees the eleventh refused — and both are meaningless in a suite where pacing protects nothing. Limiter-behaviour tests opt back in explicitly.
 
 > **Decision (D2):** the flock retry loop uses the INJECTED `clock`/`sleep`, not real time. Reason: the lock-timeout test then runs in microseconds and is deterministic, and production still gets `time.time`/`time.sleep` from the constructor defaults.
 
@@ -95,9 +99,9 @@ neutralise, autouse, for EVERY test rather than per-file:
      processes, and a suite that could leave a fleet-wide breaker open.
      `tmp_path` is function-scoped, so each test gets a private directory.
 
-  2. With the production defaults (`burst=2`, `backoff_base_s=30`), tests
-     that legitimately call `lakera.check()` more than twice, or that raise a
-     429 and then expect the NEXT call to report a different HTTP status,
+  2. With the production defaults (`burst=10`, `backoff_base_s=300`), tests
+     that legitimately call `lakera.check()` more than ten times, or that raise
+     a 429 and then expect the NEXT call to report a different HTTP status,
      would start seeing `lakera_unavailable:throttled` instead. That is not a
      regression in those tests; it is the limiter doing its job in a context
      where pacing is meaningless. So the suite runs the limiter in its
@@ -249,11 +253,16 @@ def test_from_env_uses_the_documented_defaults(monkeypatch, tmp_path):
         monkeypatch.delenv(name, raising=False)
     monkeypatch.setenv("INJECTION_SCANNER_CACHE_DIR", str(tmp_path))
 
+    # The numbers Lakera's own published limit implies, not a guess. Community
+    # plan: 10,000 requests/month = 13.9/hour = one every 4.3 minutes. 300 s
+    # sustained is 12/hour, just under it; burst 10 lets a multi-pane session
+    # restore through; the breaker waits MINUTES because recovery from the
+    # 2026-09-05 throttle took tens of them. See the constants in throttle.py.
     assert LimiterConfig.from_env() == LimiterConfig(
-        min_interval_s=15.0,
-        burst=2,
-        backoff_base_s=30.0,
-        backoff_max_s=600.0,
+        min_interval_s=300.0,
+        burst=10,
+        backoff_base_s=300.0,
+        backoff_max_s=3600.0,
         lock_wait_s=2.0,
     )
     assert throttle.default_max_wait_s() == 0.0
@@ -273,10 +282,10 @@ def test_malformed_env_values_fall_back_to_the_default(monkeypatch, raw):
     monkeypatch.setenv("INJECTION_SCANNER_LAKERA_MAX_WAIT_S", raw)
 
     assert LimiterConfig.from_env() == LimiterConfig(
-        min_interval_s=15.0,
-        burst=2,
-        backoff_base_s=30.0,
-        backoff_max_s=600.0,
+        min_interval_s=300.0,
+        burst=10,
+        backoff_base_s=300.0,
+        backoff_max_s=3600.0,
         lock_wait_s=2.0,
     )
     assert throttle.default_max_wait_s() == 0.0
@@ -378,9 +387,10 @@ feature flag shipped defaulted-off is the failure mode the
 `avoiding-unrequested-feature-flags` rule exists to prevent.
 
 Every limit is an INPUT (`LimiterConfig.from_env`), never a constant fitted to
-today's numbers. The defaults are PROVISIONAL and are retuned from a
-measurement of Lakera's actual limits by changing env values or these
-defaults — never by editing the algorithm.
+today's numbers. The defaults follow the ONE limit Lakera publishes (the
+Community plan's 10,000 requests per month) and are retuned by changing env
+values or these defaults when the dashboard shows a different tier — never by
+editing the algorithm.
 """
 from __future__ import annotations
 
@@ -415,18 +425,37 @@ ENV_MAX_WAIT_S = "INJECTION_SCANNER_LAKERA_MAX_WAIT_S"
 
 # ---------- defaults + clamps ----------
 #
-# PROVISIONAL, and labelled as such on purpose. The healthy pre-onset fleet
-# averaged ~0.6 calls/min with zero failures; a 15 s sustained interval keeps
-# the worst case (six panes + CI) at ~4 calls/min. These are the numbers to
-# change when Lakera's published limits are measured — not the algorithm.
+# Set from measurement on 2026-09-06, not from a guess (full findings in
+# ~/.local/state/claude-tasks/research-agent/findings-lakera-limits.md).
+#
+# Lakera publishes exactly ONE limit: the Community plan's 10,000 requests per
+# month. That is 13.9 per hour, one every 4.3 minutes — and it equals the
+# trickle measured through the 2026-09-05 throttle ("one success per 4-5
+# minutes fleet-wide regardless of attempt count"), which is what identifies
+# the monthly quota, rather than some unpublished QPS ceiling, as the thing the
+# fleet was hitting. Overnight, 25 calls in 30 minutes were accepted before
+# ~40 minutes of 429s, so Lakera's own bucket is roughly 25-50 deep with a slow
+# refill.
+#
+# The defaults sit UNDER that: 300 s sustained is 12 calls/hour against the
+# quota's 13.9; a burst of 10 lets one multi-pane session restore through
+# without being refused; and the breaker waits MINUTES rather than seconds
+# because recovery was observed to take tens of minutes, so a 30 s retry would
+# simply re-spend the budget on 429s. For scale: research-agent boot smokes
+# alone ran ~632 per day before the liveness cache in smoke.py (~19k/month,
+# about twice the entire quota) — spawn frequency, not scan volume, is what
+# exhausts this account.
+#
+# The plan tier is visible only on the Lakera dashboard. On a paid tier every
+# knob loosens via env; the algorithm does not change.
 #
 # Each clamp is a RANGE, so a typo in an environment variable degrades to a
 # sane limiter instead of either disabling the bucket or parking the fleet.
 
-DEFAULT_MIN_INTERVAL_S = 15.0
-DEFAULT_BURST = 2
-DEFAULT_BACKOFF_BASE_S = 30.0
-DEFAULT_BACKOFF_MAX_S = 600.0
+DEFAULT_MIN_INTERVAL_S = 300.0
+DEFAULT_BURST = 10
+DEFAULT_BACKOFF_BASE_S = 300.0
+DEFAULT_BACKOFF_MAX_S = 3600.0
 DEFAULT_LOCK_WAIT_S = 2.0
 DEFAULT_MAX_WAIT_S = 0.0
 
@@ -2663,6 +2692,1086 @@ A rule name that merely ends in the suffix — secret_shape:thing_unavailable
 
 ---
 
+## Task 4b: the boot-smoke liveness cache
+
+**Files:**
+- Modify: `injection_scanner/throttle.py` (three helpers made public — one rename, two extractions; no behaviour change)
+- Modify: `injection_scanner/smoke.py` (`run_smoke` gains an optional `clock`; Phase 2 gains a cache; 5 new private helpers)
+- Modify: `tests/conftest.py` (one more environment variable neutralised and pinned)
+- Create: `tests/test_smoke_liveness.py`
+
+Spec §3.8, added 2026-09-06 after the measurement. The number that made this necessary: research-agent boot smokes alone ran **~632 per day** — one per server spawn, plus one per degraded recheck — which is about **19,000 a month against Lakera's published Community quota of 10,000**, before a single report is scanned. Spawn frequency, not scan volume, is what exhausts the account, and a Claude Code session restore spawns six panes at once. The limiter in Task 1 bounds the RATE; it cannot reduce the demand. This does: one passing liveness probe is trusted fleet-wide for a TTL, so a six-pane restore costs one Lakera call instead of six, and a six-pane recovery after an outage costs one instead of six.
+
+This is the smallest piece of the spec's deferred "option B", and the only piece of it that ships here. It caches a **boolean about the vendors**, never a verdict about content (spec §7).
+
+> **Decision (D21):** the cache sits in `smoke.py`, not in `throttle.py`. Reason: `throttle.py`'s stated responsibility is "the whole limiter… knows nothing about HTTP, Lakera, or reasons", and a liveness claim about the boot probe is a different concern with a different lifetime. What IS shared is the plumbing — cache directory, flock, atomic write, clamped env parsing — and Task 4b makes exactly those public rather than re-implementing them.
+
+> **Decision (D22):** three `throttle.py` helpers become public: `_env_float` → `env_float` (a rename), plus `file_lock(...)` and `atomic_write_json(...)` extracted from `CrossProcessLimiter._locked` and `._save`, which then delegate to them. Reason: the alternative is a second flock loop and a second tmp-plus-`os.replace` in `smoke.py`, i.e. two implementations of the two things in this change set that are easy to get subtly wrong. The extractions are mechanical, the methods keep their names and docstrings, and every Task 1 test passes unchanged (Step 4b.4 proves it). `_env_int` stays private — nothing outside the module needs it yet, and YAGNI.
+
+> **Decision (D23):** the liveness lock's bounded wait is the limiter's own `INJECTION_SCANNER_LAKERA_LOCK_WAIT_S`, not a new knob. Reason: the flock discipline is shared, so the bound on it should be too; an operator who widens one has widened both; and a new environment variable for a two-second wait is a knob nobody will ever set.
+
+> **Decision (D24):** the injected `clock` drives the TTL arithmetic ONLY. The flock retry loop keeps real `time.time` / `time.sleep`. Reason: lock contention is a real wall-clock event, and a fake clock that never advances would turn the bounded retry loop into an unbounded one. The TTL is the only thing a test needs to control.
+
+> **Decision (D25):** a cached `at` timestamp in the FUTURE is a miss, not a hit. Reason: a forward clock step on the writing process (or a backward one here) would otherwise let an entry outlive its TTL by an arbitrary amount, and this is the one direction where trusting the file costs more than re-probing. Symmetric with the limiter's `elapsed = max(0.0, now - updated_at)`.
+
+> **Decision (D26):** on a cache hit `run_smoke` logs TWO lines — the spec's exact `liveness probe: cached pass, <age>s old`, and a completion line that says the liveness came from cache. Reason: consumers key on the smoke completing, and the existing OK line claims "lakera + honeypot live via scan(Path)", which would be a lie on a hit. Reusing it unchanged would make the log say a vendor was contacted when it was not.
+
+> **Decision (D27):** `tests/conftest.py` pins `INJECTION_SCANNER_SMOKE_LIVENESS_TTL_S=0` (cache off) for the whole suite, exactly as D1 pins the limiter off, and `tests/test_smoke_liveness.py` opts back in per test. Reason: same hazard, same answer — a suite that silently reuses a cached pass measures the cache instead of the probe, and a value in the developer's shell must not change what the suite measures.
+
+---
+
+- [ ] **Step 4b.1: Neutralise and pin the new environment variable in `tests/conftest.py`**
+
+In `tests/conftest.py`, after the `_LIMITER_ENV` tuple, add:
+
+```python
+# `smoke.py`'s own knob (the boot-smoke liveness cache). Not read by
+# `LimiterConfig.from_env`, but it shares the cache directory and carries the
+# same hazard: a value in the developer's shell must not change what the suite
+# measures, and a suite that silently reuses a cached pass measures the cache
+# instead of the probe. Pinned OFF below; tests/test_smoke_liveness.py opts
+# back in per test.
+_SMOKE_ENV = (
+    "INJECTION_SCANNER_SMOKE_LIVENESS_TTL_S",
+)
+```
+
+Then replace the fixture body:
+
+```python
+@pytest.fixture(autouse=True)
+def _isolated_limiter_state(monkeypatch, tmp_path):
+    """Private limiter state directory + the documented "off" budget."""
+    for name in _LIMITER_ENV:
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setenv("INJECTION_SCANNER_CACHE_DIR", str(tmp_path / "cache"))
+    monkeypatch.setenv("INJECTION_SCANNER_LAKERA_MIN_INTERVAL_S", "0")
+    monkeypatch.setenv("INJECTION_SCANNER_LAKERA_BACKOFF_MAX_S", "0")
+```
+
+with:
+
+```python
+@pytest.fixture(autouse=True)
+def _isolated_limiter_state(monkeypatch, tmp_path):
+    """Private cache directory + the documented "off" budget, cache included."""
+    for name in _LIMITER_ENV + _SMOKE_ENV:
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setenv("INJECTION_SCANNER_CACHE_DIR", str(tmp_path / "cache"))
+    monkeypatch.setenv("INJECTION_SCANNER_LAKERA_MIN_INTERVAL_S", "0")
+    monkeypatch.setenv("INJECTION_SCANNER_LAKERA_BACKOFF_MAX_S", "0")
+    monkeypatch.setenv("INJECTION_SCANNER_SMOKE_LIVENESS_TTL_S", "0")
+```
+
+- [ ] **Step 4b.2: Run the whole suite — the new line must be inert today**
+
+Run:
+```bash
+env -u ANTHROPIC_API_KEY -u OPENAI_API_KEY -u LAKERA_API_KEY uv run --extra test pytest -q tests/
+```
+Expected: `545 passed` — unchanged from the end of Task 4. Nothing reads `INJECTION_SCANNER_SMOKE_LIVENESS_TTL_S` yet.
+
+- [ ] **Step 4b.3: Make the three shared helpers public in `injection_scanner/throttle.py`**
+
+Three mechanical changes, no behaviour change.
+
+**(a) Rename `_env_float` to `env_float`.** Replace its definition:
+
+```python
+def _env_float(name: str, default: float, bounds: tuple[float, float]) -> float:
+    """A float from the environment: malformed -> default, then clamp.
+
+    NaN is turned back explicitly. It parses fine, survives `min`/`max`
+    unchanged on CPython, and would then make every comparison in `acquire`
+    false — a limiter that neither allows nor refuses.
+    """
+```
+
+with:
+
+```python
+def env_float(name: str, default: float, bounds: tuple[float, float]) -> float:
+    """A float from the environment: malformed -> default, then clamp.
+
+    NaN is turned back explicitly. It parses fine, survives `min`/`max`
+    unchanged on CPython, and would then make every comparison in `acquire`
+    false — a limiter that neither allows nor refuses.
+
+    PUBLIC because `smoke.py` parses `INJECTION_SCANNER_SMOKE_LIVENESS_TTL_S`
+    with it. That knob is not a limiter setting, but it wants exactly this
+    contract — "every limit is an input with a range", malformed to the
+    default, NaN refused — and one audited implementation of it beats two.
+    `_env_int` stays private; nothing outside this module needs it yet.
+    """
+```
+
+The body is unchanged. Then update the five remaining call sites — one in `default_max_wait_s`, four in `LimiterConfig.from_env`:
+
+```python
+def default_max_wait_s() -> float:
+    """`acquire`'s wait budget when the caller does not name one.
+
+    Default 0: an interactive scan refuses immediately rather than parking a
+    report behind the fleet's budget. Batch callers (`eval`) pass their own.
+    """
+    return env_float(ENV_MAX_WAIT_S, DEFAULT_MAX_WAIT_S, MAX_WAIT_RANGE)
+```
+
+```python
+    @classmethod
+    def from_env(cls) -> "LimiterConfig":
+        return cls(
+            min_interval_s=env_float(
+                ENV_MIN_INTERVAL_S, DEFAULT_MIN_INTERVAL_S, MIN_INTERVAL_RANGE
+            ),
+            burst=_env_int(ENV_BURST, DEFAULT_BURST, BURST_RANGE),
+            backoff_base_s=env_float(
+                ENV_BACKOFF_BASE_S, DEFAULT_BACKOFF_BASE_S, BACKOFF_BASE_RANGE
+            ),
+            backoff_max_s=env_float(
+                ENV_BACKOFF_MAX_S, DEFAULT_BACKOFF_MAX_S, BACKOFF_MAX_RANGE
+            ),
+            lock_wait_s=env_float(
+                ENV_LOCK_WAIT_S, DEFAULT_LOCK_WAIT_S, LOCK_WAIT_RANGE
+            ),
+        )
+```
+
+**(b) Extract the flock loop and the atomic write.** Insert these two module-level functions between `_parse_retry_after` and `class CrossProcessLimiter:`:
+
+```python
+@contextlib.contextmanager
+def file_lock(lock_path: Path, wait_s: float, *, clock=time.time, sleep=time.sleep):
+    """Exclusive `flock` over `lock_path`, bounded by `wait_s`.
+
+    The file is opened FRESH for every operation, so the lock also serialises
+    threads inside one process: flock is associated with the open file
+    description, and each `os.open` makes its own. flock is released by the
+    kernel when the holder dies, so there are no stale locks to reap after a
+    crash. The parent directory is created `0700` if it is missing.
+
+    `LOCK_NB` plus a retry, rather than a blocking `LOCK_EX`, because the wait
+    has to be BOUNDED: a wedged peer must degrade to a caught `TimeoutError`
+    (which the limiter renders as a fail-closed reject, and the smoke liveness
+    cache renders as a miss) rather than hanging a scan or a boot forever.
+
+    Shared with `smoke.py`'s liveness cache, which keeps a different file in
+    the same directory under the same discipline.
+    """
+    lock_path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    deadline = clock() + wait_s
+    fd = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o600)
+    try:
+        while True:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except OSError as e:
+                if e.errno not in (errno.EACCES, errno.EAGAIN, errno.EWOULDBLOCK):
+                    raise
+                if clock() >= deadline:
+                    raise TimeoutError("lock wait exceeded") from None
+                sleep(_LOCK_RETRY_SLEEP_S)
+        try:
+            yield
+        finally:
+            fcntl.flock(fd, fcntl.LOCK_UN)
+    finally:
+        os.close(fd)
+
+
+def atomic_write_json(path: Path, payload: dict) -> None:
+    """Write `payload` to `path` via `<path>.tmp` + `os.replace`.
+
+    The replace is atomic, so a reader without the lock — or a process killed
+    mid-write — never sees a half-written file. Callers build `payload` by
+    NAMING its fields, so a field added to some upstream structure tomorrow is
+    invisible here until it is added on purpose.
+
+    Shared with `smoke.py`'s liveness cache. Call it inside `file_lock`.
+    """
+    tmp = path.parent / (path.name + ".tmp")
+    tmp.write_text(json.dumps(payload), encoding="utf-8")
+    os.replace(tmp, path)
+```
+
+**(c) Delegate from the two methods.** Replace `CrossProcessLimiter._locked` — note the `@contextlib.contextmanager` decorator is REMOVED, because the method now returns a context manager instead of being a generator:
+
+```python
+    @contextlib.contextmanager
+    def _locked(self):
+        """Exclusive `flock` over `<name>-throttle.lock`, bounded by config.
+
+        The file is opened FRESH for every operation, so the lock also
+        serialises threads inside one process: flock is associated with the
+        open file description, and each `os.open` makes its own. flock is
+        released by the kernel when the holder dies, so there are no stale
+        locks to reap after a crash.
+
+        `LOCK_NB` plus a retry, rather than a blocking `LOCK_EX`, because the
+        wait has to be BOUNDED: a wedged peer must degrade to `ERROR` (a
+        fail-closed reject) rather than hanging a scan forever.
+        """
+        self._state_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+        deadline = self._clock() + self._config.lock_wait_s
+        fd = os.open(self._lock_path, os.O_CREAT | os.O_RDWR, 0o600)
+        try:
+            while True:
+                try:
+                    fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    break
+                except OSError as e:
+                    if e.errno not in (errno.EACCES, errno.EAGAIN, errno.EWOULDBLOCK):
+                        raise
+                    if self._clock() >= deadline:
+                        raise TimeoutError("lakera limiter lock wait exceeded") from None
+                    self._sleep(_LOCK_RETRY_SLEEP_S)
+            try:
+                yield
+            finally:
+                fcntl.flock(fd, fcntl.LOCK_UN)
+        finally:
+            os.close(fd)
+```
+
+with:
+
+```python
+    def _locked(self):
+        """This limiter's own lock: `file_lock` over `<name>-throttle.lock`,
+        bounded by `lock_wait_s` and driven by the INJECTED clock and sleep,
+        so the lock-timeout test runs in microseconds and production still
+        gets `time.time` / `time.sleep` from the constructor defaults.
+
+        A wedged peer therefore degrades to a `TimeoutError`, which `acquire`
+        catches and renders as `ERROR` — a fail-closed reject — rather than
+        hanging a scan forever.
+        """
+        return file_lock(
+            self._lock_path,
+            self._config.lock_wait_s,
+            clock=self._clock,
+            sleep=self._sleep,
+        )
+```
+
+And replace `_save`:
+
+```python
+    def _save(self, st: _State) -> None:
+        """Write via `<file>.tmp` + `os.replace`, inside the lock.
+
+        The replace is atomic, so a reader without the lock — or a process
+        killed mid-write — never sees a half-written bucket. Only the five
+        fields below are written; the payload is built by NAMING them, so a
+        field added to `_State` tomorrow is invisible until it is added here
+        on purpose.
+        """
+        payload = {
+            "schema": _SCHEMA,
+            "tokens": st.tokens,
+            "updated_at": st.updated_at,
+            "open_until": st.open_until,
+            "failures": st.failures,
+        }
+        tmp = self._state_path.parent / (self._state_path.name + ".tmp")
+        tmp.write_text(json.dumps(payload), encoding="utf-8")
+        os.replace(tmp, self._state_path)
+```
+
+with:
+
+```python
+    def _save(self, st: _State) -> None:
+        """Persist the bucket + breaker, inside the lock.
+
+        Only the five fields below are written; the payload is built by NAMING
+        them, so a field added to `_State` tomorrow is invisible until it is
+        added here on purpose. `atomic_write_json` does the tmp +
+        `os.replace`, so no reader ever sees a half-written bucket.
+        """
+        atomic_write_json(
+            self._state_path,
+            {
+                "schema": _SCHEMA,
+                "tokens": st.tokens,
+                "updated_at": st.updated_at,
+                "open_until": st.open_until,
+                "failures": st.failures,
+            },
+        )
+```
+
+- [ ] **Step 4b.4: Prove the extraction changed nothing**
+
+Run:
+```bash
+grep -n "_env_float" injection_scanner/throttle.py \
+  ; env -u ANTHROPIC_API_KEY -u OPENAI_API_KEY -u LAKERA_API_KEY uv run --extra test pytest -q tests/test_throttle.py tests/test_lakera.py
+```
+Expected: `grep` prints nothing (exit 1 — the old private name is gone everywhere), then `100 passed` (46 in `test_throttle.py`, and 54 in `test_lakera.py`: 36 that predate this plan plus the 18 Task 2 added). Zero failures is the point of the step, not the number: this is the extraction's proof that it changed no behaviour. If `test_a_lock_held_past_the_wait_budget_is_an_error` or `test_a_zero_lock_wait_budget_is_an_error_when_the_lock_is_held` fails, the injected `clock`/`sleep` are not reaching `file_lock` — fix the delegation in `_locked`, never the test.
+
+- [ ] **Step 4b.5: Write the failing tests**
+
+Create `tests/test_smoke_liveness.py`:
+
+```python
+"""The boot-smoke liveness cache (injection_scanner.smoke, spec §3.8).
+
+Key-free and deterministic. `_scan_via_path` is replaced by a stub that COUNTS
+Phase 2 probes and answers them with a Verdict of the test's choosing, while
+DELEGATING the Phase 1 canary calls to the real function — those touch no
+network (`use_honeypot=False, use_lakera=False`) and are the thing several
+tests here assert still runs. The TTL clock is injected through
+`run_smoke(..., clock=...)`, so no test sleeps and no test waits.
+
+Why the cache exists, measured 2026-09-06: research-agent boot smokes alone ran
+~632 per day — one per server spawn, plus one per degraded recheck — about
+19,000 a month against Lakera's published Community quota of 10,000, before a
+single report is scanned. Spawn frequency, not scan volume, is what exhausts
+the account.
+
+What is pinned here:
+
+  * the HIT — a second boot inside the TTL costs zero vendor calls and says so
+    in the log; that is the whole point of the file;
+  * every unusable-entry shape is a MISS (probe exactly as before), never an
+    error and never a pass — a cache in front of a probe must not become a way
+    to skip the probe;
+  * a FAILING probe records nothing, so an outage can never be cached;
+  * Phase 1 runs on every boot regardless, cached or not — it checks THIS
+    process's own code, not the fleet's vendors;
+  * the entry holds a boolean and a timestamp and nothing else (Invariant 4);
+  * `clock` is optional, because research-agent calls `run_smoke(log_info=…,
+    log_error=…)` and that call must keep working unchanged.
+"""
+from __future__ import annotations
+
+import json
+from dataclasses import dataclass, field
+from pathlib import Path
+
+import pytest
+
+from injection_scanner import smoke
+from injection_scanner.intercept import Verdict
+
+_EPOCH = 1_700_000_000.0
+
+# Phase 1 runs three deterministic canaries, each once through the disk-read
+# wrapper `_scan_via_path` (and once through `scan_text`, which the stub below
+# does not see). Named so the "Phase 1 always runs" assertions read as
+# arithmetic rather than as a magic 3.
+_CANARIES_PER_RUN = 3
+
+
+@dataclass
+class _Fake:
+    """Simulated wall clock. Nothing sleeps; tests step `now` by hand."""
+
+    now: float = _EPOCH
+
+    def time(self) -> float:
+        return self.now
+
+
+@dataclass
+class _Log:
+    """Collects the messages `run_smoke` routes through its callbacks."""
+
+    info: list[str] = field(default_factory=list)
+    error: list[str] = field(default_factory=list)
+
+    def text(self) -> str:
+        return "\n".join(self.info)
+
+
+def _verdict(ok: bool) -> Verdict:
+    """A Verdict shaped exactly as Phase 2 inspects it: `ok`, plus the
+    `lakera` and `honeypot` entries in `layers`. `honeypot_api_errors` is left
+    at its default — nothing here goes near the audit-only field."""
+    if ok:
+        return Verdict(
+            ok=True,
+            reason="pass",
+            layers={"lakera": "pass", "honeypot": "pass"},
+            sanitize_stats={},
+            sanitized_text=smoke._BENIGN_PROBE,
+        )
+    return Verdict(
+        ok=False,
+        reason="lakera_unavailable:HTTPError:429",
+        layers={"lakera": "unavailable", "honeypot": "skipped"},
+        sanitize_stats={},
+        sanitized_text="",
+    )
+
+
+class _Probe:
+    """Stands in for `smoke._scan_via_path`.
+
+    Phase 2 (`use_honeypot=True`) is COUNTED and answered with `self.verdict`
+    — that is the one call in `run_smoke` that would spend Lakera quota and
+    hit the honeypot providers. Phase 1 (`use_honeypot=False`) is delegated to
+    the real function, which runs the deterministic canaries for real: no
+    network, no key, and the only honest way to assert that caching Phase 2
+    left Phase 1 alone.
+    """
+
+    def __init__(self, real):
+        self._real = real
+        self.verdict = _verdict(True)
+        self.probes = 0
+        self.canaries = 0
+
+    def __call__(self, payload, *, use_honeypot, use_lakera=True):
+        if not use_honeypot:
+            self.canaries += 1
+            return self._real(
+                payload, use_honeypot=use_honeypot, use_lakera=use_lakera
+            )
+        self.probes += 1
+        return self.verdict
+
+
+@pytest.fixture
+def probe(monkeypatch):
+    p = _Probe(smoke._scan_via_path)
+    monkeypatch.setattr(smoke, "_scan_via_path", p)
+    return p
+
+
+@pytest.fixture
+def cache_file(tmp_path: Path) -> Path:
+    """`tests/conftest.py` points `INJECTION_SCANNER_CACHE_DIR` at
+    `tmp_path / "cache"` for every test, so this is where an entry lands."""
+    return tmp_path / "cache" / "smoke-liveness.json"
+
+
+@pytest.fixture
+def ttl(monkeypatch):
+    """The suite runs with the cache OFF (conftest pins the TTL to 0), so a
+    test that wants it has to say so. Returns the setter."""
+
+    def _set(seconds) -> None:
+        monkeypatch.setenv(
+            "INJECTION_SCANNER_SMOKE_LIVENESS_TTL_S", str(seconds)
+        )
+
+    return _set
+
+
+def _run(fake: _Fake, log: _Log) -> None:
+    smoke.run_smoke(
+        log_info=log.info.append, log_error=log.error.append, clock=fake.time
+    )
+
+
+# ---------- hit, miss, expiry ----------
+
+def test_a_fresh_cache_runs_the_probe_and_records_the_pass(probe, cache_file, ttl):
+    ttl(3600)
+    fake, log = _Fake(), _Log()
+    _run(fake, log)
+
+    assert probe.probes == 1
+    assert json.loads(cache_file.read_text(encoding="utf-8")) == {
+        "schema": 1,
+        "ok": True,
+        "at": _EPOCH,
+    }
+
+
+def test_a_second_boot_inside_the_ttl_skips_the_probe(probe, ttl):
+    """The property the whole file exists for: a six-pane session restore
+    costs ONE Lakera call, not six."""
+    ttl(3600)
+    fake, log = _Fake(), _Log()
+    _run(fake, log)
+    assert probe.probes == 1
+
+    fake.now += 120.0
+    _run(fake, log)
+    assert probe.probes == 1, "a fresh cached pass must not be re-probed"
+    assert "liveness probe: cached pass, 120s old" in log.text()
+
+    fake.now += 3400.0                     # 3520 s total, still inside 3600
+    _run(fake, log)
+    assert probe.probes == 1
+    assert "liveness probe: cached pass, 3520s old" in log.text()
+
+
+def test_an_expired_entry_is_probed_again_and_rewritten(probe, cache_file, ttl):
+    ttl(3600)
+    fake, log = _Fake(), _Log()
+    _run(fake, log)
+
+    fake.now += 3600.1
+    _run(fake, log)
+    assert probe.probes == 2
+    assert json.loads(cache_file.read_text(encoding="utf-8"))["at"] == fake.now
+
+
+def test_the_ttl_is_an_input_and_a_short_one_is_honoured(probe, ttl):
+    ttl(60)
+    fake, log = _Fake(), _Log()
+    _run(fake, log)
+
+    fake.now += 59.0
+    _run(fake, log)
+    assert probe.probes == 1
+
+    fake.now += 2.0
+    _run(fake, log)
+    assert probe.probes == 2
+
+
+def test_a_ttl_of_zero_disables_the_cache(probe, cache_file, ttl):
+    """`0` is the documented off switch: probe every boot, record nothing."""
+    ttl(0)
+    fake, log = _Fake(), _Log()
+    for _ in range(3):
+        _run(fake, log)
+
+    assert probe.probes == 3
+    assert not cache_file.exists()
+    assert "cached pass" not in log.text()
+
+
+def test_a_malformed_ttl_falls_back_to_the_default(probe, ttl):
+    """Same contract as every limiter knob: malformed -> default, then clamp."""
+    ttl("about an hour")
+    fake, log = _Fake(), _Log()
+    _run(fake, log)
+
+    fake.now += 3599.0                     # inside the 3600 s default
+    _run(fake, log)
+    assert probe.probes == 1
+
+
+# ---------- a non-passing probe is never cached ----------
+
+def test_a_failing_probe_writes_nothing_and_still_raises(probe, cache_file, ttl):
+    """An outage must never be recorded. If it were, one bad boot would
+    silence the probe for the whole TTL across the whole fleet."""
+    ttl(3600)
+    probe.verdict = _verdict(False)
+    fake, log = _Fake(), _Log()
+
+    with pytest.raises(smoke.SmokeFailure) as excinfo:
+        _run(fake, log)
+    assert "ok=False" in excinfo.value.reason
+    assert not cache_file.exists()
+    assert probe.probes == 1
+
+    # And the next boot probes again rather than inheriting anything.
+    probe.verdict = _verdict(True)
+    _run(fake, log)
+    assert probe.probes == 2
+
+
+def test_a_degraded_layer_is_not_cached_either(probe, cache_file, ttl):
+    """`ok=True` is not enough: Phase 2 also requires BOTH layers to say
+    "pass". A verdict that satisfies the first check and fails the second must
+    leave the cache empty just the same."""
+    ttl(3600)
+    probe.verdict = Verdict(
+        ok=True,
+        reason="pass",
+        layers={"lakera": "skipped", "honeypot": "pass"},
+        sanitize_stats={},
+        sanitized_text=smoke._BENIGN_PROBE,
+    )
+    fake, log = _Fake(), _Log()
+
+    with pytest.raises(smoke.SmokeFailure) as excinfo:
+        _run(fake, log)
+    assert "lakera layer not 'pass'" in excinfo.value.reason
+    assert not cache_file.exists()
+
+
+# ---------- every unusable entry is a MISS ----------
+
+@pytest.mark.parametrize(
+    "blob",
+    [
+        "",
+        "{",
+        "null",
+        "[]",
+        "not json at all",
+        '{"schema": 99, "ok": true, "at": 1700000000.0}',
+        '{"schema": 1, "ok": false, "at": 1700000000.0}',
+        '{"schema": 1, "ok": "yes", "at": 1700000000.0}',
+        '{"schema": 1, "ok": true}',
+        '{"schema": 1, "ok": true, "at": "soon"}',
+        '{"schema": 1, "ok": true, "at": NaN}',
+        '{"schema": 1, "ok": true, "at": 1700009999.0}',
+    ],
+    ids=[
+        "empty", "truncated", "null", "array", "garbage", "foreign-schema",
+        "recorded-failure", "ok-not-boolean", "no-timestamp",
+        "timestamp-not-a-number", "timestamp-nan", "timestamp-in-the-future",
+    ],
+)
+def test_an_unusable_cache_entry_is_a_miss(probe, cache_file, ttl, blob):
+    """Not an error, and above all not a pass. A cache in front of a probe
+    must degrade to "run the probe", which is today's behaviour.
+
+    Every blob here carries a timestamp that WOULD be fresh, so each case
+    fails for its own stated reason rather than for age. `foreign-schema` is
+    an older or newer scanner sharing the cache directory; `recorded-failure`
+    and `ok-not-boolean` are the two ways `ok` can be anything but literally
+    `true`; `timestamp-in-the-future` is a clock step, and trusting it would
+    let an entry outlive its TTL by an arbitrary amount (D25); `timestamp-nan`
+    is `json.loads` accepting bare `NaN`, which then makes every comparison
+    false.
+    """
+    ttl(3600)
+    cache_file.parent.mkdir(parents=True, exist_ok=True)
+    cache_file.write_text(blob, encoding="utf-8")
+
+    fake, log = _Fake(), _Log()
+    _run(fake, log)
+
+    assert probe.probes == 1, "an entry that cannot be read must be re-probed"
+    assert json.loads(cache_file.read_text(encoding="utf-8")) == {
+        "schema": 1,
+        "ok": True,
+        "at": _EPOCH,
+    }, "and a pass must overwrite it"
+
+
+def test_an_unwritable_cache_directory_is_not_an_error(
+    probe, tmp_path, monkeypatch, ttl
+):
+    """A regular FILE where the cache directory should be. Root-proof: mkdir
+    raises `FileExistsError` for every uid, unlike a chmod-based fixture.
+
+    The boot still succeeds and still probes. Cache failure degrades to
+    today's behaviour — never to a refusal to boot, and never to fail-open.
+    """
+    blocked = tmp_path / "blocked"
+    blocked.write_text("not a directory", encoding="utf-8")
+    monkeypatch.setenv("INJECTION_SCANNER_CACHE_DIR", str(blocked))
+    ttl(3600)
+
+    fake, log = _Fake(), _Log()
+    _run(fake, log)
+    _run(fake, log)
+
+    assert probe.probes == 2, "nothing was recorded, so nothing is cached"
+    assert log.error == [], "a cache that cannot be written is not a failure"
+
+
+def test_the_cache_entry_carries_only_a_boolean_and_a_timestamp(
+    probe, cache_file, ttl
+):
+    """Invariant 4 made structural: the probe's own text must not be able to
+    ride into a file the next process reads."""
+    ttl(3600)
+    probe.verdict = Verdict(
+        ok=True,
+        reason="pass",
+        layers={"lakera": "pass", "honeypot": "pass"},
+        sanitize_stats={"stripped": "SENTINEL-DO-NOT-PERSIST"},
+        sanitized_text="SENTINEL-DO-NOT-PERSIST",
+    )
+    fake, log = _Fake(), _Log()
+    _run(fake, log)
+
+    raw = cache_file.read_text(encoding="utf-8")
+    assert set(json.loads(raw)) == {"schema", "ok", "at"}
+    assert "SENTINEL" not in raw
+    assert smoke._BENIGN_PROBE not in raw
+
+
+# ---------- Phase 1 is never cached ----------
+
+def test_the_phase_one_canaries_run_on_every_boot(probe, ttl):
+    """Phase 1 checks THIS process's own code, not the fleet's vendors, so
+    caching Phase 2 must not touch it."""
+    ttl(3600)
+    fake, log = _Fake(), _Log()
+
+    _run(fake, log)
+    assert (probe.canaries, probe.probes) == (_CANARIES_PER_RUN, 1)
+
+    _run(fake, log)
+    assert (probe.canaries, probe.probes) == (2 * _CANARIES_PER_RUN, 1)
+
+
+def test_a_broken_canary_still_fails_on_a_cached_boot(probe, monkeypatch, ttl):
+    """The cache must not be able to wave a Phase 1 regression through."""
+    ttl(3600)
+    fake, log = _Fake(), _Log()
+    _run(fake, log)
+    assert probe.probes == 1
+
+    monkeypatch.setattr(
+        smoke,
+        "_DETERMINISTIC",
+        (
+            smoke._Canary(
+                "never_blocked", "an entirely benign sentence.", "nothing"
+            ),
+        ),
+    )
+    with pytest.raises(smoke.SmokeFailure) as excinfo:
+        _run(fake, log)
+    assert "expected block" in excinfo.value.reason
+    assert probe.probes == 1, "Phase 1 failed before Phase 2 was consulted"
+
+
+# ---------- the signature production actually calls ----------
+
+def test_the_clock_keyword_is_optional(probe, ttl):
+    """research-agent calls `run_smoke(log_info=…, log_error=…)`
+    (`mcp_server/server.py`). That call has to keep working unchanged, so
+    `clock` must default rather than become required."""
+    ttl(0)
+    log = _Log()
+
+    smoke.run_smoke(log_info=log.info.append, log_error=log.error.append)
+    assert probe.probes == 1
+
+    smoke.run_smoke()
+    assert probe.probes == 2
+```
+
+- [ ] **Step 4b.6: Run it to verify it fails**
+
+Run:
+```bash
+env -u ANTHROPIC_API_KEY -u OPENAI_API_KEY -u LAKERA_API_KEY uv run --extra test pytest -q tests/test_smoke_liveness.py
+```
+Expected: `24 failed, 1 passed`. Every test that calls `_run` fails with `TypeError: run_smoke() got an unexpected keyword argument 'clock'`. The one that passes is `test_the_clock_keyword_is_optional`, which only uses today's signature — it is there to keep that signature from being broken later, so passing now is correct.
+
+- [ ] **Step 4b.7: Add the cache to `injection_scanner/smoke.py` — imports and helpers**
+
+Replace the import block:
+
+```python
+import tempfile
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Callable
+
+from injection_scanner.intercept import Verdict, scan, scan_text
+```
+
+with:
+
+```python
+import json
+import math
+import tempfile
+import time
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Callable
+
+from injection_scanner import throttle
+from injection_scanner.intercept import Verdict, scan, scan_text
+```
+
+Then insert this block immediately after the `_BENIGN_PROBE` assignment and before `def _scan_via_path(`:
+
+```python
+# ---------- the fleet-wide liveness cache ----------
+#
+# Measured 2026-09-06: research-agent boot smokes alone ran ~632 per day — one
+# per server spawn, plus one per degraded recheck — about 19,000 a month
+# against Lakera's published Community quota of 10,000, before a single report
+# is scanned. SPAWN FREQUENCY, not scan volume, is what exhausts the account,
+# and one Claude Code session restore spawns six panes at once. The limiter in
+# throttle.py bounds the RATE; it cannot reduce the demand. This does.
+#
+# So one PASSING Phase 2 probe is trusted fleet-wide for a TTL. It is a cache
+# in front of a probe, NOT a gate: every failure mode below degrades to "run
+# the probe exactly as before", never to "pass without probing". Phase 1 is
+# never cached — it checks THIS process's own code, not the fleet's vendors.
+#
+# What a stale cached pass can hide: an outage that began within the TTL. Then
+# the server boots "healthy" and the first real scan fails closed with the
+# agent-readable infra reason. Fail-closed and visibility are both preserved;
+# only the moment of discovery moves from spawn to first use.
+#
+# It caches a BOOLEAN ABOUT THE VENDORS, never a verdict about content. A
+# verdict cache would be a second system with its own staleness and poisoning
+# questions, and is deliberately out of scope.
+
+ENV_LIVENESS_TTL_S = "INJECTION_SCANNER_SMOKE_LIVENESS_TTL_S"
+
+# One hour: long enough that a six-pane session restore costs ONE Lakera call
+# instead of six, short enough that an outage is rediscovered within the same
+# working hour. `0` disables the cache; the clamp ceiling is a day. An INPUT,
+# like every other limit in this package — never a fitted constant.
+DEFAULT_LIVENESS_TTL_S = 3600.0
+LIVENESS_TTL_RANGE = (0.0, 86400.0)
+
+# Bumped only when the on-disk shape changes. Any other value is FOREIGN and is
+# discarded exactly like a corrupt file: an older or newer scanner sharing the
+# cache directory must never hand this one a liveness claim it would misread.
+_LIVENESS_SCHEMA = 1
+
+_LIVENESS_STATE_NAME = "smoke-liveness.json"
+_LIVENESS_LOCK_NAME = "smoke-liveness.lock"
+
+
+def _liveness_paths() -> tuple[Path, Path]:
+    """State file and lock file, in the same cache directory the limiter and
+    the self-updater already use — one place for an operator to look, and one
+    place to clear."""
+    d = throttle.cache_dir()
+    return d / _LIVENESS_STATE_NAME, d / _LIVENESS_LOCK_NAME
+
+
+def _liveness_ttl_s() -> float:
+    """How long one passing probe is trusted. Malformed values fall back to
+    the default and are then clamped, so a typo degrades to the documented
+    hour rather than to a cache that never expires."""
+    return throttle.env_float(
+        ENV_LIVENESS_TTL_S, DEFAULT_LIVENESS_TTL_S, LIVENESS_TTL_RANGE
+    )
+
+
+def _liveness_lock_wait_s() -> float:
+    """Bounded wait for the liveness lock.
+
+    Deliberately the limiter's own `INJECTION_SCANNER_LAKERA_LOCK_WAIT_S`
+    rather than a new knob: the flock discipline is shared, so the bound on it
+    should be too, and an operator who widens one has widened both.
+    """
+    return throttle.LimiterConfig.from_env().lock_wait_s
+
+
+def _cached_liveness_age(now: float) -> float | None:
+    """Age in seconds of a still-fresh cached PASS, or `None` for a miss.
+
+    Every unusable shape is a MISS, never an error and never a pass: missing,
+    unreadable, truncated, non-JSON, wrong type, foreign schema, `ok` that is
+    not literally `true`, an `at` that will not parse or is not finite, an `at`
+    in the FUTURE (a clock step — trusting it could extend the TTL by an
+    arbitrary amount), or an entry older than the TTL. A miss costs one probe,
+    which is exactly what every boot cost before this cache existed.
+
+    `json.loads` accepts bare `NaN`/`Infinity`, which is why the finiteness
+    check is explicit rather than implied by `float()`.
+    """
+    ttl = _liveness_ttl_s()
+    if ttl <= 0.0:
+        return None
+    state_path, lock_path = _liveness_paths()
+    try:
+        with throttle.file_lock(lock_path, _liveness_lock_wait_s()):
+            obj = json.loads(state_path.read_text(encoding="utf-8"))
+    except Exception:  # noqa: BLE001 — TOTAL by contract; any failure is a miss
+        return None
+    if not isinstance(obj, dict) or obj.get("schema") != _LIVENESS_SCHEMA:
+        return None
+    if obj.get("ok") is not True:
+        return None
+    try:
+        at = float(obj["at"])
+    except (KeyError, TypeError, ValueError):
+        return None
+    if not math.isfinite(at):
+        return None
+    age = now - at
+    if age < 0.0 or age > ttl:
+        return None
+    return age
+
+
+def _record_liveness_pass(now: float) -> None:
+    """Record that the probe passed. Best effort, by design.
+
+    An unwritable cache directory means the pass is simply not recorded — the
+    next spawn probes again, which is what happens today. Failing the smoke
+    because a CACHE could not be written would turn an optimisation into a new
+    way to refuse to boot.
+
+    The file carries a boolean and a timestamp and nothing else: no reason
+    string, no layer map, no probe text. Invariant 4 ("the caught bytes never
+    return") therefore holds trivially, and the payload is built by NAMING its
+    three fields, so anything added upstream tomorrow stays invisible.
+    """
+    if _liveness_ttl_s() <= 0.0:
+        return
+    state_path, lock_path = _liveness_paths()
+    try:
+        with throttle.file_lock(lock_path, _liveness_lock_wait_s()):
+            throttle.atomic_write_json(
+                state_path,
+                {"schema": _LIVENESS_SCHEMA, "ok": True, "at": now},
+            )
+    except Exception:  # noqa: BLE001 — see the docstring
+        return
+```
+
+- [ ] **Step 4b.8: Wire it into `run_smoke`**
+
+Replace the signature and docstring:
+
+```python
+def run_smoke(
+    *,
+    log_info: Callable[[str], None] | None = None,
+    log_error: Callable[[str], None] | None = None,
+) -> None:
+    """Run the self-test. Raises SmokeFailure on any regression.
+
+    log_info / log_error are injected so callers can route messages
+    through their own logger (stdlib logging, FastMCP, journal, etc.)
+    without this module taking a hard logger dep.
+    """
+```
+
+with:
+
+```python
+def run_smoke(
+    *,
+    log_info: Callable[[str], None] | None = None,
+    log_error: Callable[[str], None] | None = None,
+    clock: Callable[[], float] = time.time,
+) -> None:
+    """Run the self-test. Raises SmokeFailure on any regression.
+
+    log_info / log_error are injected so callers can route messages
+    through their own logger (stdlib logging, FastMCP, journal, etc.)
+    without this module taking a hard logger dep.
+
+    `clock` drives the liveness cache's TTL arithmetic and nothing else. It
+    DEFAULTS, so every existing caller — research-agent's boot smoke
+    (`run_smoke(log_info=…, log_error=…)`), the scheduled CI job, an ad-hoc
+    CLI run — keeps working unchanged. Wall-clock rather than monotonic,
+    deliberately: the cache is read by processes that did not exist when it
+    was written.
+    """
+```
+
+Then replace the head of Phase 2:
+
+```python
+    # Phase 2: honeypot + Lakera liveness via scan(Path) so we cover the
+    # disk-read wrapper. A benign payload must produce a "pass" honeypot
+    # layer AND a "pass" lakera layer. Anything else (skipped, unavailable,
+    # accidentally triggered) means infra rot or a false-positive
+    # regression. Because Lakera fails closed on a missing key, this phase
+    # requires a live LAKERA_API_KEY.
+    v = _scan_via_path(_BENIGN_PROBE, use_honeypot=True, use_lakera=True)
+```
+
+with:
+
+```python
+    # Phase 2: honeypot + Lakera liveness via scan(Path) so we cover the
+    # disk-read wrapper. A benign payload must produce a "pass" honeypot
+    # layer AND a "pass" lakera layer. Anything else (skipped, unavailable,
+    # accidentally triggered) means infra rot or a false-positive
+    # regression. Because Lakera fails closed on a missing key, this phase
+    # requires a live LAKERA_API_KEY.
+    #
+    # It is also the ONE call in here that spends vendor quota, which is why a
+    # recent fleet-wide PASS is trusted instead of re-run: hit -> return,
+    # miss -> probe exactly as before. See the liveness cache above.
+    age = _cached_liveness_age(clock())
+    if age is not None:
+        info(f"liveness probe: cached pass, {int(age)}s old")
+        info(
+            f"scanner self-test OK ({len(_DETERMINISTIC)} canaries × "
+            "2 entry points blocked; lakera + honeypot liveness from cache)"
+        )
+        return
+
+    v = _scan_via_path(_BENIGN_PROBE, use_honeypot=True, use_lakera=True)
+```
+
+And replace the tail:
+
+```python
+    info(
+        f"scanner self-test OK ({len(_DETERMINISTIC)} canaries × "
+        "2 entry points blocked; lakera + honeypot live via scan(Path))"
+    )
+```
+
+with:
+
+```python
+    # Only here, with all three Phase 2 checks passed, is the result worth
+    # sharing. A failure raised above and recorded nothing, so an outage can
+    # never be cached — one bad boot must not silence the probe fleet-wide.
+    _record_liveness_pass(clock())
+
+    info(
+        f"scanner self-test OK ({len(_DETERMINISTIC)} canaries × "
+        "2 entry points blocked; lakera + honeypot live via scan(Path))"
+    )
+```
+
+- [ ] **Step 4b.9: Run the liveness tests**
+
+Run:
+```bash
+env -u ANTHROPIC_API_KEY -u OPENAI_API_KEY -u LAKERA_API_KEY uv run --extra test pytest -q tests/test_smoke_liveness.py
+```
+Expected: `25 passed` (13 named tests + 12 parametrised unusable-entry cases).
+
+- [ ] **Step 4b.10: Run the whole suite**
+
+Run:
+```bash
+env -u ANTHROPIC_API_KEY -u OPENAI_API_KEY -u LAKERA_API_KEY uv run --extra test python -m compileall -q injection_scanner tests \
+  && env -u ANTHROPIC_API_KEY -u OPENAI_API_KEY -u LAKERA_API_KEY uv run --extra test pytest -q tests/
+```
+Expected: `compileall` silent (exit 0), then `570 passed` (545 + 25), 0 failed.
+
+- [ ] **Step 4b.11: Commit**
+
+```bash
+git -C ~/worktrees/injection-scanner-lakera-debounce add injection_scanner/throttle.py injection_scanner/smoke.py tests/conftest.py tests/test_smoke_liveness.py
+git -C ~/worktrees/injection-scanner-lakera-debounce commit \
+  -m "feat(smoke): trust one passing liveness probe fleet-wide for an hour" \
+  -m "Measured 2026-09-06: research-agent boot smokes alone ran about 632 a
+day — one per server spawn, plus one per degraded recheck — which is
+roughly 19,000 Lakera calls a month against a published Community quota of
+10,000, before a single report is scanned. Spawn frequency, not scan
+volume, is what exhausts the account, and one session restore spawns six
+panes at once. The limiter bounds the rate; it cannot reduce the demand.
+
+run_smoke's Phase 2 — the single probe that touches Lakera and the
+honeypot providers — now consults smoke-liveness.json in the shared cache
+directory, under the same flock discipline as the limiter. A pass recorded
+within INJECTION_SCANNER_SMOKE_LIVENESS_TTL_S (default 3600, clamped to
+[0, 86400], 0 disables) is trusted and the probe is skipped, so a six-pane
+restore costs one Lakera call instead of six and a six-pane recovery costs
+one instead of six.
+
+It is a cache in front of a probe, not a gate. A missing, corrupt,
+foreign-schema, unreadable or future-dated entry is a miss, and an
+unwritable directory means the pass is simply not recorded: every failure
+degrades to probing exactly as before, never to fail-open. A failing probe
+writes nothing, so an outage can never be cached. Phase 1's deterministic
+canaries run on every boot regardless — they check this process's own
+code, not the fleet's vendors. The file holds a boolean and a timestamp
+and nothing else, so Invariant 4 holds trivially.
+
+What a stale cached pass can hide is an outage that began inside the TTL;
+the server then boots healthy and the first real scan fails closed with
+the agent-readable infra reason, so only the moment of discovery moves.
+
+env_float, file_lock and atomic_write_json become public in throttle.py
+and the limiter's own methods delegate to them, rather than growing a
+second flock loop and a second atomic write in smoke.py. clock is an
+optional keyword, so research-agent's existing call is unchanged." \
+  -m "Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>"
+```
+
+---
+
 ## Task 5: CI — a hermetic merge gate, and the live checks on a schedule
 
 **Files:**
@@ -2677,11 +3786,11 @@ Maintainer directive, 2026-09-06, verbatim from `tasks/session-constraints.md`:
 
 Resolved (spec §3.6, §7) as: the per-push workflow makes NO external call and needs NO secret; the live pipeline moves, unchanged in what it runs, to its own nightly + on-demand workflow. Offline regression coverage does not shrink — the SDK-signature class is still caught by `tests/test_judge.py` driving the real SDK over a stub transport, and the Lakera response contract by `tests/test_lakera.py` over the monkeypatched `_post` seam. What leaves the merge gate is the sampled-model BENCHMARK (recall / FP over the labelled corpus), which was never deterministic in the first place.
 
-> **Decision (D15):** `INJECTION_SCANNER_LAKERA_MIN_INTERVAL_S=30` is set on BOTH live jobs, at job level. The spec's §3.6 sketch shows it on both, and the guard test asserts both: a limiter setting that appears on one Lakera job and not its sibling reads as an oversight to the next editor, and `smoke` is a Lakera-touching job whose pacing should be stated rather than inferred from "it only makes one call".
+> **Decision (D15):** BOTH pacing variables — `INJECTION_SCANNER_LAKERA_MIN_INTERVAL_S=60` and `INJECTION_SCANNER_LAKERA_BURST=2` — are set on BOTH live jobs, at job level, and the guard test asserts all four cells. The spec's §3.6 sketch shows them on both. A limiter setting that appears on one Lakera job and not its sibling reads as an oversight to the next editor, and `smoke` is a Lakera-touching job whose pacing should be stated rather than inferred from "it only makes one call". `BURST` is set explicitly rather than inherited because the fleet default is 10 (sized so a multi-pane session restore passes) and a CI runner must never be allowed a burst at all: it gets a fresh cache directory every run, so its bucket starts full and 10 back-to-back calls would land as one clump on the shared account.
 
 > **Decision (D16):** the guard test asserts a NEGATIVE about `ci.yml` — that the raw file text contains no `secrets.` at all — rather than enumerating jobs that may use secrets. A negative over the whole file is the assertion that survives a job nobody anticipated; an allow-list of job names would pass the moment someone adds a seventh job with a key in it.
 
-> **Decision (D17):** timeouts are 10 min (smoke) and 30 min (eval), per spec §3.6. At 30 s pacing a clean 16-case eval takes ~8 min; a handful of confirmation re-scans stays well inside 30. A pathological run where every case disagrees three times hits the timeout — correctly, because that run is failing anyway and must not sit on `lakera-live` for half an hour and block the next night's.
+> **Decision (D17):** timeouts are 10 min (smoke) and 45 min (eval), per spec §3.6. At 60 s pacing with `burst=2`, a clean 16-case eval takes ~15 min of pure waiting; a handful of confirmation re-scans stays inside 45. `--lakera-max-wait 1800` is the per-call budget that lets each case QUEUE for its turn rather than be refused mid-corpus, and it is deliberately shorter than the job timeout so a wedged call surfaces as an eval failure rather than as a killed job with no scorecard. A pathological run where every case disagrees three times hits the 45-minute timeout — correctly, because that run is failing anyway and must not sit on `lakera-live` for an hour and block the next night's.
 
 > **Decision (D19):** the workflow-level concurrency group in `live-eval.yml` is the literal `lakera-live` with no `github.ref` in it. That is deliberate and is the opposite of `ci.yml`'s per-ref group: the point is that a dispatch on a feature branch and the nightly on `main` must NOT run at once, because they draw on the same Lakera account. Serialising by account, not by ref, is the whole relation.
 
@@ -2856,16 +3965,30 @@ def test_the_one_call_smoke_gates_the_sixteen_call_eval() -> None:
 
 
 def test_both_live_jobs_pace_themselves() -> None:
+    """Both knobs, on both jobs — four cells, asserted one by one.
+
+    The runner's cache directory is fresh every run, so this limiter is a
+    separate domain drawing on the SAME account as the fleet: it has to pace
+    itself stricter than the fleet's own 300 s sustained interval buys it, and
+    it must never be allowed a burst. `BURST` is the one that gets forgotten,
+    because a bucket that starts full looks paced until ten calls leave at
+    once.
+    """
     jobs = _load(LIVE)["jobs"]
     for name in ("smoke", "eval"):
-        assert jobs[name]["env"]["INJECTION_SCANNER_LAKERA_MIN_INTERVAL_S"] == "30", (
-            f"{name}: the runner's cache dir is fresh per run, so this "
-            "limiter is a separate domain drawing on the SAME account — it "
-            "paces itself stricter than the fleet's own 15 s"
+        env = jobs[name].get("env", {})
+        assert env.get("INJECTION_SCANNER_LAKERA_MIN_INTERVAL_S") == "60", (
+            f"{name}: one Lakera call per minute at most"
+        )
+        assert env.get("INJECTION_SCANNER_LAKERA_BURST") == "2", (
+            f"{name}: a fresh runner bucket must not hand the shared account "
+            "the fleet default of ten calls back to back"
         )
 
 
 def test_the_eval_job_waits_for_its_turn_instead_of_being_refused() -> None:
+    """Without a wait budget, a paced eval is REFUSED mid-corpus rather than
+    queued, and `--lakera-max-wait` is what turns each refusal into a wait."""
     assert "--lakera-max-wait" in _run_commands(_load(LIVE)["jobs"]["eval"])
 
 
@@ -2873,7 +3996,9 @@ def test_both_live_jobs_are_time_bounded() -> None:
     """A job that hangs holds `lakera-live` and blocks every later run."""
     jobs = _load(LIVE)["jobs"]
     assert jobs["smoke"]["timeout-minutes"] == 10
-    assert jobs["eval"]["timeout-minutes"] == 30
+    # 16 cases at 60 s pacing is ~15 min of waiting before any confirmation
+    # re-scans, so the eval budget has to be well clear of that.
+    assert jobs["eval"]["timeout-minutes"] == 45
 ```
 
 - [ ] **Step 5.3: Run it to verify it fails**
@@ -2996,9 +4121,13 @@ jobs:
     timeout-minutes: 10
     # The runner's cache directory is fresh every run, so this limiter is a
     # separate domain from the local fleet's — drawing on the same account.
-    # It therefore paces itself stricter than the fleet's own 15 s.
+    # It therefore paces itself stricter than the fleet's own 300 s interval
+    # buys it, and takes a burst of 2 rather than inheriting the fleet default
+    # of 10: a bucket that starts full would hand the shared account ten calls
+    # back to back and look paced while doing it.
     env:
-      INJECTION_SCANNER_LAKERA_MIN_INTERVAL_S: "30"
+      INJECTION_SCANNER_LAKERA_MIN_INTERVAL_S: "60"
+      INJECTION_SCANNER_LAKERA_BURST: "2"
     steps:
       - uses: actions/checkout@v4
 
@@ -3050,9 +4179,13 @@ jobs:
     # fails smoke and this never starts, so an outage costs one call instead
     # of seventeen. Serialisation across runs is handled workflow-level.
     needs: smoke
-    timeout-minutes: 30
+    # 16 cases at 60 s pacing is ~15 min of waiting before any confirmation
+    # re-scans; 45 leaves room for those without letting a pathological run
+    # sit on `lakera-live` for an hour.
+    timeout-minutes: 45
     env:
-      INJECTION_SCANNER_LAKERA_MIN_INTERVAL_S: "30"
+      INJECTION_SCANNER_LAKERA_MIN_INTERVAL_S: "60"
+      INJECTION_SCANNER_LAKERA_BURST: "2"
     steps:
       - uses: actions/checkout@v4
 
@@ -3090,9 +4223,12 @@ jobs:
       #                      single-shot weakness stays visible in the log.
       #
       # Lakera pacing: the job-level MIN_INTERVAL_S above spaces the calls
-      # 30 s apart (~8 min for 16 cases, inside the 30-minute timeout), and
-      # --lakera-max-wait 900 lets this batch caller QUEUE for its turn
-      # rather than be refused mid-corpus.
+      # 60 s apart and BURST=2 stops the fresh runner bucket from clumping
+      # (~15 min for 16 cases, inside the 45-minute timeout), and
+      # --lakera-max-wait 1800 lets this batch caller QUEUE for its turn
+      # rather than be refused mid-corpus. The wait budget is deliberately
+      # shorter than the job timeout, so a wedged call surfaces as an eval
+      # failure with a scorecard rather than as a killed job without one.
       #
       # An outage still aborts the run loudly: eval exits 3 with
       # `INFRA <case> <reason>` on stderr rather than scoring the outage as a
@@ -3104,7 +4240,7 @@ jobs:
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
           LAKERA_API_KEY: ${{ secrets.LAKERA_API_KEY }}
         run: |
-          .venv/bin/python -m injection_scanner.eval tests/payloads/labels.jsonl --use-lakera --use-honeypot --min-recall 1.0 --max-fp-rate 0.0 --confirm-disagreements 2 --lakera-max-wait 900
+          .venv/bin/python -m injection_scanner.eval tests/payloads/labels.jsonl --use-lakera --use-honeypot --min-recall 1.0 --max-fp-rate 0.0 --confirm-disagreements 2 --lakera-max-wait 1800
 ```
 
 - [ ] **Step 5.6: Run the guard test**
@@ -3144,7 +4280,7 @@ Run:
 env -u ANTHROPIC_API_KEY -u OPENAI_API_KEY -u LAKERA_API_KEY uv run --extra test python -m compileall -q injection_scanner tests \
   && env -u ANTHROPIC_API_KEY -u OPENAI_API_KEY -u LAKERA_API_KEY uv run --extra test pytest -q tests/
 ```
-Expected: `555 passed`, 0 failed.
+Expected: `580 passed`, 0 failed.
 
 - [ ] **Step 5.9: Commit**
 
@@ -3172,9 +4308,11 @@ dispatching it on the branch before merge. One workflow-level concurrency
 group, lakera-live, not keyed on the ref: a branch dispatch and the
 nightly draw on the same account and must queue rather than overlap. eval
 needs smoke, so an outage costs one call instead of seventeen; both jobs
-pace themselves at 30 s and are time-bounded, since a hanging job would
-hold the group and block the next night's run. Daily Lakera cost falls
-from roughly 17 per push to 17 per day.
+pace themselves at one call per minute with no burst, and both are
+time-bounded, since a hanging job would hold the group and block the next
+night's run. Daily Lakera cost falls from roughly 17 per push to 17 per
+day, against a published quota of 10,000 per month shared with the whole
+fleet.
 
 tests/test_ci_relations.py parses both files and asserts all of it,
 including that ci.yml contains no 'secrets.' anywhere — a negative over
@@ -3229,17 +4367,34 @@ Every limit is an input. There is no on/off switch: "off" is `MIN_INTERVAL_S=0` 
 
 | Environment variable | Default | Clamp | Meaning |
 |---|---|---|---|
-| `INJECTION_SCANNER_LAKERA_MIN_INTERVAL_S` | `15` | `[0, 3600]` | Sustained fleet-wide interval — one call per this many seconds. `0` disables the bucket; the breaker still applies. |
-| `INJECTION_SCANNER_LAKERA_BURST` | `2` | `[1, 1000]` | Bucket capacity: how many calls may go out back-to-back after an idle period. |
-| `INJECTION_SCANNER_LAKERA_BACKOFF_BASE_S` | `30` | `[0, 3600]` | Breaker delay after the first consecutive throttle that carried no usable `Retry-After`. Doubles per consecutive failure. |
-| `INJECTION_SCANNER_LAKERA_BACKOFF_MAX_S` | `600` | `[0, 86400]` | Cap on **every** breaker delay, a server-supplied `Retry-After` included. |
-| `INJECTION_SCANNER_LAKERA_LOCK_WAIT_S` | `2` | `[0, 60]` | Bounded wait for the state-file lock before the call is refused. |
+| `INJECTION_SCANNER_LAKERA_MIN_INTERVAL_S` | `300` | `[0, 3600]` | Sustained fleet-wide interval — one call per this many seconds. `0` disables the bucket; the breaker still applies. |
+| `INJECTION_SCANNER_LAKERA_BURST` | `10` | `[1, 1000]` | Bucket capacity: how many calls may go out back-to-back after an idle period. |
+| `INJECTION_SCANNER_LAKERA_BACKOFF_BASE_S` | `300` | `[0, 3600]` | Breaker delay after the first consecutive throttle that carried no usable `Retry-After`. Doubles per consecutive failure. |
+| `INJECTION_SCANNER_LAKERA_BACKOFF_MAX_S` | `3600` | `[0, 86400]` | Cap on **every** breaker delay, a server-supplied `Retry-After` included. |
+| `INJECTION_SCANNER_LAKERA_LOCK_WAIT_S` | `2` | `[0, 60]` | Bounded wait for the state-file lock before the call is refused. Also bounds the liveness cache's lock. |
 | `INJECTION_SCANNER_LAKERA_MAX_WAIT_S` | `0` | `[0, 86400]` | Default wait budget for `check()` when the caller passes none. `0` refuses immediately rather than parking a report. |
-| `INJECTION_SCANNER_CACHE_DIR` | `~/.cache/injection-scanner` | — | State directory (`lakera-throttle.json` + `.lock`). Same directory the self-updater uses. |
+| `INJECTION_SCANNER_SMOKE_LIVENESS_TTL_S` | `3600` | `[0, 86400]` | How long one passing boot-smoke liveness probe is trusted fleet-wide (see below). `0` disables the cache. |
+| `INJECTION_SCANNER_CACHE_DIR` | `~/.cache/injection-scanner` | — | State directory (`lakera-throttle.json` + `.lock`, `smoke-liveness.json` + `.lock`). Same directory the self-updater uses. |
 
-The defaults are **provisional**. They encode today's best guess — the healthy pre-onset fleet averaged ~0.6 calls/min with zero failures, and a 15 s interval keeps the worst case (six panes plus CI) at ~4 calls/min. They are retuned from a measurement of Lakera's actual published limits by changing environment values, or these defaults in a follow-up commit — never by editing the algorithm.
+**What the defaults rest on (measured 2026-09-06).** Lakera publishes exactly one limit: the Community plan's **10,000 requests per month** — 13.9 per hour, one every 4.3 minutes. That equals the trickle measured through the 2026-09-05 throttle (one success per 4–5 minutes fleet-wide, regardless of how many attempts were made), which is what identifies the monthly quota rather than some unpublished QPS ceiling as the thing the fleet was hitting. Overnight, 25 calls in 30 minutes were accepted before ~40 minutes of 429s, so Lakera's own bucket is roughly 25–50 deep with a slow refill. The defaults sit under that: 12 calls/hour sustained, a burst of 10 so one multi-pane session restore passes, and a breaker that waits minutes rather than seconds because recovery was observed to take tens of them. The plan tier is visible only on the Lakera dashboard; on a paid tier every knob loosens via environment, and the algorithm does not change.
 
 Batch callers pass a wait budget instead of being refused: `scan(..., lakera_max_wait_s=900)`, `scan_text(..., lakera_max_wait_s=900)`, or `python -m injection_scanner.eval ... --lakera-max-wait 900` (which is already the eval default, because eval is always a batch caller).
+
+### The boot-smoke liveness cache
+
+`run_smoke()` has two phases: deterministic canaries that touch no network, and one live probe that calls Lakera and the honeypot providers. Measured 2026-09-06, research-agent boot smokes alone ran **~632 per day** — one per server spawn, plus one per degraded recheck — about 19,000 a month against a 10,000-a-month quota, before a single report is scanned. Spawn frequency, not scan volume, is what exhausts the account, and one Claude Code session restore spawns six panes at once.
+
+So a passing probe is recorded in `smoke-liveness.json` and trusted fleet-wide for `INJECTION_SCANNER_SMOKE_LIVENESS_TTL_S` seconds. A six-pane session restore then costs one Lakera call instead of six, and so does a six-pane recovery after an outage, since degraded rechecks call `run_smoke()` too.
+
+It is a cache in front of a probe, not a gate:
+
+- Phase 1 always runs. It checks the installed scanner's own code, not the fleet's vendors.
+- A missing, corrupt, foreign-schema, unreadable or future-dated entry is a **miss** — the probe runs exactly as it did before. An unwritable cache directory means the pass is simply not recorded. Nothing here can turn into fail-open.
+- A **failing** probe records nothing and raises as it always did, so one bad boot cannot silence the probe fleet-wide.
+- The file holds `{"schema": 1, "ok": true, "at": <epoch>}` — a boolean and a timestamp, no reason string and no report bytes.
+- `0` disables it.
+
+What a stale cached pass can hide is an outage that began within the TTL. The server then boots "healthy" and the first real scan fails closed with the agent-readable infra reason: fail-closed and visibility are both preserved, and only the moment of discovery moves from spawn to first use.
 
 ### Two new reasons
 
@@ -3271,8 +4426,8 @@ The relations inside `live-eval.yml` are asserted by `tests/test_ci_relations.py
 
 - One workflow-level concurrency group, `lakera-live`, with `cancel-in-progress: false` — at most one live run at a time, queued rather than dropped. Deliberately **not** keyed on the ref: a branch dispatch and the nightly on `main` draw on the same Lakera account, so they must queue rather than overlap.
 - `eval` needs `smoke`. The 1-call smoke is the canary for the 16-call eval: a Lakera outage costs one call, not seventeen.
-- Both jobs set `INJECTION_SCANNER_LAKERA_MIN_INTERVAL_S=30` — stricter than the fleet's 15 s, because a runner's cache directory is fresh every run, so this limiter is a separate domain drawing on the same account. `eval` also passes `--lakera-max-wait 900`, so it queues for its turn instead of being refused mid-corpus.
-- Both are time-bounded (10 and 30 minutes): a hanging job would hold `lakera-live` and block the next night's run.
+- Both jobs set `INJECTION_SCANNER_LAKERA_MIN_INTERVAL_S=60` **and** `INJECTION_SCANNER_LAKERA_BURST=2`. A runner's cache directory is fresh every run, so its limiter is a separate domain drawing on the same account: it has to pace itself, and it must never be allowed the fleet's burst of 10 — a bucket that starts full looks paced until ten calls leave at once. `eval` also passes `--lakera-max-wait 1800`, so it queues for its turn instead of being refused mid-corpus.
+- Both are time-bounded (10 and 45 minutes): 16 cases at 60 s pacing is ~15 minutes of waiting before any confirmation re-scans, and a hanging job would hold `lakera-live` and block the next night's run.
 - The guard test also asserts that `ci.yml` contains no `secrets.` reference anywhere — a negative over the whole file, so a job nobody anticipated cannot put a vendor call back on the merge gate.
 
 Daily Lakera cost from CI falls from roughly 17 calls per push to 17 calls per day.
@@ -3282,9 +4437,9 @@ Daily Lakera cost from CI falls from roughly 17 calls per push to 17 calls per d
 
 Run:
 ```bash
-grep -n 'Lakera rate limiting\|lakera-rate-limiting\|live-eval\|^| L' README.md
+grep -n 'Lakera rate limiting\|lakera-rate-limiting\|live-eval\|liveness cache\|SMOKE_LIVENESS_TTL\|^| L' README.md
 ```
-Expected: the in-table link `[Lakera rate limiting](#lakera-rate-limiting)` on the L2 row, the `## Lakera rate limiting` heading, five layer rows `| L0 |`, `| L1b |`, `| L2 |`, `| L3 |`, `| L4 |`, and the `gh workflow run live-eval.yml --ref <branch>` line.
+Expected: the in-table link `[Lakera rate limiting](#lakera-rate-limiting)` on the L2 row, the `## Lakera rate limiting` heading, five layer rows `| L0 |`, `| L1b |`, `| L2 |`, `| L3 |`, `| L4 |`, the `### The boot-smoke liveness cache` heading, the `INJECTION_SCANNER_SMOKE_LIVENESS_TTL_S` table row, and the `gh workflow run live-eval.yml --ref <branch>` line.
 
 - [ ] **Step 6.4: Commit**
 
@@ -3293,11 +4448,13 @@ git -C ~/worktrees/injection-scanner-lakera-debounce add README.md
 git -C ~/worktrees/injection-scanner-lakera-debounce commit \
   -m "docs: document the Lakera limiter, its inputs and the CI relations" \
   -m "A Lakera rate limiting section covering the environment table with
-defaults and clamps, the two new fail-closed reasons, how a batch caller
-asks to queue instead of being refused, and the CI split: a hermetic merge
-gate, live checks nightly and on demand via gh workflow run, and
-production's boot smoke as the real-time vendor canary. The defaults are
-labelled provisional, with the measurement that would retune them named.
+defaults and clamps, the measurement those defaults rest on (10,000
+requests a month is the only limit Lakera publishes, and it matches the
+throttled trickle we measured), the two new fail-closed reasons, the
+boot-smoke liveness cache and what a stale cached pass can hide, how a
+batch caller asks to queue instead of being refused, and the CI split: a
+hermetic merge gate, live checks nightly and on demand via gh workflow
+run, and production's boot smoke as the real-time vendor canary.
 
 Also corrects a stale sentence: the layers table said L2 and L4 were
 planned and not yet wired. Both have been wired for weeks, and the new
@@ -3320,16 +4477,17 @@ cd ~/worktrees/injection-scanner-lakera-debounce \
   && uv run --extra test python -m compileall -q injection_scanner tests \
   && env -u ANTHROPIC_API_KEY -u OPENAI_API_KEY -u LAKERA_API_KEY uv run --extra test pytest -q tests/
 ```
-Expected: `compileall` prints nothing, then a line of the shape `555 passed in <N>s`, exit code 0. The count must be ≥ 443 (the measured baseline) with zero failures; the exact total shifts if a step's parametrisation is adjusted, but **no test may fail and none may be removed**.
+Expected: `compileall` prints nothing, then a line of the shape `580 passed in <N>s`, exit code 0. That is the 443-test baseline plus 46 (Task 1) + 18 (Task 2) + 2 (Task 3) + 36 (Task 4) + 25 (Task 4b) + 10 (Task 5). The count must be ≥ 443 with zero failures; the exact total shifts if a step's parametrisation is adjusted, but **no test may fail and none may be removed**.
 
 - [ ] **Step 7.2: Prove the suite really is key-free and network-free**
 
 Run:
 ```bash
-env -u ANTHROPIC_API_KEY -u OPENAI_API_KEY -u LAKERA_API_KEY -u LAKERA_API_KEY_FILE -u INJECTION_SCANNER_CACHE_DIR \
+env -u ANTHROPIC_API_KEY -u OPENAI_API_KEY -u LAKERA_API_KEY -u LAKERA_API_KEY_FILE \
+    -u INJECTION_SCANNER_CACHE_DIR -u INJECTION_SCANNER_SMOKE_LIVENESS_TTL_S \
   uv run --extra test pytest -q tests/ 2>&1 | tail -3
 ```
-Expected: the same `555 passed`. If a test now reaches the real `~/.cache/injection-scanner`, the autouse fixture in `tests/conftest.py` is not applying — fix the fixture, never the test.
+Expected: the same `580 passed`. If a test now reaches the real `~/.cache/injection-scanner` — a limiter state file or a `smoke-liveness.json` appearing there is the tell — the autouse fixture in `tests/conftest.py` is not applying. Fix the fixture, never the test.
 
 - [ ] **Step 7.3: Confirm nothing outside the repository was touched, and that `tasks` is untracked**
 
@@ -3338,7 +4496,7 @@ Run:
 git -C ~/worktrees/injection-scanner-lakera-debounce status --short
 git -C ~/worktrees/injection-scanner-lakera-debounce log --oneline origin/main..HEAD
 ```
-Expected: `status --short` empty (or showing only ignored artefacts, never `tasks`), and six commits listed — throttle, lakera, intercept, eval, ci, docs.
+Expected: `status --short` empty (or showing only ignored artefacts, never `tasks`), and seven commits listed — throttle, lakera, intercept, eval, smoke liveness, ci, docs.
 
 - [ ] **Step 7.4: Review the whole diff once, with fresh eyes**
 
@@ -3355,6 +4513,7 @@ Expected: exactly these paths, nothing else.
  injection_scanner/eval.py        | modified
  injection_scanner/intercept.py   | modified
  injection_scanner/lakera.py      | modified
+ injection_scanner/smoke.py       | modified
  injection_scanner/throttle.py    | new
  pyproject.toml                   | modified
  tests/conftest.py                | new
@@ -3362,6 +4521,7 @@ Expected: exactly these paths, nothing else.
  tests/test_eval.py               | modified
  tests/test_intercept.py          | modified
  tests/test_lakera.py             | modified
+ tests/test_smoke_liveness.py     | new
  tests/test_throttle.py           | new
 ```
 
@@ -3374,9 +4534,10 @@ Expected: exactly these paths, nothing else.
 | **AC3** | `scan` / `scan_text` accept `lakera_max_wait_s=None` and pass it on. | `tests/test_intercept.py` — `test_lakera_max_wait_s_reaches_the_lakera_layer` (both the value and the `None` default), `test_scan_forwards_lakera_max_wait_s_from_the_disk_entry_point`. |
 | **AC4** | `--lakera-max-wait` (default 900) plumbed to `scan_text`; `_is_infra_reason` (head-anchored closed rule); `EvalInfraError`; `INFRA <id> <reason>` on stderr, exit 3, no further scans. | `tests/test_eval.py` — `test_outages_are_recognised_as_infra` (13 cases), `test_classifications_and_junk_are_not_infra` (15 cases incl. `secret_shape:thing_unavailable`), `test_an_infra_verdict_aborts_before_the_next_case`, `test_a_wrapped_honeypot_outage_also_aborts`, `test_a_detection_that_merely_ends_in_the_suffix_still_scores`, `test_a_normal_run_is_unchanged`, `test_evaluate_forwards_the_wait_budget`, `test_the_cli_defaults_the_wait_budget_to_fifteen_minutes`, `test_the_cli_reports_infra_on_stderr_and_exits_three`, `test_an_outage_can_no_longer_earn_recall`. |
 | **AC5** | `ci.yml` + `live-eval.yml` per §3.6 (hermetic gate; live checks nightly/dispatch, serialised on `lakera-live`, smoke gating eval, paced, time-bounded); `tests/test_ci_relations.py` guard; `pyyaml` in the `test` extra. | `tests/test_ci_relations.py` — gate: `test_ci_still_triggers_on_pushes_and_pull_requests`, `test_ci_runs_only_the_deterministic_test_job`, `test_ci_references_no_secret_at_all`, `test_ci_cancels_superseded_pull_request_runs`. Live: `test_the_live_pipeline_is_never_a_merge_gate`, `test_the_live_pipeline_serialises_on_the_shared_account`, `test_the_one_call_smoke_gates_the_sixteen_call_eval`, `test_both_live_jobs_pace_themselves`, `test_the_eval_job_waits_for_its_turn_instead_of_being_refused`, `test_both_live_jobs_are_time_bounded`. `pyproject.toml` `[project.optional-dependencies].test` carries `pyyaml>=6,<7`. |
-| **AC6** | README "Lakera rate limiting" section per §3.7. | `README.md` — the section added in Task 6: env table, the two new reasons, the CI split (hermetic gate, nightly/`workflow_dispatch` live checks, production's boot smoke as the real-time canary), and the provisional-defaults note. Checked by Step 6.3. |
-| **AC7** | Verifier green in the worktree, key-free, no network; every new test deterministic. | Steps 7.1 and 7.2. Determinism by construction: the limiter's clock and sleep are constructor keywords (`tests/test_throttle.py::_Fake`), `lakera._post` is monkeypatched in every Lakera test, `scan_text` is stubbed in every eval test, and the only real subprocesses are the three in `test_the_budget_is_shared_across_processes`, which touch no network. |
+| **AC6** | README "Lakera rate limiting" section per §3.7. | `README.md` — the section added in Task 6: env table (liveness TTL row included), the measurement the defaults rest on, the two new reasons, the boot-smoke liveness cache and what a stale cached pass can hide, and the CI split (hermetic gate, nightly/`workflow_dispatch` live checks, production's boot smoke as the real-time canary). Checked by Step 6.3. |
+| **AC7** | Verifier green in the worktree, key-free, no network; every new test deterministic. | Steps 7.1 and 7.2. Determinism by construction: the limiter's clock and sleep are constructor keywords (`tests/test_throttle.py::_Fake`), `run_smoke`'s TTL clock is a keyword (`tests/test_smoke_liveness.py::_Fake`), `lakera._post` is monkeypatched in every Lakera test, `scan_text` is stubbed in every eval test, `smoke._scan_via_path`'s Phase 2 branch is stubbed in every liveness test, and the only real subprocesses are the three in `test_the_budget_is_shared_across_processes`, which touch no network. |
 | **AC8** | Close-out: `advice-refine-test-loop` to zero BLOCKER/HIGH, push, PR with `--body-file`, `dod-check` DONE. | **Out of this plan's scope** — it is the orchestrating session's step, run after Task 7. Do not start it from inside a task. |
+| **AC9** | Boot-smoke liveness cache per §3.8: `run_smoke(..., clock=time.time)` optional; Phase 1 always runs; Phase 2 consults `<cache_dir>/smoke-liveness.json` (`{"schema": 1, "ok": true, "at": <epoch>}`) under flock; a fresh pass within `INJECTION_SCANNER_SMOKE_LIVENESS_TTL_S` (default 3600, clamp `[0, 86400]`, `0` disables) skips the probe and logs `liveness probe: cached pass, <age>s old`; a pass writes atomically; a failure writes nothing and raises; missing/corrupt/foreign/unreadable is a miss; unwritable is not an error; the file holds only a boolean and a timestamp. | `tests/test_smoke_liveness.py` — cache behaviour: `test_a_fresh_cache_runs_the_probe_and_records_the_pass`, `test_a_second_boot_inside_the_ttl_skips_the_probe`, `test_an_expired_entry_is_probed_again_and_rewritten`, `test_the_ttl_is_an_input_and_a_short_one_is_honoured`, `test_a_ttl_of_zero_disables_the_cache`, `test_a_malformed_ttl_falls_back_to_the_default`. Never caching a non-pass: `test_a_failing_probe_writes_nothing_and_still_raises`, `test_a_degraded_layer_is_not_cached_either`. Degradation: `test_an_unusable_cache_entry_is_a_miss` (12 cases), `test_an_unwritable_cache_directory_is_not_an_error`. Containment: `test_the_cache_entry_carries_only_a_boolean_and_a_timestamp`. Phase 1: `test_the_phase_one_canaries_run_on_every_boot`, `test_a_broken_canary_still_fails_on_a_cached_boot`. Signature: `test_the_clock_keyword_is_optional`. Isolation: `tests/conftest.py::_isolated_limiter_state` pins the TTL to `0` suite-wide (D27). |
 
 - [ ] **Step 7.6: Commit nothing**
 
@@ -3391,13 +4552,14 @@ This task changes no files. If `git status --short` is non-empty at the end of S
 | Spec § | Task |
 |---|---|
 | §3.1 `CrossProcessLimiter` (bucket, breaker, lock, state file, `acquire` algorithm, `record_*`, error semantics, aggregate guarantee) | Task 1, Step 1.5 |
-| §3.2 Configuration table, clamps, no feature flag, provisional defaults | Task 1, Steps 1.3/1.5 (`LimiterConfig.from_env`, the range constants) + Task 6 (the README table) |
+| §3.2 Configuration table, clamps, no feature flag, measured defaults | Task 1, Steps 1.3/1.5 (`LimiterConfig.from_env`, the range constants, the measurement in the constants comment) + Task 4b Step 4b.7 (the `SMOKE_LIVENESS_TTL_S` row) + Task 6 (the README table) |
 | §3.3 `lakera.py` integration (key first, `acquire`, the two reasons, 429/503 → `record_throttled`, 200 → `record_success`) | Task 2 |
 | §3.4 `intercept.py` plumbing | Task 3 |
 | §3.5 `eval.py` (`--lakera-max-wait`, `_is_infra_reason`, `EvalInfraError`, exit 3) | Task 4 |
 | §2 goal 3 (per-push CI makes no external calls; live checks nightly + dispatch, never overlapping, smoke gating eval) | Task 5 |
 | §3.6 hermetic `ci.yml` + new `live-eval.yml` | Task 5 |
 | §3.7 README | Task 6 |
+| §3.8 boot-smoke liveness cache (optional `clock`, Phase 1 always runs, the TTL'd `smoke-liveness.json` under flock, pass writes / failure does not, every unusable shape a miss, unwritable is not an error, boolean + timestamp only, `TTL=0` disables) and its seven test bullets | Task 4b |
 | §4 Failure semantics table (all 9 rows) | Rows 1–4 → Task 1 tests; rows 5–7 → Task 2 tests; row 8 (clock step) → Task 1 `test_a_backwards_clock_does_not_mint_tokens`; row 9 (hostile `Retry-After`) → Task 1 parametrised header test + Task 2 state-file test; row 10 (eval infra) → Task 4 |
 | §5 Testing (every bullet) | Tasks 1–5 as listed in the AC table above |
 | §6 Rollout | Out of scope for this repository's PR; steps 2 and 3 belong to research-agent and to the post-measurement retune |
@@ -3410,7 +4572,10 @@ This task changes no files. If `git status --short` is non-empty at the end of S
 - `LimiterConfig(min_interval_s, burst, backoff_base_s, backoff_max_s, lock_wait_s)` — same five fields and same order in the module (Step 1.5), the `_limiter` helper (Step 1.3), `test_an_unusable_state_directory_is_an_error_and_never_raises` (Step 1.9) and `test_a_flagged_two_hundred_still_closes_the_breaker` (Step 2.1).
 - `Decision.ALLOWED / THROTTLED / ERROR` — one spelling everywhere.
 - `CrossProcessLimiter.state_path` / `.lock_path` / `.config` are properties on the class (Step 1.5) and are the ones the tests read (Steps 1.3, 1.7–1.10).
-- `throttle.cache_dir()` and `throttle.default_max_wait_s()` are module-level functions, used by `lakera.check` (Step 2.5) and asserted in Steps 1.3 and 2.1.
+- `throttle.cache_dir()` and `throttle.default_max_wait_s()` are module-level functions, used by `lakera.check` (Step 2.5) and asserted in Steps 1.3 and 2.1. `cache_dir()` is also what `smoke._liveness_paths` builds on (Step 4b.7), so the limiter state and the liveness entry always land in the same directory.
+- The three helpers Task 4b makes public keep ONE spelling each across both modules: `throttle.env_float(name, default, bounds)` (defined Step 4b.3a, called in `default_max_wait_s`, `LimiterConfig.from_env` and `smoke._liveness_ttl_s`), `throttle.file_lock(lock_path, wait_s, *, clock, sleep)` (defined Step 4b.3b, called by `CrossProcessLimiter._locked` and by both smoke helpers), and `throttle.atomic_write_json(path, payload)` (defined Step 4b.3b, called by `CrossProcessLimiter._save` and `smoke._record_liveness_pass`). The private `_env_float` no longer exists anywhere — Step 4b.4 greps for it.
+- `run_smoke(*, log_info=None, log_error=None, clock=time.time)` — keyword-only with every parameter defaulted, matching research-agent's `run_smoke(log_info=log.info, log_error=log.error)` (`~/Repos/research-agent/mcp_server/server.py:2454`), the CI step in Step 5.5, and the calls in Step 4b.5.
+- Liveness-entry JSON keys — `schema`, `ok`, `at` — written in `_record_liveness_pass` (Step 4b.7) and read in `_cached_liveness_age` (Step 4b.7) and every assertion in Step 4b.5. The file name `smoke-liveness.json` and its lock `smoke-liveness.lock` appear in `_LIVENESS_STATE_NAME` / `_LIVENESS_LOCK_NAME` (Step 4b.7), the `cache_file` fixture (Step 4b.5) and the README (Step 6.2).
 - `lakera.check(text, *, max_wait_s=None)` — keyword-only, matching `intercept`'s call (Step 3.3), the spies in Step 2.1 and the stubs in Step 3.4.
 - `scan_text(raw, use_honeypot, use_lakera, lakera_max_wait_s)` — the same four names in `intercept` (Step 3.3), in `evaluate`'s call (Step 4.4) and in every eval stub (Steps 4.1).
 - `EvalInfraError(case_id, reason)` with attributes `.case_id` / `.reason` — raised in `evaluate` (Step 4.4), read in `_main` (Step 4.5) and asserted in Step 4.1.
@@ -3422,8 +4587,9 @@ This task changes no files. If `git status --short` is non-empty at the end of S
 
 - Step 1.7's `test_a_wait_budget_shorter_than_the_gap_refuses_without_waiting` originally asserted `fake.sleeps == [1.0, 1.0, 1.0]`. Traced through `acquire`: with a 10 s gap and a 3 s budget the deadline check fires on the FIRST pass, so no sleep happens at all. Corrected to `== []`, which is also the stronger statement.
 - Step 1.9's lock-timeout assertion originally pinned `len(fake.sleeps) == 40`. At an epoch near 1.7e9 the float ulp is ~2.4e-7, so forty additions of 0.05 accumulate enough error to land on either side of the deadline. Replaced with `set(fake.sleeps) == {0.05}` plus `abs(sum(...) - 2.0) < 0.1`, which pins the retry interval and the budget without depending on float luck.
-- Task 1 originally had the conftest set only `INJECTION_SCANNER_CACHE_DIR`. Traced the existing suite against the production defaults: `tests/test_lakera.py::test_throttling_is_distinguishable_from_an_expired_key` makes three `check()` calls in one test (the third would be `THROTTLED` at `burst=2`) and its first call raises a 429 (which would open the breaker over the 401 and 503 that follow). Added `MIN_INTERVAL_S=0` and `BACKOFF_MAX_S=0` — the spec's own documented "off" configuration — and made that D1.
+- Task 1 originally had the conftest set only `INJECTION_SCANNER_CACHE_DIR`. Traced the existing suite against the production defaults: `tests/test_lakera.py::test_throttling_is_distinguishable_from_an_expired_key` raises a 429 on its first `check()` call, which opens the breaker for `backoff_base_s` over the 401 and 503 calls that follow in the same test. Added `MIN_INTERVAL_S=0` and `BACKOFF_MAX_S=0` — the spec's own documented "off" configuration — and made that D1. (The bucket half of the hazard shrank when the defaults were re-measured on 2026-09-06 — `burst` went 2 → 10 — but the breaker half is unchanged and is on its own sufficient, so D1 stands as written.)
 - Task 3 originally passed `max_wait_s` conditionally to keep the three one-argument `lakera.check` stubs in `tests/test_intercept.py` working. That hides a real signature change behind a branch and leaves the keyword path untested on the common route. Changed to an unconditional keyword plus explicit stub edits, recorded as D12.
+- **The defaults and Task 4b landed on 2026-09-06, from the 4-hour measurement.** Spec §3.2 and §3.8 were rewritten and this plan followed. Three changes. (a) The provisional constants became measured ones — `MIN_INTERVAL_S` 15 → 300, `BURST` 2 → 10, `BACKOFF_BASE_S` 30 → 300, `BACKOFF_MAX_S` 600 → 3600, clamps unchanged — because Lakera publishes exactly one limit (10,000 requests/month = one per 4.3 min) and it matches the measured throttle trickle; the two default-asserting tests in Step 1.3 and the constants comment in Step 1.5 were updated with it, and D1's reasoning was re-derived from the breaker rather than the bucket, since `burst=10` no longer bites at three calls. (b) Task 5's CI pacing went from `MIN_INTERVAL_S=30` alone to `MIN_INTERVAL_S=60` **plus** `BURST=2` on both jobs, the eval timeout from 30 to 45 minutes and its wait budget from 900 to 1800 s; `BURST` is the one that mattered — a runner's fresh cache directory starts its bucket FULL, so without it the fleet default of ten would have left as one clump. (c) Task 4b is new: §3.8's liveness cache, inserted between Tasks 4 and 5 rather than renumbered in, because implementer briefs already referenced Tasks 5–7 by number. Task 4b also promotes three `throttle.py` helpers from private to public (D22) so it can share the flock and atomic-write discipline instead of copying it; Task 1's tests pass unchanged across that extraction, which Step 4b.4 verifies before anything else is built on it.
 - **Task 5 was rewritten on 2026-09-06** after the maintainer added "ci tests should not call external services in general, smell. Sceptical of calling lakera/honeypots in ci" and spec §3.6 was rewritten to match. The first version paced and serialised the Lakera jobs *inside* `ci.yml`; that is now split into a hermetic `ci.yml` (no vendor call, no secret, no fork guard) plus a new `live-eval.yml` on `schedule` + `workflow_dispatch`. The guard test changed shape with it: `test_every_job_that_touches_lakera_is_in_that_group` — which enumerated jobs holding `LAKERA_API_KEY` — was replaced by `test_ci_references_no_secret_at_all`, a negative over the whole gate file, because the property being defended is now "no vendor on the gate" rather than "every vendor job is grouped". D15, D16, D19 and D20 were rewritten or added; Task 6's CI paragraph and Task 7's AC5/AC6 rows and diff-stat follow. Tasks 1–4 and 7's other rows are untouched: nothing in the limiter, `lakera.py`, `intercept.py` or `eval.py` depends on which workflow calls it.
 
 ---
@@ -3436,4 +4602,8 @@ This task changes no files. If `git status --short` is non-empty at the end of S
 4. **§3.4's "no other behaviour change" costs three test edits.** Always passing `max_wait_s=` breaks the one-argument `lakera.check` stubs at `tests/test_intercept.py:210, 263, 283`. Production behaviour is unchanged; the stubs gain `**_kw` (D12).
 5. **`acquire`'s error catch is widened.** §3.1 says `OSError`/`ValueError` yield `ERROR`. `intercept.scan_text:323` does not wrap `lakera.check`, so anything else escaping `acquire` would abort the scan rather than reject the report. The plan catches `Exception` — a superset that can only add fail-closed refusals (D3).
 6. **The README contradicts itself once the section lands.** `README.md:13` says L2 and L4 are "planned, not yet wired"; both are wired (`intercept.py:322`, `:423`). Corrected in Task 6 (D18).
-7. **Spec §3.6 was rewritten mid-plan (2026-09-06).** The version this plan was first written against paced the Lakera jobs inside `ci.yml`; the current one splits them into a hermetic `ci.yml` plus a scheduled `live-eval.yml`. Task 5 implements the CURRENT §3.6. Two details the spec leaves as `...` in its YAML sketch are settled here: the job bodies are the ones deleted from `ci.yml`, verbatim minus the fork guards (there are no fork events on `schedule`/`workflow_dispatch` to guard against), and `INJECTION_SCANNER_LAKERA_MIN_INTERVAL_S` sits at job level on both jobs (D15) rather than on the eval step, which is where the pre-rewrite plan had put it.
+7. **§3.8 asks for "the same flock discipline as the limiter", which Task 1 makes private.** The limiter's lock loop is `CrossProcessLimiter._locked`, its atomic write is `._save`, and its clamped env parser is `_env_float` — all private, and the first two bound to the limiter's own paths and config. Nothing outside `throttle.py` can reuse them as written. Task 4b promotes exactly three: `env_float` (rename), and module-level `file_lock` / `atomic_write_json` extracted from those two methods, which then delegate (D22). Step 4b.4 runs Task 1's own tests across the extraction before anything is built on it, so "no behaviour change" is measured rather than asserted.
+8. **§3.8 says "with `_scan_via_path` stubbed", but both phases go through it.** `injection_scanner/smoke.py:116` runs each Phase 1 canary through `_scan_via_path(p, use_honeypot=False, use_lakera=False)`, and `:140` runs the Phase 2 probe through `_scan_via_path(_BENIGN_PROBE, use_honeypot=True, use_lakera=True)`. A blanket stub would therefore disable the Phase 1 canaries — the very thing §3.8's last test bullet ("Phase 1 canaries run on every call regardless") exists to check, which would then be asserting against a stub. The plan's `_Probe` (Step 4b.5) branches on `use_honeypot`: Phase 2 is counted and answered, Phase 1 is DELEGATED to the real function, which touches no network and no key because both layer flags are already off.
+9. **§3.8's "logs … and returns success" collides with the existing success line.** `smoke.py:166-169` ends every passing run with `scanner self-test OK (… lakera + honeypot live via scan(Path))`. Reusing it on a cache hit would state that a vendor was contacted when none was; omitting it would leave consumers that key on the completion marker (research-agent logs its own line after `run_smoke` returns, but an operator reading the journal does not) with no OK line at all. The plan logs BOTH: the spec's exact `liveness probe: cached pass, <age>s old`, then a completion line ending `lakera + honeypot liveness from cache` (D26).
+10. **§3.8's "PASS" is three checks, not one.** Phase 2 rejects on `not v.ok` (`smoke.py:141`), on `v.layers.get("lakera") != "pass"` (`:149`), and on `v.layers.get("honeypot") != "pass"` (`:157`). "A PASS writes the file" therefore means all three, and `_record_liveness_pass` is called only after the third — `test_a_degraded_layer_is_not_cached_either` pins the `ok=True` but degraded-layer case that would otherwise slip through a one-check reading. Relatedly, §3.8's parenthetical "leaves any older entry as it was (it is already older than the TTL, or the probe would not have run)" holds for the expiry path but not for the corrupt/foreign/future-dated ones, where a *fresh-looking* but unusable entry survives a failed probe. That is harmless — it was a miss and stays a miss — and the plan does not delete it, because deleting a file on a failure path is a new way for a boot to do damage.
+11. **Spec §3.6 was rewritten mid-plan (2026-09-06).** The version this plan was first written against paced the Lakera jobs inside `ci.yml`; the current one splits them into a hermetic `ci.yml` plus a scheduled `live-eval.yml`. Task 5 implements the CURRENT §3.6. Two details the spec leaves as `...` in its YAML sketch are settled here: the job bodies are the ones deleted from `ci.yml`, verbatim minus the fork guards (there are no fork events on `schedule`/`workflow_dispatch` to guard against), and `INJECTION_SCANNER_LAKERA_MIN_INTERVAL_S` sits at job level on both jobs (D15) rather than on the eval step, which is where the pre-rewrite plan had put it.
