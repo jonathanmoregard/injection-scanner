@@ -165,6 +165,17 @@ def _is_infra_reason(reason: object) -> bool:
 # `fp_agent_tooling_prose.md`, is 25) with room for a descriptive name; it is a
 # limit on a NAME, not a tuned constant. Raising it is safe and changes nothing
 # structural.
+#
+# The id is ALSO a path: `load_corpus_dir` reads `<directory>/<id>` for any row
+# that omits `text`. Printable ASCII includes `/`, `\` and `.`, so before this
+# rule a row could name `../../.ssh/id_ed25519` or `/etc/hostname` and pull any
+# readable file on the box into a case's text — where the honeypot and the
+# Lakera layer then hand it to third-party providers. So an id is a single NAME
+# and never a path: no separator in either spelling, and never a relative-path
+# component. Enforced here rather than in the loader so `load_jsonl`,
+# `load_corpus_dir` and a direct construction all get the same rule; the
+# loader's own resolved-path check is the second guard, for the shapes a string
+# rule cannot see (a symlink planted inside the corpus).
 _MAX_CASE_ID_LEN = 64
 _PRINTABLE_ASCII = frozenset(chr(c) for c in range(0x20, 0x7F))
 
@@ -192,6 +203,15 @@ def _validate_case_id(case_id: object) -> str:
             "case id must be a single line of printable ASCII "
             "(no newlines, control characters or non-ASCII)"
         )
+    if "/" in case_id or "\\" in case_id:
+        raise ValueError(
+            "case id must be a single file name, not a path "
+            "(no '/' or '\\' separators)"
+        )
+    # With both separators refused the id is exactly one path component, so
+    # `.` and `..` are the whole of what is left to reject.
+    if case_id in (".", ".."):
+        raise ValueError("case id must not be a relative-path component")
     return case_id
 
 
@@ -536,11 +556,29 @@ def load_corpus_dir(directory: str | Path) -> list[EvalCase]:
     The labels file gives one line per case. If a line omits `text`, the text
     is read from `<directory>/<id>` (the fixture file), letting a corpus store
     labels separately from the raw fixtures on disk.
+
+    The id is therefore a PATH here, and it is checked BEFORE anything is
+    opened — the read used to happen first, with `EvalCase` validating the id
+    only afterwards, so a row naming `../../.ssh/id_ed25519` had already been
+    read by the time anything objected. Two guards, because neither covers the
+    other:
+
+      * `_validate_case_id` refuses separators and relative-path components,
+        so an id is a single NAME;
+      * the RESOLVED fixture path must still sit inside the resolved corpus
+        directory, which is what catches a symlink planted inside the corpus —
+        a shape no string rule can see. The cost is that a corpus cannot share
+        fixtures by linking out of its own directory, which is the right trade
+        for a loader whose input decides what gets sent to a provider.
+
+    Both raise `ValueError`, which `_main` renders as a usage error (exit 2)
+    like any other unreadable corpus, and neither message echoes the id.
     """
     directory = Path(directory)
     labels_path = directory / "labels.jsonl"
     if not labels_path.exists():
         raise FileNotFoundError(f"no labels.jsonl in {directory}")
+    base = directory.resolve()
     cases: list[EvalCase] = []
     with open(labels_path, encoding="utf-8") as fh:
         for lineno, line in enumerate(fh, start=1):
@@ -548,11 +586,23 @@ def load_corpus_dir(directory: str | Path) -> list[EvalCase]:
             if not line:
                 continue
             obj = json.loads(line)
+            try:
+                case_id = _validate_case_id(obj["id"])
+            except ValueError as exc:
+                # The line number is the whole of what an operator needs; the
+                # id is deliberately not echoed (see `_validate_case_id`).
+                raise ValueError(f"{labels_path}:{lineno}: {exc}") from exc
             text = obj.get("text")
             if text is None:
-                text = (directory / obj["id"]).read_text(encoding="utf-8")
+                fixture = (base / case_id).resolve()
+                if not fixture.is_relative_to(base):
+                    raise ValueError(
+                        f"{labels_path}:{lineno}: fixture path resolves outside "
+                        "the corpus directory"
+                    )
+                text = fixture.read_text(encoding="utf-8")
             cases.append(
-                EvalCase(id=obj["id"], text=text, expected=obj["expected"])
+                EvalCase(id=case_id, text=text, expected=obj["expected"])
             )
     return cases
 

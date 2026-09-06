@@ -759,3 +759,110 @@ def test_the_infra_line_for_a_valid_id_is_unchanged(
     _reason_scan(monkeypatch, {"a": ["lakera_unavailable:throttled"]})
     assert _main([str(corpus)]) == 3
     assert capsys.readouterr().err.strip() == "INFRA a lakera_unavailable:throttled"
+
+
+# ---------------------------------------------------------------------------
+# The case id is also a PATH, and it was used as one before it was checked.
+#
+# `load_corpus_dir` reads `<directory>/<id>` for any row that omits `text`, and
+# it did that read BEFORE constructing the `EvalCase` that validates the id —
+# which anyway permitted `/` and `..`, since those are printable ASCII. So a
+# labels.jsonl row could name `../../.ssh/id_ed25519` or `/etc/hostname` and
+# pull any readable file on the box into a case's text, where the honeypot and
+# the Lakera layer then send it to third-party providers.
+#
+# Two guards, because either alone leaves a hole: the id is validated (no
+# separators, no `..`) BEFORE anything is opened, and the resolved fixture path
+# must still sit inside the corpus directory — which is what catches a SYMLINK
+# planted inside the corpus, a shape no amount of string checking sees.
+# ---------------------------------------------------------------------------
+
+_CANARY_MARKER = "CORPUS_ESCAPE_CANARY_MARKER_20260906"
+
+
+@pytest.fixture
+def recorded_reads(monkeypatch):
+    """Every path `Path.read_text` actually opens, resolved."""
+    seen: list[Path] = []
+    real = Path.read_text
+
+    def _spy(self, *args, **kwargs):
+        seen.append(Path(self).resolve())
+        return real(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "read_text", _spy)
+    return seen
+
+
+def _corpus_with_id(tmp_path: Path, case_id: str) -> tuple[Path, Path]:
+    """A corpus directory whose single row names `case_id` and omits `text`,
+    plus a canary file OUTSIDE it that no legitimate load can reach."""
+    canary = tmp_path / "secret.md"
+    canary.write_text(_CANARY_MARKER, encoding="utf-8")
+    corpus = tmp_path / "corpus"
+    (corpus / "sub").mkdir(parents=True)
+    (corpus / "labels.jsonl").write_text(
+        json.dumps({"id": case_id, "expected": "pass"}) + "\n", encoding="utf-8"
+    )
+    return corpus, canary
+
+
+@pytest.mark.parametrize(
+    "case_id",
+    [
+        pytest.param("../secret.md", id="parent-escape"),
+        pytest.param("sub/../../secret.md", id="normalised-escape"),
+        pytest.param("/etc/hostname", id="absolute"),
+        pytest.param("sub/nested.md", id="subdirectory"),
+        pytest.param("..", id="bare-dotdot"),
+        pytest.param(r"..\secret.md", id="backslash"),
+    ],
+)
+def test_a_case_id_that_is_a_path_never_reads_anything(
+    tmp_path: Path, recorded_reads, case_id: str
+) -> None:
+    corpus, canary = _corpus_with_id(tmp_path, case_id)
+    with pytest.raises(ValueError) as excinfo:
+        load_corpus_dir(corpus)
+    # The rule is stated; the offending id is not echoed, exactly as for every
+    # other illegal id.
+    assert case_id not in str(excinfo.value)
+    assert canary.resolve() not in recorded_reads
+    assert recorded_reads == [], "nothing is opened before the id is checked"
+
+
+def test_a_fixture_symlinked_out_of_the_corpus_is_refused(
+    tmp_path: Path, recorded_reads
+) -> None:
+    """A legal-looking id whose fixture is a link out of the corpus. No string
+    check can see this one — the resolved path is what catches it."""
+    corpus, canary = _corpus_with_id(tmp_path, "escape.md")
+    (corpus / "escape.md").symlink_to(canary)
+    with pytest.raises(ValueError) as excinfo:
+        load_corpus_dir(corpus)
+    assert _CANARY_MARKER not in str(excinfo.value)
+    assert canary.resolve() not in recorded_reads
+
+
+def test_a_path_shaped_id_is_a_usage_error_not_a_traceback(
+    monkeypatch, tmp_path: Path, capsys
+) -> None:
+    """And it leaves through the usage exit like every other bad corpus row:
+    exit 2, no traceback, nothing scanned."""
+    corpus = tmp_path / "c.jsonl"
+    corpus.write_text(
+        json.dumps({"id": "../secret.md", "text": "a", "expected": "pass"}) + "\n",
+        encoding="utf-8",
+    )
+    err = _usage_error(monkeypatch, [str(corpus)], capsys)
+    assert "corpus" in err
+    assert "Traceback" not in err
+    assert "../secret.md" not in err
+
+
+def test_an_ordinary_corpus_directory_still_loads(tmp_path: Path) -> None:
+    """The control: a plain fixture name beside labels.jsonl loads as before."""
+    corpus, _ = _corpus_with_id(tmp_path, "case.md")
+    (corpus / "case.md").write_text("ordinary fixture text", encoding="utf-8")
+    cases = load_corpus_dir(corpus)
+    assert [(c.id, c.text) for c in cases] == [("case.md", "ordinary fixture text")]
