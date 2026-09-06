@@ -18,6 +18,8 @@ CLI:
 
 Always exits 0 (measurement, not a gate) UNLESS --min-recall is passed, in
 which case it exits 1 when recall falls below the floor (lets CI enforce it).
+A scanner OUTAGE exits 3 instead — see `_is_infra_reason`; it is not a
+measurement, so it is not scored and no scorecard is printed.
 
 With the hosted layers live, one scan is a sample from an LLM. Pass
 --confirm-disagreements N to re-scan only the cases whose verdict disagrees
@@ -39,6 +41,90 @@ from injection_scanner.intercept import scan_text
 BLOCK = "block"
 PASS = "pass"
 _VALID = {BLOCK, PASS}
+
+
+# ---------------------------------------------------------------------------
+# Infra classification.
+#
+# An OUTAGE is not a classification. `scan_text` fails closed, so a degraded
+# layer returns ok=False and therefore AGREES with every injection-labelled
+# case: a Lakera outage would score recall 1.0 on a scanner that classified
+# nothing, and the gate would go green. Measured 2026-09-05: with Lakera
+# answering 429 to ~3 of every 4 calls, this harness would have reported a
+# perfect scorecard.
+#
+# The rule below is a VERBATIM port of research-agent's
+# `mcp_server/server.py::_is_infra_reason`, deliberately: the two repositories
+# have to agree on what "the scanner is down" looks like, and a rule that
+# drifts is worse than no rule. It is head-ANCHORED and CLOSED — never a
+# substring search, and the default is False, so an unrecognised reason is
+# treated as content-derived and still scores.
+# ---------------------------------------------------------------------------
+
+# The head segment of every layer outage reason: `lakera_unavailable`,
+# `honeypot_unavailable`, `judge_unavailable`, `unicode_sanitize_unavailable`,
+# `secret_shapes_unavailable`.
+_INFRA_REASON_HEAD_SUFFIX = "_unavailable"
+
+# Reason prefixes that WRAP another layer's reason. `intercept.py` re-emits
+# the honeypot's own result reason under `honeypot:` and the L4 judge's under
+# `lakera_arbitration:`, so a genuine outage arrives one segment deeper than
+# it was raised. An explicit set rather than "look at segment 1 too", so that
+# `secret_shape:thing_unavailable` — a rule NAME that merely ends in the
+# suffix — cannot be mistaken for an outage.
+_INFRA_WRAPPER_PREFIXES = frozenset({"honeypot", "lakera_arbitration"})
+
+# Standalone setup codes. Today they only appear as the tail of
+# `lakera_unavailable:<code>`; listed so a future call site emitting one bare
+# is still classified as infra rather than silently scored.
+_INFRA_BARE_REASONS = frozenset({"no-key", "key-config-error", "bad-response"})
+
+
+class EvalInfraError(RuntimeError):
+    """A scanner outage during an eval run — not a classification.
+
+    Carries the case that hit it and the scanner's own reason. Both are
+    scanner-synthesized, closed-vocabulary strings (a layer name, a condition,
+    an exception TYPE name, a bounded HTTP status), which is why `_main` can
+    print them: setup and infra failures are meant to be readable without a
+    dive into the isolation zone. Nothing derived from the scanned text is in
+    either field.
+    """
+
+    def __init__(self, case_id: str, reason: str) -> None:
+        super().__init__(f"{case_id} {reason}")
+        self.case_id = case_id
+        self.reason = reason
+
+
+def _infra_segments(reason: str) -> list[str]:
+    """Split a reason into tokens, dropping the `+skipped=N/M` suffix.
+
+    The honeypot appends `+skipped=<n>/<total>` to its top-line reason, which
+    would otherwise glue itself to the last token and defeat the match.
+    """
+    return [seg.split("+", 1)[0] for seg in reason.split(":")]
+
+
+def _is_infra_reason(reason: object) -> bool:
+    """True iff `reason` is a positively-recognised setup/infra outage code.
+
+    Default False: an unrecognised or malformed reason is treated as
+    content-derived and still scores. Matching is anchored at the head segment
+    (or at segment 1 behind a known wrapper prefix), never a substring search.
+    """
+    if not isinstance(reason, str) or not reason:
+        return False
+    segments = _infra_segments(reason)
+    if segments[0].endswith(_INFRA_REASON_HEAD_SUFFIX):
+        return True
+    if (
+        segments[0] in _INFRA_WRAPPER_PREFIXES
+        and len(segments) > 1
+        and segments[1].endswith(_INFRA_REASON_HEAD_SUFFIX)
+    ):
+        return True
+    return reason in _INFRA_BARE_REASONS
 
 
 @dataclass
@@ -243,6 +329,7 @@ def evaluate(
     use_honeypot: bool = False,
     use_lakera: bool = False,
     confirm_disagreements: int = 0,
+    lakera_max_wait_s: float | None = None,
 ) -> Scorecard:
     """Run scan_text over each case and score against expected labels.
 
@@ -273,6 +360,18 @@ def evaluate(
     outcome is kept on each row and reported by `Scorecard.format` as the
     single-shot numbers, because one scan per report is what production
     gets: the weakness is surfaced, not absorbed.
+
+    `lakera_max_wait_s` is how long each L2 call may queue for its turn in the
+    fleet-wide Lakera budget. A batch run would rather wait than be refused,
+    which is the opposite of what an interactive scan wants — hence a
+    parameter rather than a global.
+
+    Raises `EvalInfraError` on the FIRST verdict whose reason is a recognised
+    outage, before any further case is scanned. An outage is not a
+    classification: `scan_text` fails closed, so a degraded layer agrees with
+    every injection label and would inflate recall. Aborting also bounds the
+    cost — a throttled Lakera pays for one probe per breaker window rather
+    than one per case.
     """
     if confirm_disagreements < 0:
         raise ValueError(
@@ -285,8 +384,18 @@ def evaluate(
         while True:
             attempts += 1
             verdict = scan_text(
-                case.text, use_honeypot=use_honeypot, use_lakera=use_lakera
+                case.text,
+                use_honeypot=use_honeypot,
+                use_lakera=use_lakera,
+                lakera_max_wait_s=lakera_max_wait_s,
             )
+            if _is_infra_reason(verdict.reason):
+                # Stop the whole run, here, before this verdict is turned into
+                # a prediction. Scoring it would credit the scorecard for a
+                # layer that never classified anything, and re-scanning it
+                # under `confirm_disagreements` would just spend more of the
+                # budget on a layer that is down.
+                raise EvalInfraError(case.id, verdict.reason)
             predicted = PASS if verdict.ok else BLOCK
             if first_predicted is None:
                 first_predicted = predicted
@@ -412,15 +521,39 @@ def _main(argv: list[str] | None = None) -> int:
         "still fails). Agreeing cases are never re-scanned. The scorecard "
         "reports the first-attempt numbers alongside. Default 0: single shot.",
     )
+    parser.add_argument(
+        "--lakera-max-wait",
+        type=float,
+        default=900.0,
+        metavar="SECONDS",
+        help="how long each Lakera call may WAIT for its turn in the "
+        "fleet-wide budget before it is refused. An eval run is always a "
+        "batch caller, so it queues rather than failing; the default is 900 "
+        "(15 minutes). 0 refuses immediately, which is what an interactive "
+        "scan does. On the CLI rather than in the environment because being "
+        "correct by default beats depending on the operator remembering.",
+    )
     args = parser.parse_args(argv)
 
     cases = load_jsonl(args.corpus)
-    card = evaluate(
-        cases,
-        use_honeypot=args.use_honeypot,
-        use_lakera=args.use_lakera,
-        confirm_disagreements=args.confirm_disagreements,
-    )
+    try:
+        card = evaluate(
+            cases,
+            use_honeypot=args.use_honeypot,
+            use_lakera=args.use_lakera,
+            confirm_disagreements=args.confirm_disagreements,
+            lakera_max_wait_s=args.lakera_max_wait,
+        )
+    except EvalInfraError as e:
+        # Exit 3, distinct from 1 (a threshold failed) and 2 (argparse usage),
+        # so a CI log says "the scanner was down" rather than "recall
+        # regressed". No scorecard is printed: there isn't one, and printing a
+        # partial card is how an outage gets mistaken for a measurement.
+        #
+        # Both fields are scanner-synthesized closed-vocabulary strings, which
+        # is why they can be said out loud here.
+        print(f"INFRA {e.case_id} {e.reason}", file=sys.stderr)
+        return 3
     print(card.format())
 
     failed = False
