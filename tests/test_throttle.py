@@ -231,16 +231,34 @@ def test_zero_min_interval_disables_the_bucket_but_not_the_breaker(tmp_path):
     assert lim.acquire() is Decision.THROTTLED
 
 
-def test_a_backwards_clock_does_not_mint_tokens(tmp_path):
-    fake = _Fake()
-    lim = _limiter(tmp_path, fake, min_interval_s=10.0, burst=1)
-    assert lim.acquire() is Decision.ALLOWED
+def test_a_backwards_clock_neither_mints_tokens_nor_confiscates_them(tmp_path):
+    """An NTP step or a VM resume must leave the budget exactly as it was.
 
-    fake.now -= 3600.0                          # NTP step, or a VM resume
+    `burst >= 2` is what makes this discriminating, and the reason this test
+    is written the way it is. With `burst=1` the balance is empty whenever
+    the clock moves, so dropping the `max(0.0, ...)` around `elapsed` in
+    `_attempt` produced a limiter that re-crossed one token at the very same
+    instant as the correct one, and the test passed either way. With a
+    PARTLY FULL bucket the two diverge on the first call after the step: a
+    negative elapsed subtracts a debt from a balance that was about to be
+    spent, and tokens the fleet has already paid for silently vanish.
+    """
+    fake = _Fake()
+    lim = _limiter(tmp_path, fake, min_interval_s=10.0, burst=3)
+    assert lim.acquire() is Decision.ALLOWED    # 3.0 -> 2.0
+
+    fake.now -= 100.0                           # ten intervals backwards
+    # Confiscates nothing: elapsed clamps to 0, so the balance is still 2.0
+    # rather than 2.0 - 10.0. Both remaining tokens are still spendable.
+    assert lim.acquire() is Decision.ALLOWED    # 2.0 -> 1.0
+    assert lim.acquire() is Decision.ALLOWED    # 1.0 -> 0.0
     assert lim.acquire() is Decision.THROTTLED
 
-    fake.now += 3610.0                          # forward again, past the gap
+    # ...and mints nothing either: measured from the stepped-back instant,
+    # one interval buys exactly one token, not the eleven the step spans.
+    fake.now += 10.0
     assert lim.acquire() is Decision.ALLOWED
+    assert lim.acquire() is Decision.THROTTLED, "one interval buys one token"
 
 
 # ---------- the circuit breaker ----------
@@ -364,6 +382,32 @@ def test_the_breaker_half_opens_and_a_further_throttle_reopens_it_longer(tmp_pat
     assert _open_for(lim, fake) == 20.0
 
 
+def test_a_shorter_retry_after_never_shrinks_an_already_open_breaker(tmp_path):
+    """`open_until = max(open_until, now + delay)`, never plain assignment.
+
+    Concurrent callers land out of order: several processes can be in flight
+    when Lakera starts refusing, and the one that arrives second may carry a
+    much shorter `Retry-After` than the one that arrived first. Assignment
+    would let that straggler REOPEN the fleet ten minutes early and walk it
+    straight back into the throttle — the breaker may only ever be extended
+    by a throttle, and only `record_success` shortens it.
+    """
+    fake = _Fake()
+    lim = _limiter(
+        tmp_path, fake, min_interval_s=0.0, burst=1, backoff_max_s=3600.0
+    )
+    lim.record_throttled("600")
+    assert _open_for(lim, fake) == 600.0
+
+    lim.record_throttled("5")
+    assert _open_for(lim, fake) == 600.0, "a shorter header must not shrink it"
+
+    fake.now += 100.0
+    assert lim.acquire() is Decision.THROTTLED, (
+        "still shut at now+100: the 600 s decision stands"
+    )
+
+
 # ---------- durability and failure modes ----------
 
 @pytest.mark.parametrize(
@@ -379,25 +423,49 @@ def test_the_breaker_half_opens_and_a_further_throttle_reopens_it_longer(tmp_pat
         '{"schema": 1, "tokens": "lots"}',
         '{"schema": 1, "tokens": NaN, "updated_at": 0.0, '
         '"open_until": 0.0, "failures": 0}',
+        '{"schema": 1, "tokens": 0.0, "updated_at": 0.0, '
+        '"open_until": NaN, "failures": 0}',
+        '{"schema": 1, "tokens": 0.0, "updated_at": 0.0, '
+        '"open_until": Infinity, "failures": 0}',
     ],
     ids=[
         "empty", "truncated", "null", "array", "garbage",
-        "foreign-schema", "wrong-type", "nan",
+        "foreign-schema", "wrong-type", "nan-tokens",
+        "nan-open-until", "inf-open-until",
     ],
 )
 def test_an_unusable_state_file_is_a_reset_not_an_error(tmp_path, blob):
     """A torn file after a crash must not brick every scanner on the box.
 
-    The foreign-schema case carries an `open_until` far in the future on
-    purpose: a breaker this limiter cannot read must not be able to park it.
+    Every case asserts the WHOLE reset state, not merely that the call went
+    through, because each field is discarded for its own reason and a test
+    that only watches the `Decision` misses most of them.
+
+    `json.loads` accepts bare `NaN` and `Infinity`, and the two hide from
+    arithmetic in opposite directions: `now < NaN` is False, so a NaN breaker
+    reads as permanently CLOSED, while `Infinity` reads as one that never
+    reopens. Neither is caught by any `min()`/`max()` downstream — only by the
+    explicit `math.isfinite` check in `_load` — so the non-finite value is
+    placed in `open_until`, where no later clamp can launder it. Putting it in
+    `tokens` instead is not a real test of that check: `min(burst, NaN)`
+    happens to return `burst`, and the refill rescues the file by accident.
+
+    The foreign-schema case carries an `open_until` far in the future AND
+    `failures: 7` on purpose: a breaker this limiter cannot read must be able
+    neither to park it nor to hand it a backoff it never earned.
     """
     fake = _Fake()
-    lim = _limiter(tmp_path, fake, min_interval_s=10.0, burst=1)
+    lim = _limiter(tmp_path, fake, min_interval_s=10.0, burst=3)
     lim.state_path.parent.mkdir(parents=True, exist_ok=True)
     lim.state_path.write_text(blob, encoding="utf-8")
 
     assert lim.acquire() is Decision.ALLOWED
-    assert _state(lim)["schema"] == 1
+    st = _state(lim)
+    assert st["schema"] == 1
+    # A full bucket less the one call just spent — not the corrupt balance.
+    assert st["tokens"] == 2.0
+    assert st["open_until"] == 0.0, "a breaker that cannot be read is CLOSED"
+    assert st["failures"] == 0
 
 
 def test_an_unusable_state_directory_is_an_error_and_never_raises(tmp_path):
@@ -459,14 +527,63 @@ def test_a_zero_lock_wait_budget_is_an_error_when_the_lock_is_held(tmp_path):
         os.close(holder)
 
 
-def test_the_state_file_is_written_atomically(tmp_path):
-    """`.tmp` + `os.replace`, so no reader ever sees a half-written bucket."""
+def test_the_state_file_is_written_atomically(tmp_path, monkeypatch):
+    """`.tmp` + `os.replace`, so no reader ever sees a half-written bucket.
+
+    Asserting only "no leftover `.tmp`" is not a test of atomicity: a plain
+    `state_path.write_text(...)` satisfies it perfectly, and that is exactly
+    the implementation this test exists to rule out. So the replace itself is
+    observed — that it happened at all, that its source is the `.tmp` sibling
+    and its destination the state file.
+    """
     fake = _Fake()
-    lim = _limiter(tmp_path, fake, min_interval_s=10.0, burst=1)
+    lim = _limiter(tmp_path, fake, min_interval_s=10.0, burst=2)
+
+    seen: list[tuple[Path, Path]] = []
+    real_replace = os.replace
+
+    def recording_replace(src, dst, *args, **kwargs):
+        seen.append((Path(src), Path(dst)))
+        return real_replace(src, dst, *args, **kwargs)
+
+    monkeypatch.setattr(throttle.os, "replace", recording_replace)
     assert lim.acquire() is Decision.ALLOWED
+
+    assert seen, "the state was written without going through os.replace"
+    src, dst = seen[-1]
+    assert dst == lim.state_path
+    assert src == lim.state_path.parent / (lim.state_path.name + ".tmp")
     assert lim.state_path.exists()
     leftovers = list(lim.state_path.parent.glob("*.tmp"))
     assert leftovers == [], f"temp file not replaced: {leftovers}"
+
+
+def test_a_failed_write_leaves_the_previous_state_intact(tmp_path, monkeypatch):
+    """The whole point of the temp file: a write that dies costs the UPDATE,
+    never the state that was already on disk.
+
+    Writing in place would truncate the file first and leave a reader — or
+    the next process to start — with an empty bucket and a closed breaker,
+    which is precisely the fleet-wide amnesia the limiter exists to prevent.
+    """
+    fake = _Fake()
+    lim = _limiter(tmp_path, fake, min_interval_s=10.0, burst=2)
+    assert lim.acquire() is Decision.ALLOWED
+    before = lim.state_path.read_bytes()
+
+    def failing_replace(src, dst, *args, **kwargs):
+        raise OSError("no space left on device")
+
+    monkeypatch.setattr(throttle.os, "replace", failing_replace)
+
+    # Fail-closed rather than raising, and the recorders swallow their own.
+    assert lim.acquire() is Decision.ERROR
+    lim.record_throttled("30")
+    lim.record_success()
+
+    assert lim.state_path.read_bytes() == before, (
+        "a failed write must not damage the state that was already there"
+    )
 
 
 # ---------- the property the whole module exists for ----------

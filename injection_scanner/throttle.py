@@ -352,10 +352,6 @@ class CrossProcessLimiter:
         return cls(cache_dir(), LimiterConfig.from_env(), name=name)
 
     @property
-    def config(self) -> LimiterConfig:
-        return self._config
-
-    @property
     def state_path(self) -> Path:
         return self._state_path
 
