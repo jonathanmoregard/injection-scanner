@@ -50,6 +50,7 @@ import json
 import os
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 from dataclasses import dataclass, field
 
@@ -231,6 +232,27 @@ def _retry_after(e: BaseException) -> str | None:
     return value if isinstance(value, str) else None
 
 
+def _is_https(url: str) -> bool:
+    """True only for a URL whose scheme is exactly `https`.
+
+    `LAKERA_GUARD_URL` is an operator input, and the next thing that happens to
+    the URL is that `Bearer <the shared Lakera key>` is attached to it. Over
+    `http://` that key crosses the wire in cleartext — and `urlopen` honours
+    `http_proxy`/`all_proxy`, so a proxy variable in the environment is enough
+    to route it through a host nobody chose deliberately. Every other scheme is
+    worse in its own way (`file://` reads a local path and calls it a verdict).
+
+    `urlsplit` lowercases the scheme, so `HTTPS://` is accepted — that is RFC
+    3986's own rule, not a widening. Total: `urlsplit` raises `ValueError` on a
+    malformed authority (an unbalanced IPv6 bracket), and a URL that cannot be
+    parsed is not one that can be verified.
+    """
+    try:
+        return urllib.parse.urlsplit(url).scheme == "https"
+    except Exception:  # noqa: BLE001 — unparseable is not verifiable
+        return False
+
+
 def _lakera_key() -> str | None:
     return load_key(
         file_env="LAKERA_API_KEY_FILE",
@@ -247,6 +269,8 @@ def check(text: str, *, max_wait_s: float | None = None) -> LakeraResult:
       * key config broken (`*_FILE` set but mount botched)
                                  -> ok=False reason "lakera_unavailable:key-config-error"
       * no key configured at all -> ok=False reason "lakera_unavailable:no-key"
+      * `LAKERA_GUARD_URL` is not an https URL
+                                 -> ok=False reason "lakera_unavailable:url-config-error"
       * fleet budget exhausted / breaker open
                                  -> ok=False reason "lakera_unavailable:throttled"
       * the limiter itself is unusable (unwritable cache dir, lock wait
@@ -285,6 +309,23 @@ def check(text: str, *, max_wait_s: float | None = None) -> LakeraResult:
         # the Lakera gate is mandatory, so a missing key is a deployment
         # error the operator must hear about, not a quiet pass-through.
         return LakeraResult(ok=False, reason="lakera_unavailable:no-key")
+
+    # The endpoint, resolved and checked BEFORE the key is attached to
+    # anything and before a token is spent — the same rule key resolution
+    # already follows, and for both of its reasons. A call that must not
+    # happen must not cost the fleet a token; and a misconfigured endpoint is
+    # a deployment error, so it is decided while the key is still nowhere near
+    # a header.
+    #
+    # `http://` is the shape that matters: it puts `Bearer <the shared Lakera
+    # key>` on the wire in cleartext, and `urlopen` honours `http_proxy` /
+    # `all_proxy`, so a single environment variable is enough to route the
+    # fleet's key through a host nobody chose. The reason is a fixed literal
+    # from the closed vocabulary — the URL that caused it is NOT echoed, since
+    # it is operator-authored text on a channel promised to be content-free.
+    url = os.environ.get("LAKERA_GUARD_URL") or _DEFAULT_URL
+    if not _is_https(url):
+        return LakeraResult(ok=False, reason="lakera_unavailable:url-config-error")
 
     # Fleet-wide pacing. Everything above this line is a LOCAL decision about
     # a call that is not going to happen, so it must not spend a token: a pane
@@ -329,7 +370,6 @@ def check(text: str, *, max_wait_s: float | None = None) -> LakeraResult:
         # would notice.
         return LakeraResult(ok=False, reason="lakera_unavailable:limiter-error")
 
-    url = os.environ.get("LAKERA_GUARD_URL") or _DEFAULT_URL
     # Default-then-clamp, exactly like every limiter knob. See `TIMEOUT_RANGE`
     # for why a bare `float()` was not enough: the values that get through it
     # are the ones that hang the scan or disguise a typo as an outage.

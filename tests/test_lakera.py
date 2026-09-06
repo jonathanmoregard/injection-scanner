@@ -583,8 +583,15 @@ def test_a_limiter_that_cannot_be_built_rejects_and_never_calls_lakera(monkeypat
             lambda mp, tp: mp.setenv("LAKERA_API_KEY_FILE", str(tp / "missing")),
             "lakera_unavailable:key-config-error",
         ),
+        (
+            lambda mp, tp: (
+                mp.setenv("LAKERA_API_KEY", "lk-test-key"),
+                mp.setenv("LAKERA_GUARD_URL", "http://guard.invalid/v2/guard"),
+            ),
+            "lakera_unavailable:url-config-error",
+        ),
     ],
-    ids=["no-key", "key-config-error"],
+    ids=["no-key", "key-config-error", "url-config-error"],
 )
 def test_a_call_that_cannot_happen_spends_no_token(
     monkeypatch, tmp_path, setup, expected
@@ -1051,3 +1058,78 @@ def test_a_two_hundred_still_parses_through_the_same_opener(loopback):
         "breakdown": [],
     }
     assert [(m, p) for m, p, _ in loopback.log] == [("POST", "/guard")]
+
+
+# ---------- (j) the endpoint must be https, or nothing is sent --------------
+#
+# `LAKERA_GUARD_URL` was taken as written, whatever its scheme. Over `http://`
+# the request carries `Authorization: Bearer <the shared Lakera key>` in
+# cleartext — and `urlopen` honours `http_proxy` / `all_proxy`, so an
+# environment variable is enough to route the fleet's key through a host
+# nobody chose. `file://` is worse in kind: a local path read back as a
+# verdict.
+#
+# So a non-https endpoint is a CONFIG error, decided before the key is
+# attached to anything and before `acquire` spends a token — the same
+# treatment, for the same two reasons, that key resolution already gets.
+
+
+def _post_must_not_run(monkeypatch):
+    def _boom(*_a, **_kw):
+        raise AssertionError("_post called with a non-https endpoint")
+
+    monkeypatch.setattr(lakera, "_post", _boom)
+
+
+@pytest.mark.parametrize(
+    "raw",
+    [
+        "http://api.lakera.ai/v2/guard",
+        "HTTP://api.lakera.ai/v2/guard",
+        "ftp://api.lakera.ai/v2/guard",
+        "file:///etc/passwd",
+        "//api.lakera.ai/v2/guard",
+        "api.lakera.ai/v2/guard",
+    ],
+)
+def test_a_non_https_endpoint_fails_closed_before_the_key_is_attached(
+    monkeypatch, raw
+):
+    _with_key(monkeypatch)
+    monkeypatch.setenv("LAKERA_GUARD_URL", raw)
+    _post_must_not_run(monkeypatch)
+    res = lakera.check("anything")
+    assert res.ok is False
+    assert res.reason == "lakera_unavailable:url-config-error"
+    assert raw not in res.reason, "the offending value is not echoed"
+
+
+def _captured_url(monkeypatch) -> str:
+    seen: dict = {}
+
+    def _spy(url, body, headers, timeout):
+        seen["url"] = url
+        return {"flagged": False, "breakdown": []}
+
+    monkeypatch.setattr(lakera, "_post", _spy)
+    assert lakera.check("benign").ok is True
+    return seen["url"]
+
+
+def test_the_default_endpoint_is_unaffected(monkeypatch):
+    """The control: the shipped default is https, so nothing changes for the
+    fleet that never sets the variable."""
+    _with_key(monkeypatch)
+    assert _captured_url(monkeypatch) == lakera._DEFAULT_URL
+
+
+@pytest.mark.parametrize(
+    "raw",
+    ["https://api.lakera.ai/v2/guard", "HTTPS://api.lakera.ai/v2/guard"],
+)
+def test_an_https_override_is_used_as_written(monkeypatch, raw):
+    """Scheme comparison is case-insensitive because RFC 3986 says so, not as
+    a widening — `urlsplit` lowercases it."""
+    _with_key(monkeypatch)
+    monkeypatch.setenv("LAKERA_GUARD_URL", raw)
+    assert _captured_url(monkeypatch) == raw
