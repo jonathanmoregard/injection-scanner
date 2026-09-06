@@ -26,9 +26,10 @@ permissions:
 # At most ONE Lakera-touching run anywhere in this repository at any moment.
 # Deliberately NOT per-ref, unlike ci.yml: a dispatch on a feature branch and
 # the nightly on main draw on the SAME Lakera account, so they have to queue
-# rather than run side by side. `cancel-in-progress: false` so a queued run
-# waits instead of being dropped — the point is to spread the calls out in
-# time, not to lose them, and cancelling would hide a real failure.
+# rather than run side by side. `cancel-in-progress: false` so a run that
+# arrives while one is in progress waits (GitHub keeps one pending run per
+# group; a further arrival replaces the pending one) — the point is to spread
+# calls out in time, and the nightly plus one dispatch never exceeds that.
 concurrency:
   group: lakera-live
   cancel-in-progress: false
@@ -153,10 +154,25 @@ jobs:
       # `INFRA <case> <reason>` on stderr rather than scoring the outage as a
       # classification. GitHub notifies the last committer when a scheduled
       # workflow fails, so a nightly red is seen without extra machinery.
+      #
+      # Exit 3 is turned into an ::error:: annotation so the run summary says
+      # "outage" rather than just "eval corpus failed" — otherwise the one
+      # failure mode that is NOT a detection regression looks exactly like one,
+      # and whoever opens the nightly at 08:00 starts by hunting a regression
+      # that isn't there. The annotation is added HERE rather than in eval.py:
+      # that `INFRA <id> <reason>` stderr line is a contract other callers
+      # parse, and Actions syntax has no business inside the scanner. The
+      # exit code is captured and re-raised unchanged, so every non-zero
+      # status still fails the job — 3 merely gets a label on the way out.
       - name: eval corpus
         env:
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
           LAKERA_API_KEY: ${{ secrets.LAKERA_API_KEY }}
         run: |
-          .venv/bin/python -m injection_scanner.eval tests/payloads/labels.jsonl --use-lakera --use-honeypot --min-recall 1.0 --max-fp-rate 0.0 --confirm-disagreements 2 --lakera-max-wait 1800
+          status=0
+          .venv/bin/python -m injection_scanner.eval tests/payloads/labels.jsonl --use-lakera --use-honeypot --min-recall 1.0 --max-fp-rate 0.0 --confirm-disagreements 2 --lakera-max-wait 1800 || status=$?
+          if [ "$status" -eq 3 ]; then
+            echo "::error::scanner outage during eval (exit 3) — see the INFRA line above; no scorecard produced"
+          fi
+          exit "$status"

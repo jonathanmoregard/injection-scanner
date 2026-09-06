@@ -91,11 +91,24 @@ def test_ci_references_no_secret_at_all() -> None:
 
 
 def test_ci_cancels_superseded_pull_request_runs() -> None:
+    """The WHOLE expression, not just the words in it.
+
+    A substring check for `pull_request` survives flipping `==` to `!=`, and
+    that inversion is the dangerous one: it would cancel superseded pushes to
+    MAIN — the runs whose whole job is to prove the default branch is still
+    good — while letting redundant PR runs stack up. Both halves of the
+    condition matter, so both are pinned.
+    """
     concurrency = _load(CI)["concurrency"]
     assert "github.ref" in concurrency["group"]
-    # Superseded PR pushes are cancelled; pushes to main queue behind each
-    # other so nothing that reached the default branch goes unverified.
-    assert "pull_request" in str(concurrency["cancel-in-progress"])
+    # Whitespace inside a `${{ }}` expression is insignificant to Actions but
+    # significant to `==`, so compare on a normalised form.
+    cancel = " ".join(str(concurrency["cancel-in-progress"]).split())
+    assert cancel == "${{ github.event_name == 'pull_request' }}", (
+        "superseded PR pushes are cancelled; pushes to main queue behind "
+        "each other so nothing that reached the default branch goes "
+        f"unverified — got {cancel!r}"
+    )
 
 
 # ---------- live-eval.yml: off the gate, serialised, paced ----------
@@ -126,25 +139,40 @@ def test_the_one_call_smoke_gates_the_sixteen_call_eval() -> None:
     )
 
 
-def test_both_live_jobs_pace_themselves() -> None:
-    """Both knobs, on both jobs — four cells, asserted one by one.
+def test_every_live_job_paces_itself() -> None:
+    """Both knobs and a time bound on EVERY job in the file — not on a
+    hardcoded ("smoke", "eval") pair.
+
+    Quantified over whatever jobs exist, for the same reason D16 made the
+    `secrets.` check a negative over the whole file: a list of known job names
+    passes the moment someone adds the job it should have caught. A third
+    Lakera-touching job is exactly the edit this has to survive, and it would
+    arrive unpaced, holding `lakera-live`, looking fine.
 
     The runner's cache directory is fresh every run, so this limiter is a
     separate domain drawing on the SAME account as the fleet: it has to pace
     itself stricter than the fleet's own 300 s sustained interval buys it, and
     it must never be allowed a burst. `BURST` is the one that gets forgotten,
     because a bucket that starts full looks paced until ten calls leave at
-    once.
+    once. The time bound is asserted here only as PRESENT — the sized budgets
+    live in `test_both_live_jobs_are_time_bounded` — because an unbounded new
+    job holds the group and blocks every later run.
     """
     jobs = _load(LIVE)["jobs"]
-    for name in ("smoke", "eval"):
-        env = jobs[name].get("env", {})
+    assert jobs, "a live workflow with no jobs is a broken file, not a paced one"
+    for name, job in jobs.items():
+        env = job.get("env", {})
         assert env.get("INJECTION_SCANNER_LAKERA_MIN_INTERVAL_S") == "60", (
             f"{name}: one Lakera call per minute at most"
         )
         assert env.get("INJECTION_SCANNER_LAKERA_BURST") == "2", (
             f"{name}: a fresh runner bucket must not hand the shared account "
             "the fleet default of ten calls back to back"
+        )
+        timeout = job.get("timeout-minutes")
+        assert isinstance(timeout, int) and timeout > 0, (
+            f"{name}: needs a timeout-minutes — an unbounded job holds "
+            "`lakera-live` and blocks every run behind it"
         )
 
 
