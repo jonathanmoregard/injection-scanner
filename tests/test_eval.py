@@ -154,13 +154,21 @@ def test_load_corpus_dir_reads_labels_file() -> None:
 # ---------------------------------------------------------------------------
 
 
-def _scripted_scan(monkeypatch, script: dict[str, list[bool]]) -> dict[str, int]:
-    """Replace scan_text with a stub replaying a per-text sequence of `ok`.
+def _stub_scan_text(monkeypatch, verdict) -> list[dict]:
+    """Replace `scan_text` with a stub and return its live call log.
 
-    The last value in a sequence repeats once it is exhausted. Returns the
-    live call counter so a test can assert how many scans each case cost.
+    THE ONLY place in this file that spells out `scan_text`'s keyword list.
+    The stub must accept every keyword the real function takes — a stub that
+    swallowed `**kwargs` would keep passing while the real call site broke —
+    and one copy of the signature means the next keyword is one edit, not
+    four, with no copy left silently behind.
+
+    `verdict(raw, attempt)` decides what each call returns; `attempt` is the
+    0-based attempt index for that text. Each log entry records the text and
+    every keyword the call carried, so a test can assert what EVERY attempt
+    did, not just the first.
     """
-    calls: dict[str, int] = {}
+    log: list[dict] = []
 
     def fake(
         raw: str,
@@ -169,13 +177,38 @@ def _scripted_scan(monkeypatch, script: dict[str, list[bool]]) -> dict[str, int]
         use_lakera: bool = False,
         lakera_max_wait_s: float | None = None,
     ):
-        seq = script[raw]
-        i = calls.get(raw, 0)
-        calls[raw] = i + 1
-        ok = seq[min(i, len(seq) - 1)]
-        return SimpleNamespace(ok=ok, reason="pass" if ok else f"stub:attempt{i + 1}")
+        attempt = sum(1 for entry in log if entry["raw"] == raw)
+        log.append(
+            {
+                "raw": raw,
+                "use_honeypot": use_honeypot,
+                "use_lakera": use_lakera,
+                "lakera_max_wait_s": lakera_max_wait_s,
+            }
+        )
+        return verdict(raw, attempt)
 
     monkeypatch.setattr("injection_scanner.eval.scan_text", fake)
+    return log
+
+
+def _scripted_scan(monkeypatch, script: dict[str, list[bool]]) -> dict[str, int]:
+    """Stub `scan_text` with a per-text sequence of `ok`.
+
+    The last value in a sequence repeats once it is exhausted. Returns the
+    live call counter so a test can assert how many scans each case cost.
+    """
+    calls: dict[str, int] = {}
+
+    def verdict(raw: str, attempt: int):
+        seq = script[raw]
+        calls[raw] = attempt + 1
+        ok = seq[min(attempt, len(seq) - 1)]
+        return SimpleNamespace(
+            ok=ok, reason="pass" if ok else f"stub:attempt{attempt + 1}"
+        )
+
+    _stub_scan_text(monkeypatch, verdict)
     return calls
 
 
@@ -331,36 +364,33 @@ def test_outages_are_recognised_as_infra(reason) -> None:
         "unavailable",
         None,
         42,
-        ["lakera_unavailable:throttled"],
+        pytest.param(["lakera_unavailable:throttled"], id="list-not-str"),
     ],
 )
 def test_classifications_and_junk_are_not_infra(reason) -> None:
     assert _is_infra_reason(reason) is False
 
 
-def _reason_scan(monkeypatch, reasons: dict[str, str]) -> list[str]:
-    """Stub `scan_text` with a per-text reason. Returns the live call log."""
-    seen: list[str] = []
+def _reason_scan(monkeypatch, script: dict[str, list[str]]) -> list[dict]:
+    """Stub `scan_text` with a per-text SEQUENCE of reasons.
 
-    def fake(
-        raw: str,
-        *,
-        use_honeypot: bool = False,
-        use_lakera: bool = False,
-        lakera_max_wait_s: float | None = None,
-    ):
-        seen.append(raw)
-        reason = reasons[raw]
+    The last reason repeats once the sequence is exhausted; a case that is
+    scanned once takes a one-element sequence. Returns the live call log —
+    see `_stub_scan_text` for what each entry holds.
+    """
+
+    def verdict(raw: str, attempt: int):
+        seq = script[raw]
+        reason = seq[min(attempt, len(seq) - 1)]
         return SimpleNamespace(ok=(reason == "pass"), reason=reason)
 
-    monkeypatch.setattr("injection_scanner.eval.scan_text", fake)
-    return seen
+    return _stub_scan_text(monkeypatch, verdict)
 
 
 def test_an_infra_verdict_aborts_before_the_next_case(monkeypatch) -> None:
-    seen = _reason_scan(
+    log = _reason_scan(
         monkeypatch,
-        {"a": "pass", "b": "lakera_unavailable:throttled", "c": "pass"},
+        {"a": ["pass"], "b": ["lakera_unavailable:throttled"], "c": ["pass"]},
     )
     with pytest.raises(EvalInfraError) as excinfo:
         evaluate(
@@ -372,43 +402,19 @@ def test_an_infra_verdict_aborts_before_the_next_case(monkeypatch) -> None:
         )
     assert excinfo.value.case_id == "b"
     assert excinfo.value.reason == "lakera_unavailable:throttled"
-    assert seen == ["a", "b"], "no case after the outage may be scanned"
+    assert [e["raw"] for e in log] == ["a", "b"], (
+        "no case after the outage may be scanned"
+    )
 
 
 def test_a_wrapped_honeypot_outage_also_aborts(monkeypatch) -> None:
     _reason_scan(
         monkeypatch,
-        {"a": "honeypot:honeypot_unavailable:scn:no-openai-api-key+skipped=2/6"},
+        {"a": ["honeypot:honeypot_unavailable:scn:no-openai-api-key+skipped=2/6"]},
     )
     with pytest.raises(EvalInfraError) as excinfo:
         evaluate([EvalCase(id="a", text="a", expected=BLOCK)])
     assert excinfo.value.case_id == "a"
-
-
-def _reason_sequence_scan(monkeypatch, script: dict[str, list[str]]) -> list[dict]:
-    """Stub `scan_text` with a per-text SEQUENCE of reasons.
-
-    The last reason repeats once the sequence is exhausted. Each log entry
-    records the text scanned AND the wait budget that call carried, so a test
-    can assert what every attempt did — not just the first one.
-    """
-    log: list[dict] = []
-
-    def fake(
-        raw: str,
-        *,
-        use_honeypot: bool = False,
-        use_lakera: bool = False,
-        lakera_max_wait_s: float | None = None,
-    ):
-        seq = script[raw]
-        i = sum(1 for entry in log if entry["raw"] == raw)
-        log.append({"raw": raw, "lakera_max_wait_s": lakera_max_wait_s})
-        reason = seq[min(i, len(seq) - 1)]
-        return SimpleNamespace(ok=(reason == "pass"), reason=reason)
-
-    monkeypatch.setattr("injection_scanner.eval.scan_text", fake)
-    return log
 
 
 def test_an_outage_on_a_rescan_aborts_too(monkeypatch) -> None:
@@ -420,7 +426,7 @@ def test_an_outage_on_a_rescan_aborts_too(monkeypatch) -> None:
     only the first attempt would score the outage AND keep re-scanning
     through it, spending the budget on a layer that is down.
     """
-    log = _reason_sequence_scan(
+    log = _reason_scan(
         monkeypatch,
         {
             "ok": ["lakera:prompt_attack", "lakera_unavailable:throttled", "pass"],
@@ -447,7 +453,7 @@ def test_an_outage_on_a_rescan_aborts_too(monkeypatch) -> None:
 
 
 def test_a_detection_that_merely_ends_in_the_suffix_still_scores(monkeypatch) -> None:
-    _reason_scan(monkeypatch, {"a": "secret_shape:thing_unavailable"})
+    _reason_scan(monkeypatch, {"a": ["secret_shape:thing_unavailable"]})
     card = evaluate([EvalCase(id="a", text="a", expected=BLOCK)])
     assert (card.tp, card.fn) == (1, 0)
 
@@ -455,7 +461,11 @@ def test_a_detection_that_merely_ends_in_the_suffix_still_scores(monkeypatch) ->
 def test_a_normal_run_is_unchanged(monkeypatch) -> None:
     _reason_scan(
         monkeypatch,
-        {"a": "pass", "b": "secret_shape:github_token", "c": "lakera:prompt_attack"},
+        {
+            "a": ["pass"],
+            "b": ["secret_shape:github_token"],
+            "c": ["lakera:prompt_attack"],
+        },
     )
     card = evaluate(
         [
@@ -467,34 +477,16 @@ def test_a_normal_run_is_unchanged(monkeypatch) -> None:
     assert (card.tp, card.fn, card.fp, card.tn) == (2, 0, 0, 1)
 
 
-def _capture_kwargs(monkeypatch) -> list[dict]:
-    seen: list[dict] = []
-
-    def fake(
-        raw: str,
-        *,
-        use_honeypot: bool = False,
-        use_lakera: bool = False,
-        lakera_max_wait_s: float | None = None,
-    ):
-        seen.append(
-            {
-                "use_honeypot": use_honeypot,
-                "use_lakera": use_lakera,
-                "lakera_max_wait_s": lakera_max_wait_s,
-            }
-        )
-        return SimpleNamespace(ok=True, reason="pass")
-
-    monkeypatch.setattr("injection_scanner.eval.scan_text", fake)
-    return seen
-
-
 def test_evaluate_forwards_the_wait_budget(monkeypatch) -> None:
-    seen = _capture_kwargs(monkeypatch)
+    log = _reason_scan(monkeypatch, {"a": ["pass"]})
     evaluate([EvalCase(id="a", text="a", expected=PASS)], lakera_max_wait_s=900.0)
-    assert seen == [
-        {"use_honeypot": False, "use_lakera": False, "lakera_max_wait_s": 900.0}
+    assert log == [
+        {
+            "raw": "a",
+            "use_honeypot": False,
+            "use_lakera": False,
+            "lakera_max_wait_s": 900.0,
+        }
     ]
 
 
@@ -508,13 +500,13 @@ def test_the_cli_defaults_the_wait_budget_to_fifteen_minutes(
     corpus.write_text(
         '{"id": "a", "text": "a", "expected": "pass"}\n', encoding="utf-8"
     )
-    seen = _capture_kwargs(monkeypatch)
+    log = _reason_scan(monkeypatch, {"a": ["pass"]})
     assert _main([str(corpus)]) == 0
-    assert seen[0]["lakera_max_wait_s"] == 900.0
+    assert log[0]["lakera_max_wait_s"] == 900.0
 
-    seen.clear()
+    log.clear()
     assert _main([str(corpus), "--lakera-max-wait", "5"]) == 0
-    assert seen[0]["lakera_max_wait_s"] == 5.0
+    assert log[0]["lakera_max_wait_s"] == 5.0
 
 
 def test_the_cli_reports_infra_on_stderr_and_exits_three(
@@ -528,8 +520,8 @@ def test_the_cli_reports_infra_on_stderr_and_exits_three(
         '{"id": "ok", "text": "ok", "expected": "pass"}\n',
         encoding="utf-8",
     )
-    seen = _reason_scan(
-        monkeypatch, {"inj": "lakera_unavailable:throttled", "ok": "pass"}
+    log = _reason_scan(
+        monkeypatch, {"inj": ["lakera_unavailable:throttled"], "ok": ["pass"]}
     )
     assert _main([str(corpus), "--min-recall", "1.0"]) == 3
     captured = capsys.readouterr()
@@ -540,7 +532,9 @@ def test_the_cli_reports_infra_on_stderr_and_exits_three(
     # The exact line and nothing else: a CI log reading this must not have to
     # guess which of several lines is the diagnosis.
     assert captured.err.strip() == "INFRA inj lakera_unavailable:throttled"
-    assert seen == ["inj"], "the second case must never be scanned"
+    assert [e["raw"] for e in log] == ["inj"], (
+        "the second case must never be scanned"
+    )
 
 
 def test_an_outage_can_no_longer_earn_recall(monkeypatch, tmp_path: Path) -> None:
@@ -551,5 +545,56 @@ def test_an_outage_can_no_longer_earn_recall(monkeypatch, tmp_path: Path) -> Non
     corpus.write_text(
         '{"id": "inj", "text": "inj", "expected": "block"}\n', encoding="utf-8"
     )
-    _reason_scan(monkeypatch, {"inj": "lakera_unavailable:throttled"})
+    _reason_scan(monkeypatch, {"inj": ["lakera_unavailable:throttled"]})
     assert _main([str(corpus), "--min-recall", "1.0"]) != 0
+
+
+@pytest.mark.parametrize(
+    "flag",
+    [
+        pytest.param(["--lakera-max-wait", "-5"], id="negative"),
+        pytest.param(["--lakera-max-wait", "-0.001"], id="barely-negative"),
+        pytest.param(["--lakera-max-wait", "nan"], id="nan"),
+        pytest.param(["--lakera-max-wait", "inf"], id="inf"),
+        # `-inf` only reaches the guard in the `=` form: a bare `-inf` looks
+        # like an option to argparse and is rejected one step earlier.
+        pytest.param(["--lakera-max-wait=-inf"], id="negative-inf"),
+    ],
+)
+def test_a_nonsense_wait_budget_is_a_usage_error(
+    monkeypatch, tmp_path: Path, capsys, flag: list[str]
+) -> None:
+    """A typo must not be able to disguise itself as an outage.
+
+    `acquire` clamps a negative or non-finite budget to 0.0 — refuse
+    immediately — so under fleet contention the first case would come back
+    `lakera_unavailable:throttled` and the run would exit 3 reporting a
+    scanner outage that was really a mistyped flag. `evaluate` already
+    rejects `confirm_disagreements < 0`; this is the same treatment on the
+    same kind of input, and exit 2 keeps a usage error out of the outage
+    channel.
+    """
+    corpus = tmp_path / "c.jsonl"
+    corpus.write_text(
+        '{"id": "a", "text": "a", "expected": "pass"}\n', encoding="utf-8"
+    )
+    log = _reason_scan(monkeypatch, {"a": ["pass"]})
+    with pytest.raises(SystemExit) as excinfo:
+        _main([str(corpus), *flag])
+    assert excinfo.value.code == 2
+    assert "--lakera-max-wait" in capsys.readouterr().err
+    assert log == [], "a rejected budget must not scan anything"
+
+
+@pytest.mark.parametrize("good, expected", [("0", 0.0), ("900", 900.0)])
+def test_a_sane_wait_budget_is_accepted(
+    monkeypatch, tmp_path: Path, good: str, expected: float
+) -> None:
+    """0 is legal — it is exactly what an interactive scan does."""
+    corpus = tmp_path / "c.jsonl"
+    corpus.write_text(
+        '{"id": "a", "text": "a", "expected": "pass"}\n', encoding="utf-8"
+    )
+    log = _reason_scan(monkeypatch, {"a": ["pass"]})
+    assert _main([str(corpus), "--lakera-max-wait", good]) == 0
+    assert log[0]["lakera_max_wait_s"] == expected

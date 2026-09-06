@@ -16,10 +16,14 @@ CLI:
     python -m injection_scanner.eval <corpus.jsonl>
     python -m injection_scanner.eval <corpus.jsonl> --min-recall 0.8
 
-Always exits 0 (measurement, not a gate) UNLESS --min-recall is passed, in
-which case it exits 1 when recall falls below the floor (lets CI enforce it).
-A scanner OUTAGE exits 3 instead — see `_is_infra_reason`; it is not a
-measurement, so it is not scored and no scorecard is printed.
+Exit codes:
+    0  measured (the default: a run with no threshold flag is not a gate)
+    1  a threshold failed — --min-recall / --max-fp-rate, so CI can hold a
+       floor and a ceiling
+    2  usage error
+    3  a scanner OUTAGE — see `_is_infra_reason`. An outage is not a
+       measurement, so nothing is scored and no scorecard is printed; the
+       diagnosis goes to stderr as `INFRA <case_id> <reason>`.
 
 With the hosted layers live, one scan is a sample from an LLM. Pass
 --confirm-disagreements N to re-scan only the cases whose verdict disagrees
@@ -31,6 +35,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import sys
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -71,7 +76,8 @@ _INFRA_REASON_HEAD_SUFFIX = "_unavailable"
 # `lakera_arbitration:`, so a genuine outage arrives one segment deeper than
 # it was raised. An explicit set rather than "look at segment 1 too", so that
 # `secret_shape:thing_unavailable` — a rule NAME that merely ends in the
-# suffix — cannot be mistaken for an outage.
+# suffix — cannot be mistaken for an outage. Pinned by
+# `tests/test_eval.py::test_a_detection_that_merely_ends_in_the_suffix_still_scores`.
 _INFRA_WRAPPER_PREFIXES = frozenset({"honeypot", "lakera_arbitration"})
 
 # Standalone setup codes. Today they only appear as the tail of
@@ -481,6 +487,16 @@ def _main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         prog="python -m injection_scanner.eval",
         description="Score the scanner against a labeled corpus.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=(
+            "exit codes:\n"
+            "  0  measured (a run with no threshold flag is not a gate)\n"
+            "  1  a threshold failed (--min-recall / --max-fp-rate)\n"
+            "  2  usage error\n"
+            "  3  a scanner OUTAGE: a layer was down, so nothing was\n"
+            "     measured. No scorecard is printed; the diagnosis goes to\n"
+            "     stderr as `INFRA <case_id> <reason>`.\n"
+        ),
     )
     parser.add_argument("corpus", help="path to a JSONL corpus file")
     parser.add_argument(
@@ -534,6 +550,18 @@ def _main(argv: list[str] | None = None) -> int:
         "correct by default beats depending on the operator remembering.",
     )
     args = parser.parse_args(argv)
+    if not math.isfinite(args.lakera_max_wait) or args.lakera_max_wait < 0:
+        # A typo must not be able to disguise itself as an outage. The limiter
+        # clamps a negative or non-finite budget to 0.0 — refuse immediately —
+        # so under fleet contention the first case would come back
+        # `lakera_unavailable:throttled` and the run would exit 3 reporting a
+        # scanner outage that was really a mistyped flag. `evaluate` already
+        # rejects `confirm_disagreements < 0`; this is the same treatment, and
+        # exit 2 keeps a usage error out of the outage channel.
+        parser.error(
+            f"--lakera-max-wait must be a finite number of seconds >= 0, got "
+            f"{args.lakera_max_wait!r}"
+        )
 
     cases = load_jsonl(args.corpus)
     try:
