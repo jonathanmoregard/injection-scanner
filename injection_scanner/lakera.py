@@ -59,10 +59,37 @@ from injection_scanner.throttle import (
     CrossProcessLimiter,
     Decision,
     default_max_wait_s,
+    env_float,
 )
 
 _DEFAULT_URL = "https://api.lakera.ai/v2/guard"
-_DEFAULT_TIMEOUT_S = 10.0
+
+# The per-request socket timeout, and the one knob in this module that is a
+# LIMIT — so it gets the treatment every other limit in the package gets
+# (`throttle.LimiterConfig`, `smoke.LIVENESS_TTL_RANGE`): an env INPUT, parsed
+# by `env_float`, malformed-to-default and then clamped to a RANGE. Public
+# names because the range is what the tests assert against and what an operator
+# reads.
+#
+# Why a range and not a bare `float()`. Both ends fail SILENTLY, which is what
+# makes them worth a clamp rather than a comment:
+#
+#   * a non-finite or absurd value (`inf`, `1e9` — 31 years) is a perfectly
+#     good float, so no `except` fires, and `urlopen` then waits effectively
+#     forever. The scan HANGS instead of failing closed, which is strictly
+#     worse than a reject: fail-closed is the contract, and a parked scan
+#     honours neither side of it.
+#   * a NEGATIVE value makes `urlopen` raise on the spot, so every scan on the
+#     box returns `lakera_unavailable:ValueError` — indistinguishable from a
+#     real Lakera outage, and the reason names the exception rather than the
+#     typo that caused it.
+#
+# The ceiling is generous (120 s) because a slow classifier is a legitimate
+# configuration; the floor (1 s) is the smallest value that can complete a
+# round trip, so anything under it would be a self-inflicted outage.
+ENV_TIMEOUT_S = "INJECTION_SCANNER_LAKERA_TIMEOUT"
+DEFAULT_TIMEOUT_S = 10.0
+TIMEOUT_RANGE = (1.0, 120.0)
 
 
 @dataclass
@@ -265,12 +292,10 @@ def check(text: str, *, max_wait_s: float | None = None) -> LakeraResult:
         return LakeraResult(ok=False, reason="lakera_unavailable:limiter-error")
 
     url = os.environ.get("LAKERA_GUARD_URL") or _DEFAULT_URL
-    try:
-        timeout = float(
-            os.environ.get("INJECTION_SCANNER_LAKERA_TIMEOUT", _DEFAULT_TIMEOUT_S)
-        )
-    except (TypeError, ValueError):
-        timeout = _DEFAULT_TIMEOUT_S
+    # Default-then-clamp, exactly like every limiter knob. See `TIMEOUT_RANGE`
+    # for why a bare `float()` was not enough: the values that get through it
+    # are the ones that hang the scan or disguise a typo as an outage.
+    timeout = env_float(ENV_TIMEOUT_S, DEFAULT_TIMEOUT_S, TIMEOUT_RANGE)
 
     headers = {
         "Authorization": f"Bearer {key}",

@@ -856,3 +856,76 @@ def test_scan_text_surfaces_the_throttled_reason_and_fails_closed(monkeypatch):
     assert v.ok is False
     assert v.reason == "lakera_unavailable:throttled"
     assert v.layers["lakera"] == "lakera_unavailable:throttled"
+
+
+# ---------- (h) the request timeout is a range-clamped input ----------------
+#
+# `INJECTION_SCANNER_LAKERA_TIMEOUT` used to go through a bare `float()` with a
+# `(TypeError, ValueError)` fallback, which accepts every value `float()`
+# accepts. Two of those are not timeouts at all: `inf` (and any absurd finite
+# value, `1e9`) hands `urlopen` an unbounded wait, so a hung socket parks the
+# scan instead of failing it closed; and a NEGATIVE value makes `urlopen` raise
+# immediately, so every scan on the box comes back
+# `lakera_unavailable:ValueError` and reads as a Lakera outage rather than as
+# the typo it is. Both are silent — nothing in the reason names the knob.
+#
+# So it is parsed like every other limit in this package: `throttle.env_float`,
+# default-then-clamp over a RANGE, malformed to the default. The floor is what
+# makes the negative case a clamp rather than a crash; the ceiling is what
+# makes `inf`/`1e9` a bounded wait.
+
+
+def _captured_timeout(monkeypatch) -> float:
+    """Run one `check` and return the timeout `_post` actually received."""
+    seen: dict = {}
+
+    def _spy(url, body, headers, timeout):
+        seen["timeout"] = timeout
+        return {"flagged": False, "breakdown": []}
+
+    monkeypatch.setattr(lakera, "_post", _spy)
+    assert lakera.check("benign").ok is True
+    return seen["timeout"]
+
+
+def test_an_unset_timeout_is_the_documented_default(monkeypatch):
+    _with_key(monkeypatch)
+    assert _captured_timeout(monkeypatch) == lakera.DEFAULT_TIMEOUT_S
+
+
+def test_a_timeout_inside_the_range_is_used_as_written(monkeypatch):
+    _with_key(monkeypatch)
+    monkeypatch.setenv("INJECTION_SCANNER_LAKERA_TIMEOUT", "30")
+    assert _captured_timeout(monkeypatch) == 30.0
+
+
+@pytest.mark.parametrize("raw", ["inf", "Infinity", "nan"])
+def test_a_non_finite_timeout_degrades_to_the_default(monkeypatch, raw):
+    """`float("inf")` parses, so the old bare `float()` accepted it and
+    `urlopen` then waited forever — a hang, not a fail-closed reject."""
+    _with_key(monkeypatch)
+    monkeypatch.setenv("INJECTION_SCANNER_LAKERA_TIMEOUT", raw)
+    assert _captured_timeout(monkeypatch) == lakera.DEFAULT_TIMEOUT_S
+
+
+def test_an_absurd_timeout_is_clamped_to_the_ceiling(monkeypatch):
+    """`1e9` seconds is 31 years: finite, so no fallback catches it, and
+    unbounded in every way that matters."""
+    _with_key(monkeypatch)
+    monkeypatch.setenv("INJECTION_SCANNER_LAKERA_TIMEOUT", "1e9")
+    assert _captured_timeout(monkeypatch) == lakera.TIMEOUT_RANGE[1]
+
+
+def test_a_negative_timeout_is_clamped_to_the_floor(monkeypatch):
+    """The failure this prevents is a DIAGNOSIS failure: `urlopen(timeout=-5)`
+    raises, so every scan reported `lakera_unavailable:ValueError` and the
+    operator hunted a Lakera outage that did not exist."""
+    _with_key(monkeypatch)
+    monkeypatch.setenv("INJECTION_SCANNER_LAKERA_TIMEOUT", "-5")
+    assert _captured_timeout(monkeypatch) == lakera.TIMEOUT_RANGE[0]
+
+
+def test_a_malformed_timeout_degrades_to_the_default(monkeypatch):
+    _with_key(monkeypatch)
+    monkeypatch.setenv("INJECTION_SCANNER_LAKERA_TIMEOUT", "abc")
+    assert _captured_timeout(monkeypatch) == lakera.DEFAULT_TIMEOUT_S
