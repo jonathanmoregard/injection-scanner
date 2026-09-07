@@ -16,6 +16,8 @@
 - Create `tests/test_network_hermeticity.py`: executable proof that IPv4/IPv6 sockets are blocked and Unix sockets remain permitted.
 - Modify `tests/test_ci_relations.py`: guard the project-level embargo configuration.
 - Modify `tests/test_lakera.py`: replace four loopback-server tests with in-process transport doubles.
+- Modify `injection_scanner/lakera.py`: pin the credentialed destination,
+  disable ambient proxies, and strictly validate injection decisions.
 - Modify `tests/test_throttle.py`: regression for unreadable state.
 - Modify `injection_scanner/throttle.py`: distinguish missing state from read I/O failure.
 - Modify `README.md`: accurate hermetic-test, directory-mode, and parsed-200 documentation.
@@ -251,7 +253,159 @@ git add tests/test_lakera.py
 git commit -m "test: replace loopback endpoints with transport doubles"
 ```
 
-### Task 3: Make limiter state read failures fail closed
+### Task 3: Pin the credentialed endpoint and validate responses strictly
+
+**Files:**
+- Modify: `tests/test_lakera.py`
+- Modify: `injection_scanner/lakera.py`
+
+- [ ] **Step 1: Write failing endpoint tests**
+
+Add table-driven tests that accept the default endpoint and its normalized
+HTTPS/default-port spelling, and reject before token acquisition:
+
+```python
+@pytest.mark.parametrize(
+    "url",
+    [
+        "https://attacker.invalid/v2/guard",
+        "https://api.lakera.ai.evil.invalid/v2/guard",
+        "https://user@api.lakera.ai/v2/guard",
+        "https://api.lakera.ai:444/v2/guard",
+        "https://api.lakera.ai/other",
+        "https://api.lakera.ai/v2/guard?next=evil",
+        "https://api.lakera.ai/v2/guard#fragment",
+    ],
+)
+def test_only_the_canonical_lakera_endpoint_can_receive_the_key(
+    monkeypatch, url
+) -> None:
+    _with_key(monkeypatch)
+    monkeypatch.setenv("LAKERA_GUARD_URL", url)
+    _post_must_not_run(monkeypatch)
+    result = lakera.check("anything")
+    assert result.ok is False
+    assert result.reason == "lakera_unavailable:url-config-error"
+```
+
+Add a test that sets `HTTPS_PROXY` and `ALL_PROXY`, constructs the production
+opener, and asserts its `ProxyHandler.proxies == {}`.
+
+- [ ] **Step 2: Write failing response-schema tests**
+
+Parametrize malformed responses:
+
+```python
+@pytest.mark.parametrize(
+    "data",
+    [
+        {"flagged": True, "breakdown": []},
+        {"flagged": False, "breakdown": []},
+        {"flagged": False, "breakdown": [
+            {"detector_type": "prompt_attack", "detected": "false"}
+        ]},
+        {"flagged": False, "breakdown": [
+            {"detector_type": "prompt_attack", "detected": False},
+            {"detector_type": "prompt_attack", "detected": False},
+        ]},
+        {"flagged": False, "breakdown": [
+            {"detector_type": "prompt_attack", "detected": True}
+        ]},
+        {"flagged": "false", "breakdown": [
+            {"detector_type": "prompt_attack", "detected": False}
+        ]},
+    ],
+)
+def test_malformed_or_contradictory_decisions_fail_closed(
+    monkeypatch, data
+) -> None:
+    _with_key(monkeypatch)
+    monkeypatch.setattr(lakera, "_post", lambda *_a, **_kw: data)
+    result = lakera.check("anything")
+    assert result.ok is False
+    assert result.reason == "lakera_unavailable:bad-response"
+```
+
+Add a positive test proving a detected non-prompt detector name never appears
+in `categories`.
+
+- [ ] **Step 3: Run the new tests and verify RED**
+
+Run the exact new node IDs with:
+
+```bash
+uv run --extra test pytest -q tests/test_lakera.py -k \
+  "canonical_lakera_endpoint or ambient_proxies or malformed_or_contradictory or never_exposes"
+```
+
+Expected: endpoint-host and malformed-response cases fail against the current
+HTTPS-only/lenient parser.
+
+- [ ] **Step 4: Implement destination validation and proxy isolation**
+
+Replace `_is_https` with `_is_trusted_endpoint`:
+
+```python
+def _is_trusted_endpoint(url: str) -> bool:
+    try:
+        parsed = urllib.parse.urlsplit(url)
+        return (
+            parsed.scheme.lower() == "https"
+            and parsed.hostname == "api.lakera.ai"
+            and parsed.port in (None, 443)
+            and parsed.username is None
+            and parsed.password is None
+            and parsed.path == "/v2/guard"
+            and not parsed.query
+            and not parsed.fragment
+        )
+    except (TypeError, ValueError):
+        return False
+```
+
+Build the opener with:
+
+```python
+_OPENER = urllib.request.build_opener(
+    urllib.request.ProxyHandler({}),
+    _NoRedirect(),
+)
+```
+
+Keep validation before limiter acquisition and header construction.
+
+- [ ] **Step 5: Implement strict prompt-attack parsing**
+
+After confirming `data` is a dictionary, require a boolean `flagged`, a list
+`breakdown`, well-formed entries, and exactly one prompt-attack entry. Return
+`bad-response` for invalid shapes. Return only:
+
+```python
+if prompt_detected:
+    if flagged is not True:
+        return LakeraResult(ok=False, reason="lakera_unavailable:bad-response")
+    return LakeraResult(
+        ok=False,
+        flagged=True,
+        categories=["prompt_attack"],
+        reason="lakera:prompt_attack",
+    )
+return LakeraResult(ok=True, reason="pass")
+```
+
+Do not expose any upstream detector name other than the fixed literal.
+
+- [ ] **Step 6: Run, check, and commit**
+
+```bash
+uv run --extra test pytest -q tests/test_lakera.py
+python -m compileall -q injection_scanner/lakera.py tests/test_lakera.py
+git diff --check -- injection_scanner/lakera.py tests/test_lakera.py
+git add injection_scanner/lakera.py tests/test_lakera.py
+git commit -m "fix: pin and validate the Lakera boundary"
+```
+
+### Task 4: Make limiter state read failures fail closed
 
 **Files:**
 - Modify: `tests/test_throttle.py`
@@ -325,7 +479,7 @@ git add injection_scanner/throttle.py tests/test_throttle.py
 git commit -m "fix: fail closed on limiter state read errors"
 ```
 
-### Task 4: Align documentation and run the complete hermetic verification
+### Task 5: Align documentation and run the complete hermetic verification
 
 **Files:**
 - Modify: `README.md`

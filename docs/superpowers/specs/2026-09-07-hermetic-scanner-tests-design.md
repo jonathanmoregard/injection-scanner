@@ -35,6 +35,14 @@ refuse the call.
    malformed, non-finite, or foreign-schema state still resets safely.
 9. The scanner remains fail-closed, and no secret or scanned bytes appear in
    errors, logs, state, or test output.
+10. The Lakera bearer key can be sent only to the canonical Guard v2 HTTPS
+    endpoint. A configured URL cannot select another host, port, path, query,
+    fragment, or userinfo, and the client does not inherit ambient proxies.
+11. A response can pass only when it has a boolean top-level `flagged`, a
+    well-formed breakdown, and exactly one boolean `prompt_attack` decision.
+    Missing, duplicate, malformed, or contradictory injection decisions fail
+    closed. Detector names other than the fixed `prompt_attack` literal never
+    leave the scanner as categories.
 
 ## Design
 
@@ -92,6 +100,35 @@ Add a regression test that writes an open-breaker state and makes the state
 path unreadable through a deterministic patched `Path.read_text`. It must
 first fail by returning `ALLOWED`, then pass by returning `ERROR`. Avoid
 mode-bit tests because they are unreliable when tests run as root.
+
+### Credentialed endpoint and response validation
+
+`LAKERA_GUARD_URL` remains an operator input for compatibility, but it may
+name only the canonical service: HTTPS, host `api.lakera.ai`, path
+`/v2/guard`, default port, no userinfo, query, or fragment. Scheme and host
+normalization follow URL rules; a different destination returns the fixed
+`lakera_unavailable:url-config-error` before a token is spent or the key is
+attached.
+
+Build the urllib opener with `ProxyHandler({})` and the existing no-redirect
+handler. This makes the credential's network destination depend only on the
+validated URL, not on `HTTPS_PROXY`, `ALL_PROXY`, or desktop proxy state.
+
+Response parsing validates the decision as a schema, not as a collection of
+optional hints:
+
+- `flagged` is a real boolean;
+- `breakdown` is a list of dictionaries whose `detector_type` is a string
+  and `detected` is a real boolean;
+- exactly one entry has `detector_type == "prompt_attack"`;
+- `prompt_attack: true` requires `flagged: true`;
+- a false prompt-attack result may coexist with top-level `flagged: true`,
+  because moderation/PII detectors are intentionally not gate decisions.
+
+The only returned category is the fixed literal `prompt_attack` on that
+detector's positive result. Other detector names are neither trusted as output
+nor needed for the gate. Any invalid shape returns the fixed fail-closed
+`lakera_unavailable:bad-response`.
 
 ### Documentation consistency
 
