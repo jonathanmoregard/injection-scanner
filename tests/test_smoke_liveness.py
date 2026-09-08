@@ -95,6 +95,20 @@ def _verdict(ok: bool) -> Verdict:
     )
 
 
+def _quota_fallback_verdict() -> Verdict:
+    return Verdict(
+        ok=True,
+        reason="pass",
+        layers={
+            "lakera": "lakera_unavailable:throttled",
+            "honeypot": "pass",
+            "judge": "benign-unanimous",
+        },
+        sanitize_stats={},
+        sanitized_text=smoke._BENIGN_PROBE,
+    )
+
+
 class _Probe:
     """Stands in for `smoke._scan_via_path`.
 
@@ -295,6 +309,57 @@ def test_a_degraded_layer_is_not_cached_either(probe, cache_file, ttl):
     with pytest.raises(smoke.SmokeFailure) as excinfo:
         _run(fake, log)
     assert "lakera layer not 'pass'" in excinfo.value.reason
+    assert not cache_file.exists()
+
+
+def test_strict_quota_fallback_is_healthy_and_cached(probe, cache_file, ttl):
+    ttl(3600)
+    probe.verdict = _quota_fallback_verdict()
+    fake, log = _Fake(), _Log()
+
+    _run(fake, log)
+
+    assert probe.probes == 1
+    assert cache_file.exists()
+    assert "strict quota fallback live via scan(Path)" in log.text()
+
+
+@pytest.mark.parametrize(
+    "layers",
+    [
+        {
+            "lakera": "lakera_unavailable:throttled",
+            "honeypot": "pass",
+        },
+        {
+            "lakera": "lakera_unavailable:throttled",
+            "honeypot": "pass",
+            "judge": "attack:openai_4o_mini",
+        },
+        {
+            "lakera": "lakera_unavailable:service-unavailable",
+            "honeypot": "pass",
+            "judge": "benign-unanimous",
+        },
+    ],
+    ids=["judge-missing", "judge-attack", "service-outage"],
+)
+def test_only_complete_quota_fallback_is_healthy(
+    probe, cache_file, ttl, layers
+):
+    ttl(3600)
+    probe.verdict = Verdict(
+        ok=True,
+        reason="pass",
+        layers=layers,
+        sanitize_stats={},
+        sanitized_text=smoke._BENIGN_PROBE,
+    )
+    fake, log = _Fake(), _Log()
+
+    with pytest.raises(smoke.SmokeFailure):
+        _run(fake, log)
+
     assert not cache_file.exists()
 
 

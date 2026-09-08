@@ -22,15 +22,16 @@ Two phases:
      regression hides because a sibling class still triggers.
      use_honeypot=False — no API cost, deterministic.
 
-  2. Honeypot + Lakera liveness — one benign payload with
+  2. Scanner-stack liveness — one benign payload with
      use_honeypot=True AND use_lakera=True (both left ON), run through
      scan(Path). Pays one honeypot round-trip per scenario plus one
      Lakera Guard call. If L2 (Lakera) or L3 (honeypot) is degraded
      (SDK missing, key unset/revoked, provider down), production scans
      fail-closed per intercept.py; this probe surfaces that BEFORE any
-     real record is processed, AND it covers the disk-read wrapper at
-     minimal extra API cost. Because Lakera fails closed on a missing
-     key, this phase REQUIRES a live LAKERA_API_KEY to pass.
+     real record is processed. Exact Lakera quota pressure is healthy only
+     when the same strict honeypot and unanimous cross-family arbitration
+     used for report delivery both pass. Missing keys, 5xx responses, and
+     every other Lakera failure remain unhealthy.
 
      Phase 2 does NOT pay that cost on every boot. A pass is recorded
      fleet-wide in `smoke-liveness.json` and reused while it is younger
@@ -57,7 +58,12 @@ from pathlib import Path
 from typing import Callable
 
 from injection_scanner import throttle
-from injection_scanner.intercept import Verdict, scan, scan_text
+from injection_scanner.intercept import (
+    Verdict,
+    is_lakera_quota_degraded,
+    scan,
+    scan_text,
+)
 
 
 class SmokeFailure(Exception):
@@ -358,7 +364,7 @@ def run_smoke(
         info(f"liveness probe: cached pass, {int(age)}s old")
         info(
             f"scanner self-test OK ({len(_DETERMINISTIC)} canaries × "
-            "2 entry points blocked; lakera + honeypot liveness from cache)"
+            "2 entry points blocked; scanner-stack liveness from cache)"
         )
         return
 
@@ -371,19 +377,24 @@ def run_smoke(
         )
         err(f"scanner self-test FAILED: {msg}")
         raise SmokeFailure(msg)
-    lk = v.layers.get("lakera", "")
-    if lk != "pass":
-        msg = (
-            f"lakera layer not 'pass' on benign probe (got {lk!r}). "
-            "L2 likely degraded — check LAKERA_API_KEY / network."
-        )
-        err(f"scanner self-test FAILED: {msg}")
-        raise SmokeFailure(msg)
     hp = v.layers.get("honeypot", "")
     if hp != "pass":
         msg = (
             f"honeypot layer not 'pass' on benign probe (got {hp!r}). "
             "L3 likely degraded."
+        )
+        err(f"scanner self-test FAILED: {msg}")
+        raise SmokeFailure(msg)
+    lk = v.layers.get("lakera", "")
+    quota_fallback = (
+        is_lakera_quota_degraded(lk)
+        and v.layers.get("judge", "") == "benign-unanimous"
+    )
+    if lk != "pass" and not quota_fallback:
+        msg = (
+            f"lakera layer not 'pass' and strict quota fallback incomplete "
+            f"on benign probe (got {lk!r}). L2 likely degraded — check "
+            "LAKERA_API_KEY / network."
         )
         err(f"scanner self-test FAILED: {msg}")
         raise SmokeFailure(msg)
@@ -397,7 +408,12 @@ def run_smoke(
     # and ::test_a_degraded_layer_is_not_cached_either.
     _record_liveness_pass(clock())
 
+    live_detail = (
+        "strict quota fallback live via scan(Path)"
+        if quota_fallback
+        else "lakera + honeypot live via scan(Path)"
+    )
     info(
         f"scanner self-test OK ({len(_DETERMINISTIC)} canaries × "
-        "2 entry points blocked; lakera + honeypot live via scan(Path))"
+        f"2 entry points blocked; {live_detail})"
     )
