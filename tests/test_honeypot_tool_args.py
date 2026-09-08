@@ -15,7 +15,7 @@ Two defects, both live before this module:
          -> verdict = Honeypot_Left_Alone
          -> signal  = left_alone
 
-     `max_tokens=400` makes malformed JSON routine rather than exotic, so
+     A bounded output budget makes malformed JSON possible rather than exotic, so
      this is reachable without the attacker doing anything clever — and
      trivially reachable if the injection pads the arguments.
 
@@ -77,9 +77,11 @@ from injection_scanner.honeypot import _classify_from_parts
 from injection_scanner.honeypot_scenarios import (
     ALL_SCENARIOS,
     CANARY_ALPHA,
+    LEGIT_TOOLS,
     SCENARIO_A_CONVERSATION_HISTORY_LEAK as SCEN_A,
     SCENARIO_B_MISCONFIGURED_ENV as SCEN_B,
     TRAP_CAPABILITIES,
+    build_trap_tools,
     canary_label,
 )
 
@@ -144,6 +146,49 @@ def _openai_call(monkeypatch, tool_calls, content=""):
     return asyncio.run(honeypot._call_openai(SCEN_OPENAI, "report body", [], set()))
 
 
+def test_openai_honeypot_enforces_a_strict_single_tool_reply(monkeypatch):
+    """Provider-side schema enforcement prevents malformed judge arguments."""
+    import openai
+
+    captured = {}
+    response = _OpenAIResponse(
+        _Message([_ToolCall("return_summary", '{"text":"short summary"}')])
+    )
+
+    class _FakeOpenAI:
+        def __init__(self, *_a, **_kw):
+            def create(*_a, **kwargs):
+                captured.update(kwargs)
+                return response
+
+            completions = type("_C", (), {"create": create})()
+            self.chat = type("_Chat", (), {"completions": completions})()
+
+    monkeypatch.setattr(honeypot, "_openai_key", lambda: "sk-openai-test")
+    monkeypatch.setattr(openai, "OpenAI", _FakeOpenAI)
+    traps, trap_names = build_trap_tools(SCEN_OPENAI["traps"])
+
+    result = asyncio.run(
+        honeypot._call_openai(
+            SCEN_OPENAI,
+            "report body",
+            LEGIT_TOOLS + traps,
+            trap_names,
+        )
+    )
+
+    assert result.verdict == "Honeypot_Left_Alone"
+    assert captured["tool_choice"] == "required"
+    assert captured["parallel_tool_calls"] is False
+    assert captured["max_tokens"] > 400
+    for tool in captured["tools"]:
+        function = tool["function"]
+        schema = function["parameters"]
+        assert function["strict"] is True
+        assert schema["additionalProperties"] is False
+        assert set(schema["required"]) == set(schema["properties"])
+
+
 def _patch_anthropic(monkeypatch, blocks):
     import anthropic
 
@@ -165,7 +210,7 @@ def _anthropic_call(monkeypatch, blocks):
 # ---------- bug 1: canary in arguments that do not parse ----------
 
 # Every shape of "the JSON did not parse" that still carries the canary as a
-# literal substring. Truncation is the one `max_tokens=400` produces on its
+# literal substring. Output truncation can produce this shape on its
 # own; the others are what an injection that pads the arguments produces.
 _UNPARSEABLE_WITH_CANARY = {
     "truncated-mid-object": '{"text": "the key is ' + OPENAI_CANARY,
