@@ -1,20 +1,17 @@
 """Tests for the Lakera Guard L2 layer (injection_scanner.lakera).
 
-FULLY MOCKED — no network. Every test monkeypatches `lakera._post` (the
-isolated stdlib POST seam) and controls the key source via env vars +
-the keyloader keyring lookup. Asserts the FAIL-CLOSED contract: a flagged
+FULLY MOCKED — no network. Tests replace either `lakera._post` or its
+`lakera._OPENER` transport seam and control the key source via env vars + the
+keyloader keyring lookup. Asserts the FAIL-CLOSED contract: a flagged
 classification, a missing key, a broken `*_FILE` mount, and any transport
-error ALL collapse to ok=False, and the input text never leaks into the
-reason / categories strings.
+error ALL collapse to ok=False, and the input text never leaks into the reason
+/ categories strings.
 """
 from __future__ import annotations
 
 import io
 import json
-import threading
 from http.client import HTTPMessage
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from types import SimpleNamespace
 from urllib.error import HTTPError, URLError
 
 import pytest
@@ -952,113 +949,106 @@ def test_a_malformed_timeout_degrades_to_the_default(monkeypatch):
 # that moved) therefore hands the fleet's key to a third party silently, and
 # the scan still returns a normal verdict so nothing ever says so.
 #
-# These two run against a real loopback HTTP server rather than a monkeypatched
-# `_post`, deliberately: the thing under test IS the opener `_post` uses, and a
-# stub of `_post` would assert nothing about it. The server records every
-# request it receives, so "no second request" is observed rather than inferred.
+# These tests replace `_OPENER`, not `_post`: the thing under test is still the
+# production request construction, bounded read, parsing, and redirect policy,
+# while the in-process transport double makes a network request impossible.
 
 _KEY_MARKER = "lk-loopback-key-DO-NOT-FORWARD"
 
-# Filled by the fixture below; the handler is a class, so its state is here.
-_PROBE_LOG: list[tuple[str, str, str | None]] = []
-_PROBE_MODE: dict = {}
+class _Response:
+    def __init__(self, body: bytes) -> None:
+        self.body = body
+        self.read_limits: list[int] = []
+        self.exited = False
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_exc) -> bool:
+        self.exited = True
+        return False
+
+    def read(self, limit: int) -> bytes:
+        self.read_limits.append(limit)
+        return self.body[:limit]
 
 
-class _LoopbackHandler(BaseHTTPRequestHandler):
-    """Records (method, path, Authorization) for every request, then answers
-    per `_PROBE_MODE`. `/guard` is the endpoint under test; any other path is
-    the redirect target, and a request landing there is the exfiltration."""
+class _Opener:
+    def __init__(self, outcome: _Response | BaseException) -> None:
+        self.outcome = outcome
+        self.calls: list[tuple[object, float]] = []
 
-    protocol_version = "HTTP/1.0"
-
-    def _record(self) -> None:
-        _PROBE_LOG.append(
-            (self.command, self.path, self.headers.get("Authorization"))
-        )
-
-    def do_GET(self) -> None:  # a followed POST 302 arrives as a GET
-        self._record()
-        self._respond()
-
-    def do_POST(self) -> None:
-        self._record()
-        length = int(self.headers.get("Content-Length") or 0)
-        if length:
-            self.rfile.read(length)
-        self._respond()
-
-    def _respond(self) -> None:
-        target = _PROBE_MODE.get("redirect_to")
-        if target and self.path == "/guard":
-            self.send_response(302)
-            self.send_header("Location", target)
-            self.send_header("Content-Length", "0")
-            self.end_headers()
-            return
-        body = _PROBE_MODE.get("body", b'{"flagged": false, "breakdown": []}')
-        self.send_response(200)
-        self.send_header("Content-Type", "application/json")
-        self.send_header("Content-Length", str(len(body)))
-        self.end_headers()
-        self.wfile.write(body)
-
-    def log_message(self, *args) -> None:  # keep the pytest output clean
-        return
+    def open(self, request, *, timeout: float):
+        self.calls.append((request, timeout))
+        if isinstance(self.outcome, BaseException):
+            raise self.outcome
+        return self.outcome
 
 
-@pytest.fixture
-def loopback():
-    """A recording HTTP server on 127.0.0.1. Hermetic — no external host."""
-    _PROBE_LOG.clear()
-    _PROBE_MODE.clear()
-    srv = ThreadingHTTPServer(("127.0.0.1", 0), _LoopbackHandler)
-    thread = threading.Thread(target=srv.serve_forever, daemon=True)
-    thread.start()
+def _hermetic_post(monkeypatch, outcome, *, timeout: float = 5.0):
+    opener = _Opener(outcome)
+    monkeypatch.setattr(lakera, "_OPENER", opener)
+    result = None
+    error = None
     try:
-        yield SimpleNamespace(
-            base=f"http://127.0.0.1:{srv.server_port}",
-            log=_PROBE_LOG,
-            mode=_PROBE_MODE,
+        result = lakera._post(
+            "https://api.lakera.invalid/v2/guard",
+            b"{}",
+            {
+                "Authorization": f"Bearer {_KEY_MARKER}",
+                "Content-Type": "application/json",
+            },
+            timeout,
         )
-    finally:
-        srv.shutdown()
-        srv.server_close()
-        thread.join(timeout=5)
+    except BaseException as exc:  # returned to the assertion, never swallowed
+        error = exc
+    return result, error, opener
 
 
-def _loopback_post(url: str, body: bytes = b"{}", timeout: float = 5.0):
-    return lakera._post(
-        url,
-        body,
-        {
-            "Authorization": f"Bearer {_KEY_MARKER}",
-            "Content-Type": "application/json",
-        },
-        timeout,
+def test_the_production_opener_installs_the_no_redirect_handler():
+    assert any(
+        isinstance(handler, lakera._NoRedirect)
+        for handler in lakera._OPENER.handlers
     )
 
 
-def test_a_redirect_is_an_outage_and_never_forwards_the_key(loopback):
-    loopback.mode["redirect_to"] = f"{loopback.base}/elsewhere"
-    with pytest.raises(HTTPError) as excinfo:
-        _loopback_post(f"{loopback.base}/guard")
-    assert excinfo.value.code == 302
-    # The existing fail-closed path renders it like any other HTTP outage.
-    assert lakera._transport_reason(excinfo.value) == "lakera_unavailable:HTTPError:302"
-    # Exactly ONE request, and it went to the configured endpoint. Anything at
-    # `/elsewhere` would mean the key left the account it belongs to.
-    assert [(m, p) for m, p, _ in loopback.log] == [("POST", "/guard")]
-    assert not any(_KEY_MARKER in (auth or "") for _, p, auth in loopback.log if p != "/guard")
+def test_a_redirect_is_an_outage_and_never_forwards_the_key(monkeypatch):
+    error = HTTPError(
+        "https://api.lakera.invalid/v2/guard",
+        302,
+        "Found",
+        {"Location": "https://attacker.invalid/elsewhere"},
+        None,
+    )
+    result, raised, opener = _hermetic_post(monkeypatch, error)
+    assert result is None
+    assert raised is error
+    assert lakera._transport_reason(raised) == "lakera_unavailable:HTTPError:302"
+    assert len(opener.calls) == 1
+    request, timeout = opener.calls[0]
+    assert request.full_url == "https://api.lakera.invalid/v2/guard"
+    assert request.get_method() == "POST"
+    assert request.get_header("Authorization") == f"Bearer {_KEY_MARKER}"
+    assert timeout == 5.0
+    assert lakera._NoRedirect().redirect_request(
+        request, None, 302, "Found", {}, "https://attacker.invalid/elsewhere"
+    ) is None
 
 
-def test_a_two_hundred_still_parses_through_the_same_opener(loopback):
+def test_a_two_hundred_still_parses_through_the_same_opener(monkeypatch):
     """The control: suppressing redirects must not change the ordinary path."""
-    loopback.mode["body"] = json.dumps({"flagged": False, "breakdown": []}).encode()
-    assert _loopback_post(f"{loopback.base}/guard") == {
-        "flagged": False,
-        "breakdown": [],
-    }
-    assert [(m, p) for m, p, _ in loopback.log] == [("POST", "/guard")]
+    response = _Response(
+        json.dumps({"flagged": False, "breakdown": []}).encode("utf-8")
+    )
+    result, raised, opener = _hermetic_post(monkeypatch, response, timeout=4.0)
+    assert raised is None
+    assert result == {"flagged": False, "breakdown": []}
+    assert len(opener.calls) == 1
+    request, timeout = opener.calls[0]
+    assert request.get_method() == "POST"
+    assert timeout == 4.0
+    assert response.read_limits == [lakera.DEFAULT_MAX_RESPONSE_BYTES + 1]
+    assert response.exited is True
 
 
 # ---------- (j) the endpoint must be https, or nothing is sent --------------
@@ -1160,26 +1150,34 @@ def _json_body(size: int) -> bytes:
     return body
 
 
-def test_a_response_one_byte_over_the_cap_is_an_outage(loopback, monkeypatch):
+def test_a_response_one_byte_over_the_cap_is_an_outage(monkeypatch):
     cap = lakera.MAX_RESPONSE_BYTES_RANGE[0]
     monkeypatch.setenv("INJECTION_SCANNER_LAKERA_MAX_RESPONSE_BYTES", str(cap))
-    loopback.mode["body"] = _json_body(cap + 1)
-    with pytest.raises(Exception) as excinfo:  # noqa: PT011 — the type is the fix
-        _loopback_post(f"{loopback.base}/guard")
+    response = _Response(_json_body(cap + 1))
+    result, raised, opener = _hermetic_post(monkeypatch, response)
+    assert result is None
+    assert type(raised) is lakera.ResponseTooLarge
     assert (
-        lakera._transport_reason(excinfo.value)
+        lakera._transport_reason(raised)
         == "lakera_unavailable:ResponseTooLarge"
     )
+    assert len(opener.calls) == 1
+    assert response.read_limits == [cap + 1]
+    assert response.exited is True
 
 
-def test_a_response_at_the_cap_still_parses(loopback, monkeypatch):
+def test_a_response_at_the_cap_still_parses(monkeypatch):
     """The control: the cap is a ceiling, not an off-by-one reject."""
     cap = lakera.MAX_RESPONSE_BYTES_RANGE[0]
     monkeypatch.setenv("INJECTION_SCANNER_LAKERA_MAX_RESPONSE_BYTES", str(cap))
-    loopback.mode["body"] = _json_body(cap)
-    data = _loopback_post(f"{loopback.base}/guard")
+    response = _Response(_json_body(cap))
+    data, raised, opener = _hermetic_post(monkeypatch, response)
+    assert raised is None
     assert data["flagged"] is False
     assert data["breakdown"] == []
+    assert len(opener.calls) == 1
+    assert response.read_limits == [cap + 1]
+    assert response.exited is True
 
 
 @pytest.mark.parametrize(
