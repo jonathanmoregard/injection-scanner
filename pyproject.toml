@@ -42,7 +42,11 @@ test = [
     # same reason as the SDK pins above — the next major is a reviewed
     # change, not a silent one.
     "pyyaml>=6,<7",
+    "pytest-socket>=0.7,<1",
 ]
+
+[tool.pytest.ini_options]
+addopts = "--disable-socket --allow-unix-socket"
 
 [tool.setuptools.packages.find]
 include = ["injection_scanner*"]

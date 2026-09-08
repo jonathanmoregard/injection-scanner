@@ -33,11 +33,14 @@ green, renames a group, or drops a `needs` while fixing something else. So:
 """
 from __future__ import annotations
 
+import tomllib
 from pathlib import Path
 
 import yaml
 
-WORKFLOWS = Path(__file__).resolve().parents[1] / ".github" / "workflows"
+ROOT = Path(__file__).resolve().parents[1]
+PROJECT = ROOT / "pyproject.toml"
+WORKFLOWS = ROOT / ".github" / "workflows"
 CI = WORKFLOWS / "ci.yml"
 LIVE = WORKFLOWS / "live-eval.yml"
 
@@ -88,6 +91,15 @@ def test_ci_references_no_secret_at_all() -> None:
     works unchanged on a fork PR.
     """
     assert "secrets." not in CI.read_text(encoding="utf-8")
+
+
+def test_every_pytest_run_has_the_network_embargo() -> None:
+    project = tomllib.loads(PROJECT.read_text(encoding="utf-8"))
+    test_deps = project["project"]["optional-dependencies"]["test"]
+    assert any(dep.startswith("pytest-socket") for dep in test_deps)
+    addopts = project["tool"]["pytest"]["ini_options"]["addopts"].split()
+    assert "--disable-socket" in addopts
+    assert "--allow-unix-socket" in addopts
 
 
 def test_ci_cancels_superseded_pull_request_runs() -> None:

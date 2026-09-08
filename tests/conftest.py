@@ -27,6 +27,54 @@ or by `monkeypatch.setenv`-ing the specific budget they mean to test.
 from __future__ import annotations
 
 import pytest
+from pytest_socket import disable_socket
+
+
+_SOCKET_ESCAPE_HATCHES = frozenset(
+    {"enable_socket", "socket_enabled", "allow_hosts"}
+)
+
+
+def pytest_configure(config: pytest.Config) -> None:
+    """Install one socket embargo before collection and keep it until exit.
+
+    pytest-socket normally swaps the constructor during each test's setup and
+    restores it during teardown. That leaves module import, collection, and
+    fixture finalizers outside the embargo, and lets imports cache the real
+    constructor before a test starts. Its options have already been parsed and
+    its configure hook has run by the time this tests/ conftest is registered,
+    so remove only its per-test lifecycle hooks and retain its mature guarded
+    socket implementation for the whole remaining pytest process.
+    """
+    if config.getoption("--force-enable-socket"):
+        raise pytest.UsageError(
+            "network escape hatch forbidden: --force-enable-socket"
+        )
+    if config.getoption("--allow-hosts") is not None:
+        raise pytest.UsageError("network escape hatch forbidden: --allow-hosts")
+
+    socket_plugin = config.pluginmanager.get_plugin("socket")
+    if socket_plugin is None:
+        raise pytest.UsageError("pytest-socket plugin is required")
+    config.pluginmanager.unregister(socket_plugin)
+    disable_socket(allow_unix_socket=True)
+
+
+def pytest_collection_modifyitems(items: list[pytest.Item]) -> None:
+    """Reject per-test opt-outs before any test body can execute."""
+    for item in items:
+        markers = {
+            name
+            for name in _SOCKET_ESCAPE_HATCHES
+            if item.get_closest_marker(name) is not None
+        }
+        fixtures = _SOCKET_ESCAPE_HATCHES.intersection(item.fixturenames)
+        used = sorted(markers | fixtures)
+        if used:
+            raise pytest.UsageError(
+                "network escape hatch forbidden: "
+                f"{item.nodeid} uses {', '.join(used)}"
+            )
 
 # Every environment variable `throttle.LimiterConfig.from_env` reads, minus
 # the cache dir (set below rather than cleared). Listed explicitly so a new
