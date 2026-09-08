@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import io
 import json
+import urllib.request
 from http.client import HTTPMessage
 from urllib.error import HTTPError, URLError
 
@@ -56,7 +57,8 @@ def test_flagged_true_rejects_with_lakera_reason(monkeypatch):
         lambda *a, **k: {
             "flagged": True,
             "breakdown": [
-                {"detector_type": "prompt_attack", "detected": True, "message_id": 0}
+                {"detector_type": "prompt_attack", "detected": True, "message_id": 0},
+                {"detector_type": "HOSTILE_DETECTOR_MARKER", "detected": True},
             ],
         },
     )
@@ -64,7 +66,8 @@ def test_flagged_true_rejects_with_lakera_reason(monkeypatch):
     assert res.ok is False
     assert res.flagged is True
     assert res.reason == "lakera:prompt_attack"
-    assert "prompt_attack" in res.categories
+    assert res.categories == ["prompt_attack"]
+    assert "HOSTILE_DETECTOR_MARKER" not in res.reason
 
 
 # ----- (a2) FP-safety regression: moderation fired but NO prompt_attack -----
@@ -88,6 +91,7 @@ def test_moderation_only_does_not_reject(monkeypatch):
     assert res.ok is True
     assert res.reason == "pass"
     assert res.flagged is False
+    assert res.categories == []
 
 
 # ----- (b) clean breakdown -> pass -----
@@ -107,15 +111,15 @@ def test_flagged_false_passes(monkeypatch):
     assert res.flagged is False
 
 
-# ----- (b2) fallback: no breakdown, top-level flagged True -> reject -----
+# ----- (b2) no breakdown is malformed, even when top-level flagged is bool -----
 
-def test_fallback_flagged_true_no_breakdown_rejects(monkeypatch):
+def test_flagged_true_without_breakdown_is_a_bad_response(monkeypatch):
     _with_key(monkeypatch)
     monkeypatch.setattr(lakera, "_post", lambda *a, **k: {"flagged": True})
     res = lakera.check("something")
     assert res.ok is False
-    assert res.flagged is True
-    assert res.reason == "lakera:flagged"
+    assert res.flagged is False
+    assert res.reason == "lakera_unavailable:bad-response"
 
 
 # ----- (b3) bad response: no flagged, no breakdown -> fail closed -----
@@ -126,6 +130,146 @@ def test_bad_response_shape_fails_closed(monkeypatch):
     res = lakera.check("something")
     assert res.ok is False
     assert res.reason == "lakera_unavailable:bad-response"
+
+
+@pytest.mark.parametrize(
+    "data",
+    [
+        None,
+        [],
+        {"flagged": True, "breakdown": []},
+        {"flagged": False, "breakdown": []},
+        {
+            "flagged": False,
+            "breakdown": [
+                {"detector_type": "moderated_content/crime", "detected": True}
+            ],
+        },
+        {
+            "flagged": False,
+            "breakdown": [
+                {"detector_type": "prompt_attack", "detected": "false"}
+            ],
+        },
+        {
+            "flagged": False,
+            "breakdown": [
+                {"detector_type": "prompt_attack", "detected": False},
+                {"detector_type": "prompt_attack", "detected": False},
+            ],
+        },
+        {
+            "flagged": True,
+            "breakdown": [
+                {"detector_type": "prompt_attack", "detected": True},
+                {"detector_type": "prompt_attack", "detected": False},
+            ],
+        },
+        {
+            "flagged": False,
+            "breakdown": [
+                {"detector_type": "prompt_attack", "detected": True}
+            ],
+        },
+        {
+            "flagged": "false",
+            "breakdown": [
+                {"detector_type": "prompt_attack", "detected": False}
+            ],
+        },
+        {
+            "flagged": 0,
+            "breakdown": [
+                {"detector_type": "prompt_attack", "detected": False}
+            ],
+        },
+        {
+            "breakdown": [
+                {"detector_type": "prompt_attack", "detected": False}
+            ],
+        },
+        {
+            "flagged": False,
+            "breakdown": {"detector_type": "prompt_attack", "detected": False},
+        },
+        {
+            "flagged": False,
+            "breakdown": [
+                {"detector_type": "prompt_attack", "detected": False},
+                "malformed-after-valid-prompt",
+            ],
+        },
+        {
+            "flagged": False,
+            "breakdown": [
+                {"detector_type": "prompt_attack", "detected": False},
+                {"detector_type": 7, "detected": False},
+            ],
+        },
+        {
+            "flagged": False,
+            "breakdown": [
+                {"detector_type": "prompt_attack", "detected": False},
+                {"detector_type": "moderated_content/crime", "detected": 1},
+            ],
+        },
+        {
+            "flagged": False,
+            "breakdown": [
+                {"detector_type": "prompt_attack", "detected": False},
+                {"detector_type": "missing-detected"},
+            ],
+        },
+    ],
+    ids=[
+        "non-dict",
+        "list-not-dict",
+        "missing-prompt-flagged",
+        "missing-prompt-clean",
+        "only-non-prompt",
+        "detected-not-bool",
+        "duplicate-prompt",
+        "conflicting-duplicate-prompt",
+        "prompt-true-flagged-false",
+        "flagged-not-bool",
+        "flagged-int",
+        "missing-flagged",
+        "breakdown-not-list",
+        "malformed-entry-after-prompt",
+        "detector-type-not-str-after-prompt",
+        "detected-int-after-prompt",
+        "missing-detected-after-prompt",
+    ],
+)
+def test_malformed_or_contradictory_decisions_fail_closed(monkeypatch, data):
+    _with_key(monkeypatch)
+    monkeypatch.setattr(lakera, "_post", lambda *_a, **_kw: data)
+    result = lakera.check("anything")
+    assert result.ok is False
+    assert result.flagged is False
+    assert result.categories == []
+    assert result.reason == "lakera_unavailable:bad-response"
+
+
+def test_a_nonprompt_detector_never_exposes_upstream_strings(monkeypatch):
+    _with_key(monkeypatch)
+    marker = "HOSTILE_DETECTOR_MARKER_DO_NOT_EXPOSE"
+    monkeypatch.setattr(
+        lakera,
+        "_post",
+        lambda *_a, **_kw: {
+            "flagged": True,
+            "breakdown": [
+                {"detector_type": "prompt_attack", "detected": False},
+                {"detector_type": marker, "detected": True},
+            ],
+        },
+    )
+    result = lakera.check("anything")
+    assert result.ok is True
+    assert result.reason == "pass"
+    assert result.categories == []
+    assert marker not in result.reason
 
 
 # ----- (b4) request body carries breakdown:true and the text -----
@@ -704,6 +848,16 @@ def test_a_flagged_two_hundred_still_closes_the_breaker(monkeypatch):
     assert st["open_until"] == 0.0
 
 
+def test_a_parsed_two_hundred_records_success_before_schema_validation(monkeypatch):
+    _with_key(monkeypatch)
+    spy = _SpyLimiter(Decision.ALLOWED)
+    _install_spy(monkeypatch, spy)
+    monkeypatch.setattr(lakera, "_post", lambda *_a, **_kw: {"malformed": True})
+    result = lakera.check("anything")
+    assert result.reason == "lakera_unavailable:bad-response"
+    assert len(spy.successes) == 1
+
+
 def test_a_two_hundred_that_raced_a_trip_does_not_reopen_the_gate(monkeypatch):
     """The straggler race, end to end through `check`.
 
@@ -889,7 +1043,12 @@ def _captured_timeout(monkeypatch) -> float:
 
     def _spy(url, body, headers, timeout):
         seen["timeout"] = timeout
-        return {"flagged": False, "breakdown": []}
+        return {
+            "flagged": False,
+            "breakdown": [
+                {"detector_type": "prompt_attack", "detected": False}
+            ],
+        }
 
     monkeypatch.setattr(lakera, "_post", _spy)
     assert lakera.check("benign").ok is True
@@ -985,6 +1144,27 @@ class _Opener:
         return self.outcome
 
 
+class _OpenerChainResponse(_Response):
+    code = 200
+    msg = "OK"
+
+    def info(self) -> HTTPMessage:
+        return _headers({})
+
+
+class _InProcessHTTPSHandler(urllib.request.HTTPSHandler):
+    """Terminate an opener's HTTPS chain without opening a socket."""
+
+    def __init__(self, response: _OpenerChainResponse) -> None:
+        super().__init__()
+        self.response = response
+        self.requests = []
+
+    def https_open(self, request):
+        self.requests.append(request)
+        return self.response
+
+
 def _hermetic_post(monkeypatch, outcome, *, timeout: float = 5.0):
     opener = _Opener(outcome)
     monkeypatch.setattr(lakera, "_OPENER", opener)
@@ -1010,6 +1190,69 @@ def test_the_production_opener_installs_the_no_redirect_handler():
         isinstance(handler, lakera._NoRedirect)
         for handler in lakera._OPENER.handlers
     )
+    assert not any(
+        isinstance(handler, urllib.request.ProxyHandler)
+        for handler in lakera._OPENER.handlers
+    )
+
+
+def test_build_opener_ignores_ambient_proxies(monkeypatch):
+    monkeypatch.setenv("HTTPS_PROXY", "http://proxy.invalid:8443")
+    monkeypatch.setenv("ALL_PROXY", "http://proxy.invalid:8443")
+    opener = lakera._build_opener()
+    assert not any(
+        isinstance(handler, lakera.urllib.request.ProxyHandler)
+        for handler in opener.handlers
+    )
+    assert any(isinstance(handler, lakera._NoRedirect) for handler in opener.handlers)
+
+
+def test_post_uses_the_real_proxy_free_no_redirect_opener_chain(monkeypatch):
+    response = _OpenerChainResponse(
+        json.dumps(
+            {
+                "flagged": False,
+                "breakdown": [
+                    {"detector_type": "prompt_attack", "detected": False}
+                ],
+            }
+        ).encode("utf-8")
+    )
+    transport = _InProcessHTTPSHandler(response)
+    opener = urllib.request.build_opener(
+        urllib.request.ProxyHandler({}),
+        lakera._NoRedirect(),
+        transport,
+    )
+    monkeypatch.setattr(lakera, "_OPENER", opener)
+
+    body = b'{"messages":[{"role":"user","content":"test"}]}'
+    result = lakera._post(
+        lakera._DEFAULT_URL,
+        body,
+        {
+            "Authorization": f"Bearer {_KEY_MARKER}",
+            "Content-Type": "application/json",
+        },
+        6.25,
+    )
+
+    assert result["flagged"] is False
+    assert len(transport.requests) == 1
+    request = transport.requests[0]
+    assert request.full_url == lakera._DEFAULT_URL
+    assert request.get_method() == "POST"
+    assert request.data == body
+    assert request.get_header("Authorization") == f"Bearer {_KEY_MARKER}"
+    assert request.timeout == 6.25
+    assert response.read_limits == [lakera.DEFAULT_MAX_RESPONSE_BYTES + 1]
+    assert response.exited is True
+    assert not any(
+        isinstance(handler, urllib.request.ProxyHandler)
+        for handler in opener.handlers
+    )
+    assert any(isinstance(handler, lakera._NoRedirect) for handler in opener.handlers)
+    assert transport in opener.handlers
 
 
 def test_a_redirect_is_an_outage_and_never_forwards_the_key(monkeypatch):
@@ -1051,6 +1294,49 @@ def test_a_two_hundred_still_parses_through_the_same_opener(monkeypatch):
     assert response.exited is True
 
 
+@pytest.mark.parametrize(
+    "raw",
+    [
+        b'{"flagged":false,"flagged":true,"breakdown":[]}',
+        (
+            b'{"flagged":false,"breakdown":['
+            b'{"detector_type":"prompt_attack","detected":false,'
+            b'"HOSTILE_DUPLICATE_KEY_MARKER":1,'
+            b'"HOSTILE_DUPLICATE_KEY_MARKER":2}]}'
+        ),
+    ],
+    ids=["top-level", "nested"],
+)
+def test_post_rejects_duplicate_json_keys_at_every_depth(monkeypatch, raw):
+    result, raised, opener = _hermetic_post(monkeypatch, _Response(raw))
+    assert result is None
+    assert type(raised) is lakera.DuplicateJSONKey
+    assert str(raised) == ""
+    assert len(opener.calls) == 1
+
+
+def test_check_maps_duplicate_json_keys_to_fixed_bad_response(monkeypatch):
+    _with_key(monkeypatch)
+    marker = b"HOSTILE_DUPLICATE_KEY_MARKER"
+    raw = (
+        b'{"flagged":false,"breakdown":[{"detector_type":"prompt_attack",'
+        b'"detected":false,"' + marker + b'":1,"' + marker + b'":2}]}'
+    )
+    monkeypatch.setattr(lakera, "_OPENER", _Opener(_Response(raw)))
+    result = lakera.check("anything")
+    assert result.ok is False
+    assert result.reason == "lakera_unavailable:bad-response"
+    assert marker.decode() not in result.reason
+
+
+def test_check_keeps_malformed_json_as_a_typed_transport_outage(monkeypatch):
+    _with_key(monkeypatch)
+    monkeypatch.setattr(lakera, "_OPENER", _Opener(_Response(b"not-json")))
+    result = lakera.check("anything")
+    assert result.ok is False
+    assert result.reason == "lakera_unavailable:JSONDecodeError"
+
+
 # ---------- (j) the endpoint must be https, or nothing is sent --------------
 #
 # `LAKERA_GUARD_URL` was taken as written, whatever its scheme. Over `http://`
@@ -1067,7 +1353,7 @@ def test_a_two_hundred_still_parses_through_the_same_opener(monkeypatch):
 
 def _post_must_not_run(monkeypatch):
     def _boom(*_a, **_kw):
-        raise AssertionError("_post called with a non-https endpoint")
+        raise AssertionError("_post called with an untrusted endpoint")
 
     monkeypatch.setattr(lakera, "_post", _boom)
 
@@ -1088,11 +1374,59 @@ def test_a_non_https_endpoint_fails_closed_before_the_key_is_attached(
 ):
     _with_key(monkeypatch)
     monkeypatch.setenv("LAKERA_GUARD_URL", raw)
+    spy = _SpyLimiter()
+    _install_spy(monkeypatch, spy)
     _post_must_not_run(monkeypatch)
     res = lakera.check("anything")
     assert res.ok is False
     assert res.reason == "lakera_unavailable:url-config-error"
     assert raw not in res.reason, "the offending value is not echoed"
+    assert spy.acquired == []
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        "https://attacker.invalid/v2/guard",
+        "https://api.lakera.ai.evil.invalid/v2/guard",
+        "https://user@api.lakera.ai/v2/guard",
+        "https://user:password@api.lakera.ai/v2/guard",
+        "https://api.lakera.ai:444/v2/guard",
+        "https://api.lakera.ai:/v2/guard",
+        "https://api.lakera.ai:0443/v2/guard",
+        "https://api.lakera.ai:notaport/v2/guard",
+        "https://api.lakera.ai:65536/v2/guard",
+        "https://api.lakera.ai/other",
+        "https://api.lakera.ai/v2/guard/",
+        "https://api.lakera.ai/v2/guard?next=evil",
+        "https://api.lakera.ai/v2/guard#fragment",
+        "https://api.lakera.ai/v2/guard?",
+        "https://api.lakera.ai/v2/guard#",
+        "https://api%2elakera.ai/v2/guard",
+        "https://api.lakera.ai/v2/%67uard",
+        "https://api.laKera.ai/v2/guard",
+        "https://api.laKera.ai:443/v2/guard",
+        " https://api.lakera.ai/v2/guard",
+        "\x1fhttps://api.lakera.ai/v2/guard",
+        "https://api.lakera.ai/v2/guard\r",
+        "https://api.lakera.ai/v2/guard\n",
+        "https://api.lakera.ai/v2/guard\t",
+        "https://api.lakera.\tai/v2/guard",
+        r"https://api.lakera.ai\@attacker.invalid/v2/guard",
+        r"https://api.lakera.ai\v2\guard",
+    ],
+)
+def test_only_the_canonical_lakera_endpoint_can_receive_the_key(monkeypatch, url):
+    _with_key(monkeypatch)
+    monkeypatch.setenv("LAKERA_GUARD_URL", url)
+    spy = _SpyLimiter()
+    _install_spy(monkeypatch, spy)
+    _post_must_not_run(monkeypatch)
+    result = lakera.check("anything")
+    assert result.ok is False
+    assert result.reason == "lakera_unavailable:url-config-error"
+    assert url not in result.reason
+    assert spy.acquired == []
 
 
 def _captured_url(monkeypatch) -> str:
@@ -1100,7 +1434,12 @@ def _captured_url(monkeypatch) -> str:
 
     def _spy(url, body, headers, timeout):
         seen["url"] = url
-        return {"flagged": False, "breakdown": []}
+        return {
+            "flagged": False,
+            "breakdown": [
+                {"detector_type": "prompt_attack", "detected": False}
+            ],
+        }
 
     monkeypatch.setattr(lakera, "_post", _spy)
     assert lakera.check("benign").ok is True
@@ -1116,11 +1455,14 @@ def test_the_default_endpoint_is_unaffected(monkeypatch):
 
 @pytest.mark.parametrize(
     "raw",
-    ["https://api.lakera.ai/v2/guard", "HTTPS://api.lakera.ai/v2/guard"],
+    [
+        "https://api.lakera.ai/v2/guard",
+        "HTTPS://API.LAKERA.AI/v2/guard",
+        "https://api.lakera.ai:443/v2/guard",
+    ],
 )
-def test_an_https_override_is_used_as_written(monkeypatch, raw):
-    """Scheme comparison is case-insensitive because RFC 3986 says so, not as
-    a widening — `urlsplit` lowercases it."""
+def test_a_trusted_endpoint_override_is_used_as_written(monkeypatch, raw):
+    """Validation normalizes for comparison but preserves operator spelling."""
     _with_key(monkeypatch)
     monkeypatch.setenv("LAKERA_GUARD_URL", raw)
     assert _captured_url(monkeypatch) == raw

@@ -401,11 +401,10 @@ def scan_text(
                 # not directs" (see judge.py).
                 #
                 # Everything else stays a hard reject: every
-                # lakera_unavailable:* outage (fail-closed unchanged) and
-                # the no-breakdown `lakera:flagged` fallback (unknown
-                # detector mix — conservative). With the honeypot off
-                # (lakera-only measurement runs) there is no corroborating
-                # signal, so the flag also stays a hard reject.
+                # lakera_unavailable:* outage (including a malformed or
+                # incomplete response). With the honeypot off (lakera-only
+                # measurement runs) there is no corroborating signal, so the
+                # prompt-attack classification also stays a hard reject.
                 lakera_deferred = True
             else:
                 return Verdict(

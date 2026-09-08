@@ -128,6 +128,15 @@ class ResponseTooLarge(Exception):
     """
 
 
+class DuplicateJSONKey(Exception):
+    """A JSON object repeated a key.
+
+    Carries no message because response keys are server-controlled content and
+    this exception crosses the transport boundary before becoming the fixed
+    `lakera_unavailable:bad-response` reason.
+    """
+
+
 def _max_response_bytes() -> int:
     return env_int(
         ENV_MAX_RESPONSE_BYTES, DEFAULT_MAX_RESPONSE_BYTES, MAX_RESPONSE_BYTES_RANGE
@@ -170,11 +179,28 @@ class _NoRedirect(urllib.request.HTTPRedirectHandler):
 # away and a 3xx becomes what it already is for this caller — an outage. The
 # `Location` value is neither read nor logged.
 #
-# `build_opener` replaces its default `HTTPRedirectHandler` with any SUBCLASS
-# passed in, which is why `_NoRedirect` derives from it rather than standing
-# alone. Everything else (proxy, cookie-less HTTP/HTTPS, the error processor)
-# stays as `urlopen` had it.
-_OPENER = urllib.request.build_opener(_NoRedirect())
+# `build_opener` replaces defaults when an instance of their class is passed.
+# `_NoRedirect` replaces redirect following, while `ProxyHandler({})` replaces
+# environment-derived proxy routing with an explicitly empty mapping. CPython
+# then omits that empty handler from `.handlers`, but its presence here still
+# suppresses the default ambient-proxy handler.
+def _build_opener():
+    return urllib.request.build_opener(
+        urllib.request.ProxyHandler({}),
+        _NoRedirect(),
+    )
+
+
+_OPENER = _build_opener()
+
+
+def _object_without_duplicate_keys(pairs: list[tuple[str, object]]) -> dict:
+    result = {}
+    for key, value in pairs:
+        if key in result:
+            raise DuplicateJSONKey
+        result[key] = value
+    return result
 
 
 def _post(url: str, body: bytes, headers: dict, timeout: float) -> dict:
@@ -198,7 +224,10 @@ def _post(url: str, body: bytes, headers: dict, timeout: float) -> dict:
         raw = resp.read(cap + 1)
     if len(raw) > cap:
         raise ResponseTooLarge
-    return json.loads(raw.decode("utf-8"))
+    return json.loads(
+        raw.decode("utf-8"),
+        object_pairs_hook=_object_without_duplicate_keys,
+    )
 
 
 def _transport_reason(e: BaseException) -> str:
@@ -280,24 +309,48 @@ def _retry_after(e: BaseException) -> str | None:
     return value if isinstance(value, str) else None
 
 
-def _is_https(url: str) -> bool:
-    """True only for a URL whose scheme is exactly `https`.
+def _is_trusted_endpoint(url: str) -> bool:
+    """True only for the exact Lakera Guard HTTPS destination.
 
     `LAKERA_GUARD_URL` is an operator input, and the next thing that happens to
-    the URL is that `Bearer <the shared Lakera key>` is attached to it. Over
-    `http://` that key crosses the wire in cleartext — and `urlopen` honours
-    `http_proxy`/`all_proxy`, so a proxy variable in the environment is enough
-    to route it through a host nobody chose deliberately. Every other scheme is
-    worse in its own way (`file://` reads a local path and calls it a verdict).
+    the URL is that `Bearer <the shared Lakera key>` is attached to it. Scheme,
+    host, port, credentials, path, query and fragment therefore form one
+    allowlisted destination rather than independent best-effort checks.
 
-    `urlsplit` lowercases the scheme, so `HTTPS://` is accepted — that is RFC
-    3986's own rule, not a widening. Total: `urlsplit` raises `ValueError` on a
-    malformed authority (an unbalanced IPv6 bracket), and a URL that cannot be
-    parsed is not one that can be verified.
+    The raw spelling must be ASCII before case normalization, preventing
+    Unicode case-folding confusables from becoming an allowlisted hostname.
+    The round-trip check then rejects raw bytes that `urlsplit` silently
+    strips, while normalizing only scheme casing because `urlunsplit` lowers
+    it. It also distinguishes a bare trailing `?` or `#` from no
+    query/fragment. Raw netloc matching rejects spellings such as an empty or
+    zero-padded port even when `.port` normalizes them to `None` or `443`.
+    Accessing `.port` can raise for malformed and out-of-range values, which
+    makes the whole unverified endpoint invalid.
     """
+    if not isinstance(url, str) or not url.isascii():
+        return False
     try:
-        return urllib.parse.urlsplit(url).scheme == "https"
-    except Exception:  # noqa: BLE001 — unparseable is not verifiable
+        parsed = urllib.parse.urlsplit(url)
+        raw_scheme, separator, raw_after_scheme = url.partition(":")
+        normalized_raw = f"{parsed.scheme}:{raw_after_scheme}"
+        netloc = parsed.netloc.casefold()
+        return (
+            separator == ":"
+            and raw_scheme.casefold() == parsed.scheme
+            and normalized_raw == urllib.parse.urlunsplit(parsed)
+            and parsed.scheme.lower() == "https"
+            and netloc in ("api.lakera.ai", "api.lakera.ai:443")
+            and parsed.hostname == "api.lakera.ai"
+            and parsed.port in (None, 443)
+            and parsed.username is None
+            and parsed.password is None
+            and parsed.path == "/v2/guard"
+            and not parsed.query
+            and not parsed.fragment
+            and "?" not in url
+            and "#" not in url
+        )
+    except (TypeError, ValueError):
         return False
 
 
@@ -317,7 +370,7 @@ def check(text: str, *, max_wait_s: float | None = None) -> LakeraResult:
       * key config broken (`*_FILE` set but mount botched)
                                  -> ok=False reason "lakera_unavailable:key-config-error"
       * no key configured at all -> ok=False reason "lakera_unavailable:no-key"
-      * `LAKERA_GUARD_URL` is not an https URL
+      * `LAKERA_GUARD_URL` is not the exact trusted Lakera endpoint
                                  -> ok=False reason "lakera_unavailable:url-config-error"
       * fleet budget exhausted / breaker open
                                  -> ok=False reason "lakera_unavailable:throttled"
@@ -333,8 +386,6 @@ def check(text: str, *, max_wait_s: float | None = None) -> LakeraResult:
       * bad/unknown response shape
                                  -> ok=False reason "lakera_unavailable:bad-response"
       * prompt_attack detected   -> ok=False reason "lakera:prompt_attack"
-      * flagged (fallback, no breakdown)
-                                 -> ok=False reason "lakera:flagged"
       * clean (or only moderation/PII fired)
                                  -> ok=True  reason "pass"
 
@@ -366,14 +417,12 @@ def check(text: str, *, max_wait_s: float | None = None) -> LakeraResult:
     # a deployment error, so it is decided while the key is still nowhere near
     # a header.
     #
-    # `http://` is the shape that matters: it puts `Bearer <the shared Lakera
-    # key>` on the wire in cleartext, and `urlopen` honours `http_proxy` /
-    # `all_proxy`, so a single environment variable is enough to route the
-    # fleet's key through a host nobody chose. The reason is a fixed literal
-    # from the closed vocabulary — the URL that caused it is NOT echoed, since
-    # it is operator-authored text on a channel promised to be content-free.
+    # The full destination is pinned because any alternate host, userinfo,
+    # port, path, query or fragment could redirect where the credential goes
+    # or change what handles it. The reason is a fixed literal from the closed
+    # vocabulary — the URL that caused it is NOT echoed.
     url = os.environ.get("LAKERA_GUARD_URL") or _DEFAULT_URL
-    if not _is_https(url):
+    if not _is_trusted_endpoint(url):
         return LakeraResult(ok=False, reason="lakera_unavailable:url-config-error")
 
     # Fleet-wide pacing. Everything above this line is a LOCAL decision about
@@ -441,6 +490,8 @@ def check(text: str, *, max_wait_s: float | None = None) -> LakeraResult:
 
     try:
         data = _post(url, body, headers, timeout)
+    except DuplicateJSONKey:
+        return LakeraResult(ok=False, reason="lakera_unavailable:bad-response")
     except Exception as e:  # noqa: BLE001 — any failure fails CLOSED
         # 429 and 503 are the two codes RFC 9110 pairs with `Retry-After`, and
         # both mean "stop calling": one because we are over our rate, one
@@ -472,8 +523,8 @@ def check(text: str, *, max_wait_s: float | None = None) -> LakeraResult:
     limiter.record_success(started_at)
 
     # Parse defensively: a malformed / unexpected response shape must not
-    # fail-open. Any parse error collapses to a fail-closed reject with only
-    # the exception type name in the reason.
+    # fail-open. Every decoded shape failure converges on one fixed reason;
+    # response content and exception details never cross the boundary.
     #
     # Lakera Guard v2, verified 2026: the response is a dict with a top-level
     # `flagged` bool and (because we requested it) a `breakdown` list. Each
@@ -482,42 +533,37 @@ def check(text: str, *, max_wait_s: float | None = None) -> LakeraResult:
     # `detector_type` is exactly "prompt_attack".
     try:
         if not isinstance(data, dict):
-            # Not even a JSON object — cannot classify. Fail closed.
             return LakeraResult(ok=False, reason="lakera_unavailable:bad-response")
 
-        breakdown = data.get("breakdown")
-        if isinstance(breakdown, list):
-            detected = [
-                e for e in breakdown
-                if isinstance(e, dict) and e.get("detected") is True
-            ]
-            categories = sorted({
-                e["detector_type"]
-                for e in detected
-                if isinstance(e.get("detector_type"), str)
-            })
-            # Gate on the injection detector ONLY. We deliberately do NOT gate
-            # on moderation (moderated_content/*) or PII detectors — those fire
-            # on legitimate security-research prose and would over-reject.
-            # Secret-exfil is covered by the deterministic secret_shapes layer.
-            if any(e.get("detector_type") == "prompt_attack" for e in detected):
-                return LakeraResult(
-                    ok=False,
-                    flagged=True,
-                    categories=categories,
-                    reason="lakera:prompt_attack",
-                )
-            return LakeraResult(ok=True, reason="pass")
-
-        # Fallback: no usable breakdown (shouldn't happen since we request it),
-        # but a top-level bool `flagged` is present -> gate conservatively.
         flagged = data.get("flagged")
-        if isinstance(flagged, bool):
-            if flagged:
-                return LakeraResult(ok=False, flagged=True, reason="lakera:flagged")
-            return LakeraResult(ok=True, reason="pass")
+        breakdown = data.get("breakdown")
+        if type(flagged) is not bool or not isinstance(breakdown, list):
+            return LakeraResult(ok=False, reason="lakera_unavailable:bad-response")
 
-        # Neither a usable breakdown nor a bool flagged -> unknown shape.
+        prompt_decisions = []
+        for entry in breakdown:
+            if not isinstance(entry, dict):
+                return LakeraResult(ok=False, reason="lakera_unavailable:bad-response")
+            detector_type = entry.get("detector_type")
+            detected = entry.get("detected")
+            if type(detector_type) is not str or type(detected) is not bool:
+                return LakeraResult(ok=False, reason="lakera_unavailable:bad-response")
+            if detector_type == "prompt_attack":
+                prompt_decisions.append(detected)
+
+        if len(prompt_decisions) != 1:
+            return LakeraResult(ok=False, reason="lakera_unavailable:bad-response")
+
+        prompt_detected = prompt_decisions[0]
+        if prompt_detected:
+            if flagged is not True:
+                return LakeraResult(ok=False, reason="lakera_unavailable:bad-response")
+            return LakeraResult(
+                ok=False,
+                flagged=True,
+                categories=["prompt_attack"],
+                reason="lakera:prompt_attack",
+            )
+        return LakeraResult(ok=True, reason="pass")
+    except Exception:  # noqa: BLE001 — hostile decoded objects fail CLOSED
         return LakeraResult(ok=False, reason="lakera_unavailable:bad-response")
-    except Exception as e:  # noqa: BLE001 — defensive parse, fail CLOSED
-        return LakeraResult(ok=False, reason=f"lakera_unavailable:{type(e).__name__}")
