@@ -1,6 +1,7 @@
 """Tests for the layered intercept shim."""
 from __future__ import annotations
 
+import base64
 import tempfile
 from pathlib import Path
 
@@ -207,7 +208,7 @@ def test_orchestrator_strips_but_passes_single_zw():
 
 # ----- L4 arbitration wiring (lakera flag + honeypot clean -> judge) -----
 
-def _flagged(_text):
+def _flagged(_text, **_kw):
     from injection_scanner.lakera import LakeraResult
     return LakeraResult(ok=False, flagged=True, reason="lakera:prompt_attack")
 
@@ -260,7 +261,7 @@ def test_lakera_flag_honeypot_triggered_rejects_without_judge(monkeypatch):
 def test_lakera_outage_hard_rejects_without_judge(monkeypatch):
     from injection_scanner import intercept, judge, lakera
     from injection_scanner.lakera import LakeraResult
-    monkeypatch.setattr(lakera, "check", lambda _t: LakeraResult(
+    monkeypatch.setattr(lakera, "check", lambda _t, **_kw: LakeraResult(
         ok=False, reason="lakera_unavailable:no-key"))
     monkeypatch.setattr(judge, "check", lambda _t: (_ for _ in ()).throw(
         AssertionError("judge must not run on lakera outage")))
@@ -280,7 +281,9 @@ def test_lakera_flag_without_honeypot_hard_rejects(monkeypatch):
 def test_lakera_clean_never_calls_judge(monkeypatch):
     from injection_scanner import intercept, judge, lakera
     from injection_scanner.lakera import LakeraResult
-    monkeypatch.setattr(lakera, "check", lambda _t: LakeraResult(ok=True, reason="pass"))
+    monkeypatch.setattr(
+        lakera, "check", lambda _t, **_kw: LakeraResult(ok=True, reason="pass")
+    )
     monkeypatch.setattr(intercept, "honeypot_check", _hp_clean)
     monkeypatch.setattr(judge, "check", lambda _t: (_ for _ in ()).throw(
         AssertionError("judge must not run when lakera passes")))
@@ -299,3 +302,160 @@ def test_judge_crash_fails_closed(monkeypatch):
     assert not v.ok
     assert v.reason == "judge_unavailable:unhandled:RuntimeError"
     assert "infra down" not in v.reason
+
+
+# ----- the batch wait budget reaches L2 (2026-09-05) -----
+#
+# `eval` is always a batch caller: it would rather queue behind the fleet's
+# budget than be refused. That preference is the caller's, so it travels as a
+# keyword from the caller to `lakera.check` and nothing in between interprets
+# it.
+
+# The spy's default is a SENTINEL, not None: `None` is a value intercept is
+# required to forward, so a default of None would make "keyword omitted" and
+# "keyword passed as None" record identically, and a conditional call site
+# (`check(t)` when the budget is unset, `check(t, max_wait_s=v)` otherwise)
+# would still satisfy `seen == [900.0, None]`. With the sentinel, an omitted
+# keyword records `_UNSET` and the assertion fails — which is exactly the
+# mutant D12 in the plan rules out.
+_UNSET = object()
+
+
+def _wait_spy():
+    """Return `(spy, seen)`: a `lakera.check` stand-in recording `max_wait_s`."""
+    from injection_scanner.lakera import LakeraResult
+
+    seen: list[object] = []
+
+    def _spy(text, *, max_wait_s=_UNSET):
+        seen.append(max_wait_s)
+        return LakeraResult(ok=True, reason="pass")
+
+    return _spy, seen
+
+
+def test_lakera_max_wait_s_reaches_the_lakera_layer(monkeypatch):
+    from injection_scanner import intercept, lakera
+
+    _spy, seen = _wait_spy()
+    monkeypatch.setattr(lakera, "check", _spy)
+
+    v = intercept.scan_text(
+        "clean prose", use_honeypot=False, use_lakera=True, lakera_max_wait_s=900.0
+    )
+    assert v.ok
+    assert seen == [900.0]
+
+    # Absent means absent: `lakera.check` resolves the default from the
+    # environment, so intercept must not substitute a number of its own — and
+    # must not drop the keyword either, which the sentinel default catches.
+    intercept.scan_text("clean prose", use_honeypot=False, use_lakera=True)
+    assert seen == [900.0, None]
+
+
+def test_scan_forwards_lakera_max_wait_s_from_the_disk_entry_point(monkeypatch, tmp_path):
+    from injection_scanner import intercept, lakera
+
+    _spy, seen = _wait_spy()
+    monkeypatch.setattr(lakera, "check", _spy)
+    report = tmp_path / "report.md"
+    report.write_text("# Report\n\nClean prose.\n", encoding="utf-8")
+
+    v = intercept.scan(
+        report, use_honeypot=False, use_lakera=True, lakera_max_wait_s=120.0
+    )
+    assert v.ok
+    assert seen == [120.0]
+
+
+# ----- L1a-decode fails closed like every other layer (2026-09-06) -----
+#
+# Every other layer in `scan_text` sits inside a blanket try/except per
+# honeypot-manufacturing Invariant 3: an exception inside a layer reduces to
+# REJECT, it does not propagate. The L1a-decode block was the one that did not,
+# so a raise in `decode.find_encoded_blobs` or in the `secret_shapes.scan` over
+# a decoded blob escaped `scan_text` entirely — aborting the scan instead of
+# rejecting the report, and breaking `run_smoke`'s contract of raising only
+# `SmokeFailure`.
+#
+# `decode` is already a layer name research-agent's closed vocabulary knows and
+# `_unavailable` is the infra head suffix, so `eval._is_infra_reason` and the
+# downstream diagnosis classify this exactly as they classify every other
+# outage — no new vocabulary crosses the boundary.
+
+
+def _raise(exc):
+    def _boom(*_a, **_k):
+        raise exc
+    return _boom
+
+
+def test_a_decode_crash_fails_closed_and_does_not_escape(monkeypatch):
+    from injection_scanner import decode, intercept
+    monkeypatch.setattr(
+        decode, "find_encoded_blobs", _raise(RuntimeError("secret sauce"))
+    )
+    v = intercept.scan_text("clean text", use_honeypot=False, use_lakera=False)
+    assert v.ok is False
+    assert v.reason == "decode_unavailable:unhandled:RuntimeError"
+    assert v.layers["decode"] == "unhandled:RuntimeError"
+
+
+def test_a_crash_scanning_a_decoded_blob_also_fails_closed(monkeypatch):
+    """The second arm of the same block: `secret_shapes.scan(blob.decoded)`.
+
+    Driven with a real base64 blob so `find_encoded_blobs` genuinely produces
+    one — a test that stubbed the blobs too would pass even if the loop were
+    left outside the guard.
+    """
+    from injection_scanner import intercept, secret_shapes as ss
+    monkeypatch.setattr(ss, "scan", _raise(ValueError("secret sauce")))
+    blob = base64.b64encode(b"x" * 90).decode("ascii")
+    v = intercept.scan_text(
+        f"report body\n\n{blob}\n", use_honeypot=False, use_lakera=False
+    )
+    assert v.ok is False
+    assert v.reason == "decode_unavailable:unhandled:ValueError"
+
+
+def test_the_decode_outage_reason_carries_no_exception_text(monkeypatch):
+    """Invariant 4: the type name only, never `str(e)`. An exception raised
+    over decoded bytes is the one most likely to embed them."""
+    from injection_scanner import decode, intercept
+    monkeypatch.setattr(
+        decode, "find_encoded_blobs", _raise(RuntimeError("secret sauce"))
+    )
+    v = intercept.scan_text("clean text", use_honeypot=False, use_lakera=False)
+    rendered = repr(v) + "|".join([v.reason, *v.layers.values()])
+    assert "secret sauce" not in rendered
+    assert "secret sauce" not in repr(v.to_audit())
+
+
+def test_an_ordinary_decode_run_is_unchanged():
+    """Control: the guard changes neither the pass path nor the detection.
+
+    `encoded_secret` must still fire — a guard that swallowed the loop would
+    turn this into a silent pass, which is the fail-OPEN direction.
+    """
+    # "Hello, world." is short enough that even the rot13 candidate rule —
+    # which speculatively rot13s ordinary prose — finds nothing to try.
+    clean = intercept_scan_text("Hello, world.")
+    assert clean.ok is True
+    assert clean.layers["decode"] == "blobs=0 encodings="
+
+    prose = intercept_scan_text("A short note about the weather today.")
+    assert prose.ok is True
+    assert prose.layers["decode"] == "blobs=1 encodings=rot13"
+
+    leak = base64.b64encode(
+        b"AWS key AKIAIOSFODNN7EXAMPLE for the record"
+    ).decode("ascii")
+    v = intercept_scan_text(f"see attachment\n\n{leak}\n")
+    assert v.ok is False
+    assert v.reason.startswith("encoded_secret:base64:")
+    assert v.layers["decode"].startswith("blobs=")
+
+
+def intercept_scan_text(text: str):
+    from injection_scanner import intercept
+    return intercept.scan_text(text, use_honeypot=False, use_lakera=False)
