@@ -137,6 +137,14 @@ class DuplicateJSONKey(Exception):
     """
 
 
+class UnexpectedHTTPStatus(Exception):
+    """The response status was not the exact HTTP 200 contract.
+
+    Carries no message so provider-controlled response metadata cannot reach
+    the caller-visible transport reason.
+    """
+
+
 def _max_response_bytes() -> int:
     return env_int(
         ENV_MAX_RESPONSE_BYTES, DEFAULT_MAX_RESPONSE_BYTES, MAX_RESPONSE_BYTES_RANGE
@@ -208,8 +216,8 @@ def _post(url: str, body: bytes, headers: dict, timeout: float) -> dict:
 
     Kept as a thin, monkeypatchable seam so the unit tests can inject
     responses (or raise) without any network access. Raises on network /
-    HTTP / decode errors; the caller's blanket except turns those into a
-    fail-closed reject.
+    HTTP / decode errors, including any status other than exact HTTP 200; the
+    caller's blanket except turns those into a fail-closed reject.
 
     Goes through `_OPENER`, not `urlopen`: see the comment on it for why a
     followed redirect is a key-exfiltration bug rather than a convenience.
@@ -221,6 +229,12 @@ def _post(url: str, body: bytes, headers: dict, timeout: float) -> dict:
     cap = _max_response_bytes()
     req = urllib.request.Request(url, data=body, headers=headers, method="POST")
     with _OPENER.open(req, timeout=timeout) as resp:
+        try:
+            status = resp.status
+        except Exception:  # noqa: BLE001 — missing/hostile status fails closed
+            raise UnexpectedHTTPStatus from None
+        if type(status) is not int or status != 200:
+            raise UnexpectedHTTPStatus
         raw = resp.read(cap + 1)
     if len(raw) > cap:
         raise ResponseTooLarge

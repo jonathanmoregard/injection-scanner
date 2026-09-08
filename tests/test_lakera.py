@@ -1115,8 +1115,10 @@ def test_a_malformed_timeout_degrades_to_the_default(monkeypatch):
 _KEY_MARKER = "lk-loopback-key-DO-NOT-FORWARD"
 
 class _Response:
-    def __init__(self, body: bytes) -> None:
+    def __init__(self, body: bytes, *, status: int = 200) -> None:
         self.body = body
+        self.status = status
+        self.code = status
         self.read_limits: list[int] = []
         self.exited = False
 
@@ -1145,7 +1147,6 @@ class _Opener:
 
 
 class _OpenerChainResponse(_Response):
-    code = 200
     msg = "OK"
 
     def info(self) -> HTTPMessage:
@@ -1253,6 +1254,41 @@ def test_post_uses_the_real_proxy_free_no_redirect_opener_chain(monkeypatch):
     )
     assert any(isinstance(handler, lakera._NoRedirect) for handler in opener.handlers)
     assert transport in opener.handlers
+
+
+def test_a_201_is_not_a_liveness_success(monkeypatch):
+    _with_key(monkeypatch)
+    spy = _SpyLimiter(Decision.ALLOWED)
+    _install_spy(monkeypatch, spy)
+    marker = "PROVIDER_RESPONSE_MARKER_DO_NOT_EXPOSE"
+    response = _OpenerChainResponse(
+        json.dumps(
+            {
+                "flagged": False,
+                "breakdown": [
+                    {"detector_type": "prompt_attack", "detected": False}
+                ],
+                "provider_text": marker,
+            }
+        ).encode("utf-8"),
+        status=201,
+    )
+    transport = _InProcessHTTPSHandler(response)
+    opener = urllib.request.build_opener(
+        urllib.request.ProxyHandler({}),
+        lakera._NoRedirect(),
+        transport,
+    )
+    monkeypatch.setattr(lakera, "_OPENER", opener)
+
+    result = lakera.check("anything")
+
+    assert result.ok is False
+    assert result.reason == "lakera_unavailable:UnexpectedHTTPStatus"
+    assert marker not in result.reason
+    assert spy.successes == []
+    assert response.read_limits == []
+    assert len(transport.requests) == 1
 
 
 def test_a_redirect_is_an_outage_and_never_forwards_the_key(monkeypatch):
