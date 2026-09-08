@@ -18,6 +18,8 @@
 - Modify `tests/test_lakera.py`: replace four loopback-server tests with in-process transport doubles.
 - Modify `injection_scanner/lakera.py`: pin the credentialed destination,
   disable ambient proxies, and strictly validate injection decisions.
+- Modify `injection_scanner/intercept.py`: remove the stale legacy fallback
+  response-contract comment.
 - Modify `tests/test_throttle.py`: regression for unreadable state.
 - Modify `injection_scanner/throttle.py`: distinguish missing state from read I/O failure.
 - Modify `README.md`: accurate hermetic-test, directory-mode, and parsed-200 documentation.
@@ -100,6 +102,20 @@ addopts = "--disable-socket --allow-unix-socket"
 
 No test gets an `enable_socket` or `socket_enabled` escape hatch.
 
+In `tests/conftest.py`, add a `pytest_configure` hook that rejects
+`--force-enable-socket` and `--allow-hosts`, unregisters pytest-socket's
+per-test lifecycle plugin after option parsing, and calls
+`disable_socket(allow_unix_socket=True)` once. Add a collection hook that
+rejects the `enable_socket`, `socket_enabled`, and `allow_hosts`
+marker/fixture escape mechanisms.
+
+Extend `tests/test_network_hermeticity.py` with isolated subprocess pytest
+cases proving a constructor cached during collection remains guarded, fixture
+finalizers remain guarded, and every CLI/per-test escape mechanism exits with
+a usage error. The RED run against stock pytest-socket must fail without ever
+connecting or binding: constructor creation alone is enough to discriminate
+the lifecycle gap.
+
 - [ ] **Step 4: Run the focused tests and verify GREEN**
 
 Run:
@@ -109,15 +125,17 @@ uv run --extra test pytest -q tests/test_network_hermeticity.py tests/test_ci_re
 ```
 
 Expected: all tests pass; IPv4/IPv6 socket construction raises
-`SocketBlockedError`, while an unbound Unix-domain socket can be created.
+`SocketBlockedError` in bodies, collection-cached call sites, and finalizers;
+escape mechanisms are usage errors; an unbound Unix-domain socket can be
+created.
 
 - [ ] **Step 5: Run the fastest file checks**
 
 Run:
 
 ```bash
-python -m compileall -q tests/test_network_hermeticity.py tests/test_ci_relations.py
-git diff --check -- pyproject.toml tests/test_network_hermeticity.py tests/test_ci_relations.py
+python -m compileall -q tests/conftest.py tests/test_network_hermeticity.py tests/test_ci_relations.py
+git diff --check -- pyproject.toml tests/conftest.py tests/test_network_hermeticity.py tests/test_ci_relations.py
 ```
 
 Expected: exit 0.
@@ -125,7 +143,7 @@ Expected: exit 0.
 - [ ] **Step 6: Commit**
 
 ```bash
-git add pyproject.toml tests/test_network_hermeticity.py tests/test_ci_relations.py
+git add pyproject.toml tests/conftest.py tests/test_network_hermeticity.py tests/test_ci_relations.py
 git commit -m "test: forbid network endpoints under pytest"
 ```
 
@@ -258,6 +276,7 @@ git commit -m "test: replace loopback endpoints with transport doubles"
 **Files:**
 - Modify: `tests/test_lakera.py`
 - Modify: `injection_scanner/lakera.py`
+- Modify: `injection_scanner/intercept.py` (comment only)
 
 - [ ] **Step 1: Write failing endpoint tests**
 
@@ -272,9 +291,23 @@ HTTPS/default-port spelling, and reject before token acquisition:
         "https://api.lakera.ai.evil.invalid/v2/guard",
         "https://user@api.lakera.ai/v2/guard",
         "https://api.lakera.ai:444/v2/guard",
+        "https://api.lakera.ai:/v2/guard",
+        "https://api.lakera.ai:0443/v2/guard",
         "https://api.lakera.ai/other",
         "https://api.lakera.ai/v2/guard?next=evil",
         "https://api.lakera.ai/v2/guard#fragment",
+        "https://api.lakera.ai/v2/guard?",
+        "https://api.lakera.ai/v2/guard#",
+        "https://api.lakera.ai:bad/v2/guard",
+        "https://api.lakera.ai:65536/v2/guard",
+        "https://user:password@api.lakera.ai/v2/guard",
+        "https://api%2elakera.ai/v2/guard",
+        "https://api.lakera.ai/v2%2fguard",
+        " https://api.lakera.ai/v2/guard",
+        "\x1fhttps://api.lakera.ai/v2/guard",
+        "https://api.lakera.ai/v2/guard\n",
+        "https://api.lakera.\tai/v2/guard",
+        "https://api.lakera.ai\\@attacker.invalid/v2/guard",
     ],
 )
 def test_only_the_canonical_lakera_endpoint_can_receive_the_key(
@@ -288,8 +321,15 @@ def test_only_the_canonical_lakera_endpoint_can_receive_the_key(
     assert result.reason == "lakera_unavailable:url-config-error"
 ```
 
-Add a test that sets `HTTPS_PROXY` and `ALL_PROXY`, constructs the production
-opener, and asserts its `ProxyHandler.proxies == {}`.
+Add an accepted-spelling table for the default URL, uppercase scheme/host, and
+explicit port 443. Install a limiter spy in the rejection table and assert no
+token acquisition occurs.
+
+Add a production `_build_opener()` factory. In a test, set `HTTPS_PROXY` and
+`ALL_PROXY`, construct an opener, and assert the handler chain contains
+`_NoRedirect` but no `ProxyHandler`. CPython does not retain an empty
+`ProxyHandler({})`; without the explicit empty handler, ambient proxies create
+a populated handler, so absence is the discriminating assertion.
 
 - [ ] **Step 2: Write failing response-schema tests**
 
@@ -328,6 +368,16 @@ def test_malformed_or_contradictory_decisions_fail_closed(
 
 Add a positive test proving a detected non-prompt detector name never appears
 in `categories`.
+
+Extend malformed-shape coverage to non-boolean `flagged`/`detected` values,
+missing or wrongly typed fields, malformed entries after a valid prompt entry,
+conflicting duplicate prompt entries, and a breakdown containing only
+non-prompt detectors. Add a liveness regression proving a parsed HTTP 200 with
+an invalid schema still records success before returning `bad-response`.
+
+At the raw transport seam, add a duplicate-key JSON regression, including a
+nested duplicate. Use `object_pairs_hook` to reject last-value-wins ambiguity
+and map that dedicated content-free failure to `bad-response` in `check`.
 
 - [ ] **Step 3: Run the new tests and verify RED**
 
@@ -399,9 +449,9 @@ Do not expose any upstream detector name other than the fixed literal.
 
 ```bash
 uv run --extra test pytest -q tests/test_lakera.py
-python -m compileall -q injection_scanner/lakera.py tests/test_lakera.py
-git diff --check -- injection_scanner/lakera.py tests/test_lakera.py
-git add injection_scanner/lakera.py tests/test_lakera.py
+python -m compileall -q injection_scanner/lakera.py injection_scanner/intercept.py tests/test_lakera.py
+git diff --check -- injection_scanner/lakera.py injection_scanner/intercept.py tests/test_lakera.py
+git add injection_scanner/lakera.py injection_scanner/intercept.py tests/test_lakera.py
 git commit -m "fix: pin and validate the Lakera boundary"
 ```
 

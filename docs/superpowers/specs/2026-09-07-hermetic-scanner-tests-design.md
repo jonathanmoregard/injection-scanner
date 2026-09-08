@@ -55,19 +55,27 @@ Add `pytest-socket` to the test-only dependency group and configure:
 addopts = "--disable-socket --allow-unix-socket"
 ```
 
-`--disable-socket` is parsed before tests run and patches socket creation for
-the entire pytest process. Keeping it in project configuration makes plain
-`pytest`, `python -m pytest`, local `uv run`, and the existing CI command
-equivalent. `--allow-unix-socket` retains non-network local IPC.
+`--disable-socket` is parsed before tests run. Keeping it in project
+configuration makes plain `pytest`, `python -m pytest`, local `uv run`, and
+the existing CI command equivalent. `--allow-unix-socket` retains
+non-network local IPC.
 
-No test may opt out with `enable_socket` or `socket_enabled`. The CI
-relations test will parse `pyproject.toml` and assert the dependency and both
-options remain present. This makes removal of the embargo an ordinary test
-failure.
+The plugin's default per-test lifecycle is insufficient: it restores the real
+constructor during collection and teardown. The root `tests/conftest.py`
+therefore unregisters those lifecycle hooks in `pytest_configure`, after the
+plugin has parsed its options, and calls its mature `disable_socket`
+implementation once for the whole project-test lifecycle. The guard is active
+before test-module collection and remains active through fixture finalizers.
 
-A sentinel test attempts to create an IPv4 socket and asserts
-`pytest_socket.SocketBlockedError`. It is not the primary enforcement; it is
-an executable assertion that the configured enforcement is loaded.
+No test may opt out with `enable_socket`, `socket_enabled`, `allow_hosts`,
+`--force-enable-socket`, or `--allow-hosts`. Configuration and collection
+hooks reject those mechanisms before a test body runs. The CI-relations test
+asserts the dependency and mandatory project options remain present.
+
+Sentinel and subprocess meta-tests prove that IPv4/IPv6 constructors are
+blocked in ordinary test bodies, when cached during collection, and during
+fixture finalization. They also prove Unix sockets remain available and every
+documented escape mechanism is refused.
 
 ### Hermetic HTTP behavior tests
 
@@ -105,14 +113,21 @@ mode-bit tests because they are unreliable when tests run as root.
 
 `LAKERA_GUARD_URL` remains an operator input for compatibility, but it may
 name only the canonical service: HTTPS, host `api.lakera.ai`, path
-`/v2/guard`, default port, no userinfo, query, or fragment. Scheme and host
-normalization follow URL rules; a different destination returns the fixed
+`/v2/guard`, absent or explicit default port `443`, no userinfo, query, or
+fragment. Scheme and host normalization follow URL rules. Empty `?` and `#`
+delimiters, malformed ports, encoded host/path variants, and backslash
+authority confusion are non-canonical and rejected. A different destination returns the fixed
 `lakera_unavailable:url-config-error` before a token is spent or the key is
 attached.
 
 Build the urllib opener with `ProxyHandler({})` and the existing no-redirect
 handler. This makes the credential's network destination depend only on the
 validated URL, not on `HTTPS_PROXY`, `ALL_PROXY`, or desktop proxy state.
+Expose opener construction through a small production factory so tests can
+set hostile ambient proxy variables and inspect the resulting handler chain.
+CPython intentionally does not retain an empty `ProxyHandler` in that chain;
+the invariant is the absence of any populated proxy handler and the presence
+of the no-redirect handler.
 
 Response parsing validates the decision as a schema, not as a collection of
 optional hints:
@@ -129,6 +144,12 @@ The only returned category is the fixed literal `prompt_attack` on that
 detector's positive result. Other detector names are neither trusted as output
 nor needed for the gate. Any invalid shape returns the fixed fail-closed
 `lakera_unavailable:bad-response`.
+
+Strictness begins at JSON decoding: duplicate object keys are rejected at any
+nesting depth instead of inheriting `json.loads`' last-value-wins behavior.
+Decoded-shape validation examines every breakdown entry, even entries after a
+valid prompt decision. A parsed HTTP 200 remains a liveness success before
+schema validation, while a syntactically malformed JSON response does not.
 
 ### Documentation consistency
 
