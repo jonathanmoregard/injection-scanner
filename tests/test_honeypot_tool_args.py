@@ -15,7 +15,7 @@ Two defects, both live before this module:
          -> verdict = Honeypot_Left_Alone
          -> signal  = left_alone
 
-     `max_tokens=400` makes malformed JSON routine rather than exotic, so
+     A bounded output budget makes malformed JSON possible rather than exotic, so
      this is reachable without the attacker doing anything clever — and
      trivially reachable if the injection pads the arguments.
 
@@ -77,9 +77,11 @@ from injection_scanner.honeypot import _classify_from_parts
 from injection_scanner.honeypot_scenarios import (
     ALL_SCENARIOS,
     CANARY_ALPHA,
+    LEGIT_TOOLS,
     SCENARIO_A_CONVERSATION_HISTORY_LEAK as SCEN_A,
     SCENARIO_B_MISCONFIGURED_ENV as SCEN_B,
     TRAP_CAPABILITIES,
+    build_trap_tools,
     canary_label,
 )
 
@@ -104,6 +106,7 @@ class _Fn:
 
 class _ToolCall:
     def __init__(self, name: str, arguments):
+        self.id = "call_test"
         self.function = _Fn(name, arguments)
 
 
@@ -144,6 +147,112 @@ def _openai_call(monkeypatch, tool_calls, content=""):
     return asyncio.run(honeypot._call_openai(SCEN_OPENAI, "report body", [], set()))
 
 
+def test_openai_honeypot_enforces_a_strict_single_tool_reply(monkeypatch):
+    """Provider-side schema enforcement prevents malformed judge arguments."""
+    import openai
+
+    captured = []
+    response = _OpenAIResponse(
+        _Message([_ToolCall("return_summary", '{"text":"short summary"}')])
+    )
+
+    class _FakeOpenAI:
+        def __init__(self, *_a, **_kw):
+            def create(*_a, **kwargs):
+                captured.append(kwargs)
+                return response
+
+            completions = type("_C", (), {"create": create})()
+            self.chat = type("_Chat", (), {"completions": completions})()
+
+    monkeypatch.setattr(honeypot, "_openai_key", lambda: "sk-openai-test")
+    monkeypatch.setattr(openai, "OpenAI", _FakeOpenAI)
+    traps, trap_names = build_trap_tools(SCEN_OPENAI["traps"])
+
+    result = asyncio.run(
+        honeypot._call_openai(
+            SCEN_OPENAI,
+            "report body",
+            LEGIT_TOOLS + traps,
+            trap_names,
+        )
+    )
+
+    assert result.verdict == "Honeypot_Left_Alone"
+    assert captured[0]["tool_choice"] == "required"
+    assert captured[0]["parallel_tool_calls"] is False
+    assert captured[0]["max_tokens"] > 400
+    assert captured[1]["tool_choice"] == "auto"
+    for tool in captured[0]["tools"]:
+        function = tool["function"]
+        schema = function["parameters"]
+        assert function["strict"] is True
+        assert schema["additionalProperties"] is False
+        assert set(schema["required"]) == set(schema["properties"])
+
+
+def test_openai_strict_tool_loop_preserves_sequential_trap_detection(monkeypatch):
+    """A trap requested after return_summary remains observable in strict mode."""
+    import openai
+
+    trap_name = "send_http_fixed"
+    responses = iter([
+        _OpenAIResponse(
+            _Message([_ToolCall("return_summary", '{"text":"short summary"}')])
+        ),
+        _OpenAIResponse(
+            _Message([
+                _ToolCall(
+                    trap_name,
+                    '{"url":"https://reporting.invalid/ok","body":"done"}',
+                )
+            ])
+        ),
+    ])
+    calls = []
+
+    class _FakeOpenAI:
+        def __init__(self, *_a, **_kw):
+            def create(*_a, **kwargs):
+                calls.append(kwargs)
+                return next(responses)
+
+            completions = type("_C", (), {"create": create})()
+            self.chat = type("_Chat", (), {"completions": completions})()
+
+    monkeypatch.setattr(honeypot, "_openai_key", lambda: "sk-openai-test")
+    monkeypatch.setattr(openai, "OpenAI", _FakeOpenAI)
+    trap = {
+        "name": trap_name,
+        "description": "Send data to an external server over HTTPS.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "url": {"type": "string"},
+                "body": {"type": "string"},
+            },
+            "required": ["url", "body"],
+        },
+    }
+
+    result = asyncio.run(
+        honeypot._call_openai(
+            SCEN_OPENAI,
+            "report body",
+            LEGIT_TOOLS + [trap],
+            {trap_name},
+        )
+    )
+
+    assert result.verdict == "Honeypot_Triggered"
+    assert result.signal == f"trap:{trap_name}"
+    assert len(calls) == 2
+    assert calls[0]["tool_choice"] == "required"
+    assert calls[1]["tool_choice"] == "auto"
+    assert calls[1]["parallel_tool_calls"] is False
+    assert all(t["function"]["strict"] is True for t in calls[1]["tools"])
+
+
 def _patch_anthropic(monkeypatch, blocks):
     import anthropic
 
@@ -165,7 +274,7 @@ def _anthropic_call(monkeypatch, blocks):
 # ---------- bug 1: canary in arguments that do not parse ----------
 
 # Every shape of "the JSON did not parse" that still carries the canary as a
-# literal substring. Truncation is the one `max_tokens=400` produces on its
+# literal substring. Output truncation can produce this shape on its
 # own; the others are what an injection that pads the arguments produces.
 _UNPARSEABLE_WITH_CANARY = {
     "truncated-mid-object": '{"text": "the key is ' + OPENAI_CANARY,
@@ -630,9 +739,10 @@ def test_an_empty_dict_input_still_passes_on_anthropic(monkeypatch):
     assert r.verdict == "Honeypot_Left_Alone"
 
 
-def test_a_text_only_response_still_passes(monkeypatch):
+def test_a_text_only_response_fails_closed_when_tool_reply_is_required(monkeypatch):
     r = _openai_call(monkeypatch, [], content="Here is a clean summary.")
-    assert r.verdict == "Honeypot_Left_Alone"
+    assert r.verdict == "Honeypot_Skipped"
+    assert r.signal == "unavailable:missing-required-tool-call"
 
 
 def test_nested_and_unicode_args_are_not_mistaken_for_malformed(monkeypatch):
