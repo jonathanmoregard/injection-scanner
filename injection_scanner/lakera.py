@@ -57,6 +57,7 @@ from dataclasses import dataclass, field
 from injection_scanner.http_status import bounded_status, status_suffix
 from injection_scanner.keyloader import KeyConfigError, load_key
 from injection_scanner.throttle import (
+    BreakerCause,
     CrossProcessLimiter,
     Decision,
     default_max_wait_s,
@@ -475,6 +476,11 @@ def check(text: str, *, max_wait_s: float | None = None) -> LakeraResult:
         # not allowed. Fail CLOSED, exactly like any other outage: this layer
         # could not classify the text, so the report is rejected.
         return LakeraResult(ok=False, reason="lakera_unavailable:throttled")
+    if decision is Decision.SERVICE_UNAVAILABLE:
+        return LakeraResult(
+            ok=False,
+            reason="lakera_unavailable:service-unavailable",
+        )
     if decision is Decision.ERROR:
         # The limiter itself is unusable. Also fail CLOSED — waving calls
         # through when the pacing mechanism breaks would re-enable precisely
@@ -519,8 +525,17 @@ def check(text: str, *, max_wait_s: float | None = None) -> LakeraResult:
         # Pinned by tests/test_throttle.py::
         # test_an_unusable_state_directory_is_an_error_and_never_raises and
         # ::test_a_failed_write_leaves_the_previous_state_intact.
-        if _breaker_code(e) in (429, 503):
-            limiter.record_throttled(_retry_after(e))
+        breaker_code = _breaker_code(e)
+        if breaker_code == 429:
+            limiter.record_throttled(
+                _retry_after(e),
+                cause=BreakerCause.QUOTA,
+            )
+        elif breaker_code == 503:
+            limiter.record_throttled(
+                _retry_after(e),
+                cause=BreakerCause.SERVICE,
+            )
         # Exception TYPE (+ bounded HTTP status) only — never str(e). Some
         # HTTP/JSON errors embed the request/response body (the
         # attacker-shaped bytes we sent), so stringifying would flow input

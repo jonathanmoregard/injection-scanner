@@ -630,6 +630,7 @@ class _SpyLimiter:
         self.decision = decision
         self.acquired: list[float] = []
         self.throttled: list[object] = []
+        self.throttle_causes: list[object] = []
         self.successes: list[float] = []
 
     def acquire(self, max_wait_s: float = 0.0) -> Decision:
@@ -639,8 +640,9 @@ class _SpyLimiter:
     def record_success(self, started_at: float) -> None:
         self.successes.append(started_at)
 
-    def record_throttled(self, retry_after) -> None:
+    def record_throttled(self, retry_after, *, cause=None) -> None:
         self.throttled.append(retry_after)
+        self.throttle_causes.append(cause)
 
 
 def _install_spy(monkeypatch, spy: _SpyLimiter) -> None:
@@ -755,18 +757,18 @@ def test_a_call_that_cannot_happen_spends_no_token(
 
 
 @pytest.mark.parametrize(
-    "code,second_reason",
-    [
-        (429, "lakera_unavailable:throttled"),
-        (503, "lakera_unavailable:throttled"),
+        "code,second_reason",
+        [
+            (429, "lakera_unavailable:throttled"),
+            (503, "lakera_unavailable:service-unavailable"),
         (500, "lakera_unavailable:HTTPError:500"),
         (401, "lakera_unavailable:HTTPError:401"),
     ],
 )
 def test_only_429_and_503_open_the_breaker(monkeypatch, code, second_reason):
-    """RFC 9110 puts `Retry-After` on both 429 and 503, and a Lakera-side
-    outage deserves the same courtesy as throttling. A 500 or a 401 is not a
-    rate signal and must leave the breaker alone."""
+    """RFC 9110 puts `Retry-After` on both 429 and 503, so both open the
+    breaker. Their fixed reasons stay distinct because only quota pressure may
+    enter the strict degraded path. A 500 or 401 leaves the breaker alone."""
     _with_key(monkeypatch)
     monkeypatch.setenv("INJECTION_SCANNER_LAKERA_BACKOFF_MAX_S", "600")
     exc = _http_error(code)
@@ -965,6 +967,35 @@ def test_a_missing_retry_after_header_is_none_not_a_crash(monkeypatch):
     monkeypatch.setattr(lakera, "_post", _boom)
     assert lakera.check("x").reason == "lakera_unavailable:HTTPError:503"
     assert spy.throttled == [None]
+    assert spy.throttle_causes == [throttle.BreakerCause.SERVICE]
+
+
+def test_a_429_records_quota_as_the_breaker_cause(monkeypatch):
+    _with_key(monkeypatch)
+    spy = _SpyLimiter(Decision.ALLOWED)
+    _install_spy(monkeypatch, spy)
+
+    def _boom(*_a, **_kw):
+        raise _http_error(429, "Too Many Requests")
+
+    monkeypatch.setattr(lakera, "_post", _boom)
+    assert lakera.check("x").reason == "lakera_unavailable:HTTPError:429"
+    assert spy.throttle_causes == [throttle.BreakerCause.QUOTA]
+
+
+def test_an_open_service_breaker_has_a_distinct_fixed_reason(monkeypatch):
+    _with_key(monkeypatch)
+    spy = _SpyLimiter(Decision.SERVICE_UNAVAILABLE)
+    _install_spy(monkeypatch, spy)
+    monkeypatch.setattr(
+        lakera,
+        "_post",
+        lambda *_a, **_kw: pytest.fail("service breaker must suppress the call"),
+    )
+
+    result = lakera.check("x")
+
+    assert result.reason == "lakera_unavailable:service-unavailable"
 
 
 def test_a_non_http_failure_leaves_the_breaker_alone(monkeypatch):

@@ -352,6 +352,39 @@ def test_a_numeric_retry_after_is_honoured_and_spends_no_token(tmp_path):
     assert lim.acquire() is Decision.ALLOWED
 
 
+def test_a_service_breaker_is_not_reported_as_quota_throttling(tmp_path):
+    fake = _Fake()
+    lim = _limiter(tmp_path, fake, min_interval_s=0.0, burst=1)
+
+    lim.record_throttled(None, cause=throttle.BreakerCause.SERVICE)
+
+    assert lim.acquire() is Decision.SERVICE_UNAVAILABLE
+
+
+def test_a_quota_signal_cannot_downgrade_an_open_service_breaker(tmp_path):
+    fake = _Fake()
+    lim = _limiter(tmp_path, fake, min_interval_s=0.0, burst=1)
+
+    lim.record_throttled("60", cause=throttle.BreakerCause.SERVICE)
+    lim.record_throttled("60", cause=throttle.BreakerCause.QUOTA)
+
+    assert lim.acquire() is Decision.SERVICE_UNAVAILABLE
+
+
+def test_breaker_cause_is_a_closed_persisted_value(tmp_path):
+    fake = _Fake()
+    lim = _limiter(tmp_path, fake, min_interval_s=0.0, burst=1)
+
+    lim.record_throttled("60", cause=throttle.BreakerCause.QUOTA)
+
+    state = _state(lim)
+    assert state["breaker_cause"] == "quota"
+    assert set(throttle.BreakerCause) == {
+        throttle.BreakerCause.QUOTA,
+        throttle.BreakerCause.SERVICE,
+    }
+
+
 def test_an_http_date_retry_after_is_honoured(tmp_path):
     fake = _Fake()
     lim = _limiter(tmp_path, fake, min_interval_s=0.0, burst=1)
@@ -600,11 +633,12 @@ def test_a_breaker_parked_beyond_the_cap_reopens_on_its_own(tmp_path):
     lim.state_path.write_text(
         json.dumps(
             {
-                "schema": 1,
+                "schema": 2,
                 "tokens": 0.0,
                 "updated_at": fake.now,
                 "open_until": fake.now + 30 * 86400.0,   # thirty days out
                 "failures": 1,
+                "breaker_cause": "quota",
                 "tripped_at": fake.now,
             }
         ),
@@ -656,15 +690,19 @@ def test_a_shorter_retry_after_never_shrinks_an_already_open_breaker(tmp_path):
         "not json at all",
         '{"schema": 99, "tokens": 0.0, "updated_at": 0.0, '
         '"open_until": 9999999999.0, "failures": 7}',
-        '{"schema": 1, "tokens": "lots"}',
-        '{"schema": 1, "tokens": NaN, "updated_at": 0.0, '
-        '"open_until": 0.0, "failures": 0, "tripped_at": 0.0}',
-        '{"schema": 1, "tokens": 0.0, "updated_at": 0.0, '
-        '"open_until": NaN, "failures": 0, "tripped_at": 0.0}',
-        '{"schema": 1, "tokens": 0.0, "updated_at": 0.0, '
-        '"open_until": Infinity, "failures": 0, "tripped_at": 0.0}',
-        '{"schema": 1, "tokens": 0.0, "updated_at": 0.0, '
-        '"open_until": 9999999999.0, "failures": 7}',
+        '{"schema": 2, "tokens": "lots"}',
+        '{"schema": 2, "tokens": NaN, "updated_at": 0.0, '
+        '"open_until": 0.0, "failures": 0, "breaker_cause": null, '
+        '"tripped_at": 0.0}',
+        '{"schema": 2, "tokens": 0.0, "updated_at": 0.0, '
+        '"open_until": NaN, "failures": 0, "breaker_cause": null, '
+        '"tripped_at": 0.0}',
+        '{"schema": 2, "tokens": 0.0, "updated_at": 0.0, '
+        '"open_until": Infinity, "failures": 0, "breaker_cause": null, '
+        '"tripped_at": 0.0}',
+        '{"schema": 2, "tokens": 0.0, "updated_at": 0.0, '
+        '"open_until": 9999999999.0, "failures": 7, '
+        '"breaker_cause": "quota"}',
     ],
     ids=[
         "empty", "truncated", "null", "array", "garbage",
@@ -703,11 +741,12 @@ def test_an_unusable_state_file_is_a_reset_not_an_error(tmp_path, blob):
 
     assert lim.acquire() is Decision.ALLOWED
     st = _state(lim)
-    assert st["schema"] == 1
+    assert st["schema"] == 2
     # A full bucket less the one call just spent — not the corrupt balance.
     assert st["tokens"] == 2.0
     assert st["open_until"] == 0.0, "a breaker that cannot be read is CLOSED"
     assert st["failures"] == 0
+    assert st["breaker_cause"] is None
     assert st["tripped_at"] == 0.0
 
 
@@ -1102,7 +1141,7 @@ def test_explicit_comparison_is_unaffected():
     assert Decision.ALLOWED is Decision.ALLOWED
     assert Decision.ALLOWED != Decision.THROTTLED
     assert Decision("throttled") is Decision.THROTTLED
-    assert len([d for d in Decision if d is not Decision.ALLOWED]) == 2
+    assert len([d for d in Decision if d is not Decision.ALLOWED]) == 3
 
 
 # ---------- the fixed-name files are opened WITHOUT following a link --------

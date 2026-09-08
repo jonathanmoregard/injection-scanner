@@ -35,12 +35,14 @@ its own call was ISSUED, and a success older than the trip is ignored.
 `lakera.check` reads that moment immediately after `acquire` returns, off the
 same wall clock this module writes.
 
-Fail-closed, like every other layer. The three outcomes are `ALLOWED`,
-`THROTTLED` (bucket empty or breaker open beyond the caller's wait budget) and
-`ERROR` (the limiter itself is unusable — unwritable directory, lock wait
-exceeded, IO error). `lakera.check` turns the latter two into
-`lakera_unavailable:throttled` / `lakera_unavailable:limiter-error`, which
-reject the report exactly as any other outage does. A limiter that cannot
+Fail-closed, like every other layer. The four outcomes are `ALLOWED`,
+`THROTTLED` (quota breaker or bucket empty), `SERVICE_UNAVAILABLE` (service
+breaker), and `ERROR` (the limiter itself is unusable — unwritable directory,
+lock wait exceeded, IO error). `lakera.check` turns the latter three into fixed
+closed-vocabulary reasons, which reject the report exactly as any other outage
+does. Distinguishing quota from a service outage lets the intercept layer use
+its strict degraded quota path without treating a 503 as quota pressure. A
+limiter that cannot
 write its state REFUSES rather than waving calls through: a silent fail-open
 would re-enable the storm this module exists to stop. `record_success` and
 `record_throttled` swallow their own errors for the same reason — if the state
@@ -94,7 +96,7 @@ from pathlib import Path
 # is FOREIGN, not corrupt, and is discarded the same way: an older or newer
 # scanner sharing the cache directory must never be able to hand this one a
 # bucket it would misread.
-_SCHEMA = 1
+_SCHEMA = 2
 
 # ---------- environment variable names ----------
 
@@ -346,6 +348,7 @@ class Decision(enum.Enum):
 
     ALLOWED = "allowed"
     THROTTLED = "throttled"
+    SERVICE_UNAVAILABLE = "service_unavailable"
     ERROR = "error"
 
     def __bool__(self) -> bool:
@@ -371,6 +374,13 @@ class Decision(enum.Enum):
         )
 
 
+class BreakerCause(enum.Enum):
+    """Why the shared breaker is open. Persisted as a closed vocabulary."""
+
+    QUOTA = "quota"
+    SERVICE = "service"
+
+
 @dataclass
 class _State:
     """The on-disk bucket + breaker, in memory. Never leaves this module."""
@@ -379,6 +389,7 @@ class _State:
     updated_at: float
     open_until: float
     failures: int
+    breaker_cause: BreakerCause | None
 
     tripped_at: float
     """When the breaker was last opened or extended. `record_success`
@@ -693,10 +704,12 @@ class CrossProcessLimiter:
         try:
             deadline = self._clock() + budget
             while True:
-                wait = self._attempt()
+                wait, cause = self._attempt()
                 if wait is None:
                     return Decision.ALLOWED
                 if self._clock() + wait > deadline:
+                    if cause is BreakerCause.SERVICE:
+                        return Decision.SERVICE_UNAVAILABLE
                     return Decision.THROTTLED
                 # Re-read after a bounded nap rather than sleeping the whole
                 # computed gap: another process may return a token or close
@@ -749,12 +762,18 @@ class CrossProcessLimiter:
                 st.failures = 0
                 st.open_until = 0.0
                 st.tripped_at = 0.0
+                st.breaker_cause = None
                 self._save(st)
         except Exception:  # noqa: BLE001 — see the docstring
             return
 
-    def record_throttled(self, retry_after: str | None) -> None:
-        """Open the breaker after a throttling response (429 or 503).
+    def record_throttled(
+        self,
+        retry_after: str | None,
+        *,
+        cause: BreakerCause = BreakerCause.QUOTA,
+    ) -> None:
+        """Open the breaker after a quota or service refusal.
 
         `retry_after` is the RAW header value and goes no further than
         `_parse_retry_after`, which turns it into a number or `None`. The
@@ -765,10 +784,19 @@ class CrossProcessLimiter:
         made, and this call was made.
         """
         try:
+            # Unknown caller input must never become the quota value that
+            # enables the degraded path. Collapse it to the conservative
+            # service-outage cause instead.
+            if not isinstance(cause, BreakerCause):
+                cause = BreakerCause.SERVICE
             with self._locked():
                 now = self._clock()
                 delay = _parse_retry_after(retry_after, now)
                 st = self._load(now)
+                service_was_open = (
+                    st.breaker_cause is BreakerCause.SERVICE
+                    and now < st.open_until
+                )
                 st.failures += 1
                 if delay is None:
                     doublings = min(st.failures - 1, _MAX_BACKOFF_DOUBLINGS)
@@ -777,6 +805,11 @@ class CrossProcessLimiter:
                     delay = 0.0
                 delay = min(delay, self._config.backoff_max_s)
                 st.open_until = max(st.open_until, now + delay)
+                # A later quota response from another in-flight call cannot
+                # downgrade a still-open service breaker into the only cause
+                # eligible for degraded scanning.
+                if cause is BreakerCause.SERVICE or not service_was_open:
+                    st.breaker_cause = cause
                 # The instant the fleet learned it was being refused. Every
                 # throttle refreshes it, so a success must have been issued
                 # after the MOST RECENT trip to be allowed to clear it — see
@@ -797,8 +830,12 @@ class CrossProcessLimiter:
 
     # ---------- internals ----------
 
-    def _attempt(self) -> float | None:
-        """One locked pass. `None` == a token was spent; else seconds to wait.
+    def _attempt(self) -> tuple[float | None, BreakerCause | None]:
+        """One locked pass: wait plus the cause of an open breaker, if any.
+
+        A `None` wait means a token was spent. A token-bucket wait has no
+        breaker cause and is quota-equivalent; an open breaker returns its
+        persisted closed-vocabulary cause.
 
         Note what is saved on the REFUSING branches: the refill is persisted
         even when the call is turned down, so a process that polls does not
@@ -834,18 +871,20 @@ class CrossProcessLimiter:
                 # Breaker open. No token is spent — the call is not happening,
                 # so it must not be billed against the bucket.
                 wait = st.open_until - now
+                cause = st.breaker_cause
             elif st.tokens >= 1.0 - _TOKEN_EPSILON:
                 # See `_TOKEN_EPSILON`: accumulated refill lands just short of
                 # a whole token, and a bare `>= 1.0` turns that dust into an
                 # unservable wait.
                 st.tokens = max(0.0, st.tokens - 1.0)
                 self._save(st)
-                return None
+                return None, None
             else:
                 wait = (1.0 - st.tokens) * self._config.min_interval_s
+                cause = None
 
             self._save(st)
-            return wait
+            return wait, cause
 
     def _locked(self):
         """This limiter's own lock: `file_lock` over `<name>-throttle.lock`,
@@ -871,6 +910,7 @@ class CrossProcessLimiter:
             updated_at=now,
             open_until=0.0,
             failures=0,
+            breaker_cause=None,
             tripped_at=0.0,
         )
 
@@ -895,6 +935,10 @@ class CrossProcessLimiter:
             updated_at = float(obj["updated_at"])
             open_until = float(obj["open_until"])
             failures = int(obj["failures"])
+            raw_cause = obj["breaker_cause"]
+            breaker_cause = (
+                None if raw_cause is None else BreakerCause(raw_cause)
+            )
             tripped_at = float(obj["tripped_at"])
         except FileNotFoundError:
             return self._fresh(now)
@@ -919,6 +963,7 @@ class CrossProcessLimiter:
             # value `record_throttled` legitimately stores.
             open_until=min(open_until, now + self._config.backoff_max_s),
             failures=max(failures, 0),
+            breaker_cause=breaker_cause,
             # A trip cannot have happened in the future. A backwards clock
             # would otherwise leave `tripped_at` ahead of every timestamp any
             # caller can report, so every success would read as stale and the
@@ -931,7 +976,7 @@ class CrossProcessLimiter:
     def _save(self, st: _State) -> None:
         """Persist the bucket + breaker, inside the lock.
 
-        Only the six fields below are written; the payload is built by NAMING
+        Only the seven fields below are written; the payload is built by NAMING
         them, so a field added to `_State` tomorrow is invisible until it is
         added here on purpose. `atomic_write_json` does the tmp + `os.replace`
         (and the 0o600 creation), so no reader ever sees a half-written bucket.
@@ -951,6 +996,9 @@ class CrossProcessLimiter:
                 "updated_at": st.updated_at,
                 "open_until": st.open_until,
                 "failures": st.failures,
+                "breaker_cause": (
+                    None if st.breaker_cause is None else st.breaker_cause.value
+                ),
                 "tripped_at": st.tripped_at,
             },
         )
