@@ -8,9 +8,9 @@ Layered prompt-injection / secret-exfil scanner. Extracted from `research-agent`
 |------|-------|---------|
 | L0 | `unicode_sanitize` | Strip covert channels (zero-width, bidi, tag-block), NFKC normalize, flag anomalous density. |
 | L1b | `secret_shapes` | High-precision API key / JWT / PEM patterns. |
-| L2 | `lakera` | Hosted Lakera Guard prompt-injection classifier, wired as a fail-CLOSED gate: a flag, a missing key, or any network/HTTP/JSON error rejects the report. Paced fleet-wide — see [Lakera rate limiting](#lakera-rate-limiting). |
+| L2 | `lakera` | Hosted Lakera Guard prompt-injection classifier, wired fail-closed. Exact quota pressure may defer to L3/L4; every other failure rejects. Paced fleet-wide — see [Lakera rate limiting](#lakera-rate-limiting). |
 | L3 | `honeypot` | Run the report past a 3-model judge ensemble (`claude-haiku-4-5`, `gpt-4o-mini`, `gpt-4.1-nano`) across six canary scenarios — two scenarios per model. If any judge gets coerced into calling a bait tool, echoing a canary via a legitimate tool argument, or surfacing one in freeform text, the report is rejected. |
-| L4 | `judge` | Arbitration for the one disagreement case (Lakera says `prompt_attack`, the honeypot is fully clean): a cross-family panel must unanimously rule the text "describes, not directs" to overturn the flag. |
+| L4 | `judge` | Arbitration when Lakera says `prompt_attack` or reports exact quota pressure and the honeypot is fully clean: a cross-family panel must unanimously rule the text "describes, not directs" before delivery. |
 
 L1a (regex) was retired (legit research output false-positived); wrap-escape protection moved to the consumer's delivery boundary.
 
@@ -73,30 +73,32 @@ The final directory component is checked with `lstat` before every use. It must 
 
 `run_smoke()` has two phases: deterministic canaries that touch no network, and one live probe that calls Lakera and the honeypot providers. Measured 2026-09-06, research-agent boot smokes alone ran **~632 per day** — one per server spawn, plus one per degraded recheck — about 19,000 a month against a 10,000-a-month quota, before a single report is scanned. Spawn frequency, not scan volume, is what exhausts the account, and one Claude Code session restore spawns six panes at once. The limiter bounds the RATE; only this reduces the DEMAND.
 
-So a passing probe is recorded in `smoke-liveness.json` and trusted fleet-wide for `INJECTION_SCANNER_SMOKE_LIVENESS_TTL_S` seconds: the second and every later spawn inside the TTL costs zero vendor calls. There is deliberately no single-flight, so panes that boot simultaneously — before the first probe has finished and recorded — all miss and all probe, a burst the limiter is there to bound. Recovery after an outage works the same way: degraded rechecks call `run_smoke()` too, so once one pane's recheck passes and records, every other pane's next recheck is served from the cache.
+So a healthy scanner-stack probe is recorded in `smoke-liveness.json` and trusted fleet-wide for `INJECTION_SCANNER_SMOKE_LIVENESS_TTL_S` seconds: the second and every later spawn inside the TTL costs zero vendor calls. Healthy means either a full Lakera + honeypot pass, or exact quota pressure followed by a full strict honeypot pass and unanimous benign judge result. There is deliberately no single-flight, so panes that boot simultaneously — before the first probe has finished and recorded — all miss and all probe, a burst the limiter is there to bound. Recovery after an outage works the same way: degraded rechecks call `run_smoke()` too, so once one pane's recheck passes and records, every other pane's next recheck is served from the cache.
 
 It is a cache in front of a probe, not a gate:
 
 - Phase 1 always runs. It checks the installed scanner's own code, not the fleet's vendors.
 - A missing, corrupt, foreign-schema, unreadable or future-dated entry is a **miss** — the probe runs exactly as it did before. So is a cache directory that fails the ownership/mode policy above. An unwritable cache directory means the pass is simply not recorded. Nothing here can turn into fail-open.
 - A **failing** probe records nothing and raises as it always did, so one bad boot cannot silence the probe fleet-wide.
-- The file holds `{"schema": 1, "ok": true, "at": <epoch>}` — a boolean about the vendors and a timestamp, no reason string and no report bytes.
+- The file holds `{"schema": 1, "ok": true, "at": <epoch>}` — a boolean about the scanner stack and a timestamp, no reason string and no report bytes.
 - `0` disables it.
 
-**To force a fresh vendor probe**, delete `smoke-liveness.json` from the cache directory, or set `INJECTION_SCANNER_SMOKE_LIVENESS_TTL_S=0`.
+**To force a fresh scanner-stack probe**, delete `smoke-liveness.json` from the cache directory, or set `INJECTION_SCANNER_SMOKE_LIVENESS_TTL_S=0`.
 
 What a stale cached pass can hide is an outage that began within the TTL. The server then boots "healthy" and the first real scan fails closed with the agent-readable infra reason: fail-closed and visibility are both preserved, and only the moment of discovery moves from spawn to first use. The sharper edge is that the hidden condition need not be temporal at all — a PANE-LOCAL fault, this process missing `LAKERA_API_KEY` or `ANTHROPIC_API_KEY` or running an older install, is papered over by a healthier peer's pass, because what is cached is a claim about the vendors and the reader cannot tell it apart from a claim about itself. Scans still fail closed (`lakera_unavailable:no-key` on the first one); what is lost is the boot banner that used to name the fault before any work arrived. `TTL=0` restores that per-boot diagnosis for an operator who wants it.
 
-### Two new reasons
+### Quota fallback and fixed reasons
 
-Both are fixed literals from the closed reason vocabulary, both carry no data, and both are fail-closed exactly like every other `lakera_unavailable:*` — the report is rejected. Neither costs a network round trip.
+These are fixed literals from a closed vocabulary and carry no data. `HTTPError:429` and local `throttled` are the only outcomes eligible for degraded arbitration: they still reject unless all strict honeypot scenarios pass and the cross-family judge returns `benign-unanimous`. Disabling the honeypot keeps them as hard rejections. Every other `lakera_unavailable:*` remains a hard rejection.
 
 | Reason | Meaning |
 |---|---|
-| `lakera_unavailable:throttled` | The fleet's budget is exhausted, or the breaker is open, and the caller's wait budget ran out. |
+| `lakera_unavailable:HTTPError:429` | Lakera directly refused the request for quota/rate pressure. |
+| `lakera_unavailable:throttled` | The fleet's local budget is exhausted, or a quota breaker is open, and the caller's wait budget ran out. |
+| `lakera_unavailable:service-unavailable` | A 503-opened service breaker suppressed the call. This is never quota fallback. |
 | `lakera_unavailable:limiter-error` | The limiter itself is unusable — unwritable, symlinked, foreign-owned or unsafely writable cache directory; lock wait exceeded; or IO error. Fail-closed on purpose: waving calls through when pacing breaks would restore the storm the limiter exists to stop. |
 
-A 429 or 503 from Lakera opens the breaker for the whole fleet and caps the bucket at a single token, so what comes out the far side of an outage is a probe rather than a herd. A successfully JSON-decoded HTTP 200 records success and closes it even when the result is flagged or the decoded value later fails the strict response-schema check: transport liveness and content acceptance are separate claims. Malformed JSON and transport/HTTP failures make no success claim. Success still counts only when that call was ISSUED after the breaker last opened. At a burst of 10 the opening calls of an outage are in flight together, and letting a straggler's 200 reset a decision nine peers had already made would walk the fleet straight back into the throttle it had correctly detected. `Retry-After` is server-supplied text: it is parsed into a number inside the limiter, clamped by `BACKOFF_MAX_S`, and the string itself is never stored, logged, or interpolated into a reason.
+A 429 or 503 from Lakera opens the breaker for the whole fleet and caps the bucket at a single token, so what comes out the far side of an outage is a probe rather than a herd. The breaker persists a closed cause (`quota` or `service`); a later in-flight 429 cannot downgrade an open service breaker. A successfully JSON-decoded HTTP 200 records success and closes it even when the result is flagged or the decoded value later fails the strict response-schema check: transport liveness and content acceptance are separate claims. Malformed JSON and transport/HTTP failures make no success claim. Success still counts only when that call was ISSUED after the breaker last opened. At a burst of 10 the opening calls of an outage are in flight together, and letting a straggler's 200 reset a decision nine peers had already made would walk the fleet straight back into the throttle it had correctly detected. `Retry-After` is server-supplied text: it is parsed into a number inside the limiter, clamped by `BACKOFF_MAX_S`, and the string itself is never stored, logged, or interpolated into a reason.
 
 The key can be sent only to the canonical Guard destination, `https://api.lakera.ai/v2/guard` (case-normalized scheme/host and an explicit `:443` are accepted); alternate schemes, hosts, credentials, ports, paths, queries, fragments and ambiguous spellings fail closed before a limiter token is spent. The opener ignores ambient proxy settings and never follows redirects, so a 3xx is an outage rather than a second credential-bearing request. A usable verdict must be an object with boolean `flagged`, a `breakdown` list whose entries have string `detector_type` and boolean `detected`, and exactly one `prompt_attack` decision; duplicate keys and malformed required structure fail closed, while unknown extra top-level or entry fields and non-prompt detector types are allowed.
 
