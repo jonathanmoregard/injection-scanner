@@ -877,13 +877,15 @@ class CrossProcessLimiter:
     def _load(self, now: float) -> _State:
         """Read the state, or synthesize a fresh one.
 
-        Missing, truncated, non-JSON, wrong shape, foreign schema, or carrying
-        a non-finite number all mean the same thing: this file cannot be
-        trusted to describe the fleet's budget. That is a RESET (full bucket,
-        breaker closed), not an error — a torn file after a crash must not
-        brick every scanner on the box, and the breaker re-learns within one
-        429. `json.loads` accepts bare `NaN`/`Infinity`, which is why the
-        finiteness check is explicit rather than implied by `float()`.
+        A missing file, truncated or non-JSON contents, wrong shape, foreign
+        schema, or a non-finite number resets to a fresh state. A real read
+        I/O failure propagates to `acquire`, which converts it to
+        `Decision.ERROR` so an unreadable budget cannot fail open.
+
+        A torn file after a crash must not brick every scanner on the box, and
+        the breaker re-learns within one 429. `json.loads` accepts bare
+        `NaN`/`Infinity`, which is why the finiteness check is explicit rather
+        than implied by `float()`.
         """
         try:
             obj = json.loads(self._state_path.read_text(encoding="utf-8"))
@@ -894,7 +896,9 @@ class CrossProcessLimiter:
             open_until = float(obj["open_until"])
             failures = int(obj["failures"])
             tripped_at = float(obj["tripped_at"])
-        except (OSError, ValueError, TypeError, KeyError):
+        except FileNotFoundError:
+            return self._fresh(now)
+        except (ValueError, TypeError, KeyError):
             return self._fresh(now)
         if not all(
             math.isfinite(v) for v in (tokens, updated_at, open_until, tripped_at)

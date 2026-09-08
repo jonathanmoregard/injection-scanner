@@ -711,6 +711,23 @@ def test_an_unusable_state_file_is_a_reset_not_an_error(tmp_path, blob):
     assert st["tripped_at"] == 0.0
 
 
+def test_a_state_file_read_error_refuses_instead_of_resetting(
+    tmp_path, monkeypatch
+) -> None:
+    fake = _Fake()
+    lim = _limiter(tmp_path, fake, min_interval_s=10.0, burst=3)
+    lim.record_throttled("600")
+    real_read_text = Path.read_text
+
+    def unreadable(path: Path, *args, **kwargs):
+        if path == lim.state_path:
+            raise PermissionError("simulated unreadable limiter state")
+        return real_read_text(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "read_text", unreadable)
+    assert lim.acquire() is Decision.ERROR
+
+
 def test_an_unusable_state_directory_is_an_error_and_never_raises(tmp_path):
     """A regular file where the state directory should be. Root-proof: this
     fails for every uid, unlike a chmod-based fixture."""
