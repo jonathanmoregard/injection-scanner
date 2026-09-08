@@ -5,6 +5,8 @@ import base64
 import tempfile
 from pathlib import Path
 
+import pytest
+
 from injection_scanner import secret_shapes, unicode_sanitize
 from injection_scanner.intercept import scan
 
@@ -218,6 +220,146 @@ def _hp_clean(_text):
     return HoneypotResult(ok=True, reason="pass")
 
 
+@pytest.mark.parametrize(
+    "reason",
+    [
+        "lakera_unavailable:HTTPError:429",
+        "lakera_unavailable:throttled",
+    ],
+)
+def test_exact_quota_degradation_uses_strict_benign_arbitration(
+    monkeypatch, reason
+):
+    from injection_scanner import intercept, judge, lakera
+    from injection_scanner.judge import JudgeResult, JudgeVote
+    from injection_scanner.lakera import LakeraResult
+
+    monkeypatch.setattr(
+        lakera,
+        "check",
+        lambda _t, **_kw: LakeraResult(ok=False, reason=reason),
+    )
+    monkeypatch.setattr(intercept, "honeypot_check", _hp_clean)
+    monkeypatch.setattr(
+        judge,
+        "check",
+        lambda _t: JudgeResult(
+            ok=True,
+            reason="benign-unanimous",
+            votes=[JudgeVote("anthropic_haiku45", "benign", "verdict")],
+        ),
+    )
+
+    verdict = intercept.scan_text("clean prose")
+
+    assert verdict.ok is True
+    assert verdict.layers["lakera"] == reason
+    assert verdict.layers["honeypot"] == "pass"
+    assert verdict.layers["judge"] == "benign-unanimous"
+
+
+@pytest.mark.parametrize(
+    "reason",
+    [
+        "lakera_unavailable:service-unavailable",
+        "lakera_unavailable:HTTPError:503",
+        "lakera_unavailable:HTTPError:429-extra",
+        "lakera_unavailable:no-key",
+        "lakera_unavailable:limiter-error",
+    ],
+)
+def test_non_quota_lakera_failures_never_enter_degraded_arbitration(
+    monkeypatch, reason
+):
+    from injection_scanner import intercept, judge, lakera
+    from injection_scanner.lakera import LakeraResult
+
+    monkeypatch.setattr(
+        lakera,
+        "check",
+        lambda _t, **_kw: LakeraResult(ok=False, reason=reason),
+    )
+    monkeypatch.setattr(
+        intercept,
+        "honeypot_check",
+        lambda _t: pytest.fail("non-quota Lakera failure must reject first"),
+    )
+    monkeypatch.setattr(
+        judge,
+        "check",
+        lambda _t: pytest.fail("non-quota Lakera failure must not arbitrate"),
+    )
+
+    verdict = intercept.scan_text("x")
+
+    assert verdict.ok is False
+    assert verdict.reason == reason
+
+
+def test_quota_degradation_without_honeypot_stays_fail_closed(monkeypatch):
+    from injection_scanner import intercept, lakera
+    from injection_scanner.lakera import LakeraResult
+
+    reason = "lakera_unavailable:HTTPError:429"
+    monkeypatch.setattr(
+        lakera,
+        "check",
+        lambda _t, **_kw: LakeraResult(ok=False, reason=reason),
+    )
+
+    verdict = intercept.scan_text("x", use_honeypot=False)
+
+    assert verdict.ok is False
+    assert verdict.reason == reason
+
+
+def test_quota_degradation_with_honeypot_trigger_rejects_without_judge(
+    monkeypatch,
+):
+    from injection_scanner import intercept, judge, lakera
+    from injection_scanner.honeypot import HoneypotResult
+    from injection_scanner.lakera import LakeraResult
+
+    monkeypatch.setattr(
+        lakera,
+        "check",
+        lambda _t, **_kw: LakeraResult(
+            ok=False,
+            reason="lakera_unavailable:throttled",
+        ),
+    )
+    monkeypatch.setattr(
+        intercept,
+        "honeypot_check",
+        lambda _t: HoneypotResult(ok=False, reason="scenario:triggered"),
+    )
+    monkeypatch.setattr(
+        judge,
+        "check",
+        lambda _t: pytest.fail("triggered honeypot must reject before judge"),
+    )
+
+    verdict = intercept.scan_text("x")
+
+    assert verdict.ok is False
+    assert verdict.reason == "honeypot:scenario:triggered"
+
+
+def test_quota_reason_helper_is_an_exact_closed_vocabulary():
+    from injection_scanner import intercept
+
+    assert intercept.is_lakera_quota_degraded(
+        "lakera_unavailable:HTTPError:429"
+    )
+    assert intercept.is_lakera_quota_degraded("lakera_unavailable:throttled")
+    assert not intercept.is_lakera_quota_degraded(
+        "lakera_unavailable:HTTPError:429-extra"
+    )
+    assert not intercept.is_lakera_quota_degraded(
+        "lakera_unavailable:service-unavailable"
+    )
+
+
 def test_lakera_flag_honeypot_clean_judge_benign_delivers(monkeypatch):
     from injection_scanner import intercept, judge, lakera
     from injection_scanner.judge import JudgeResult, JudgeVote
@@ -243,6 +385,24 @@ def test_lakera_flag_judge_attack_rejects(monkeypatch):
     v = intercept.scan_text("x", use_honeypot=True, use_lakera=True)
     assert not v.ok
     assert v.reason == "lakera_arbitration:attack:openai_4o_mini"
+
+
+def test_judge_ok_with_non_unanimous_reason_still_rejects(monkeypatch):
+    from injection_scanner import intercept, judge, lakera
+    from injection_scanner.judge import JudgeResult
+
+    monkeypatch.setattr(lakera, "check", _flagged)
+    monkeypatch.setattr(intercept, "honeypot_check", _hp_clean)
+    monkeypatch.setattr(
+        judge,
+        "check",
+        lambda _t: JudgeResult(ok=True, reason="unexpected-pass-shape"),
+    )
+
+    verdict = intercept.scan_text("x")
+
+    assert verdict.ok is False
+    assert verdict.reason == "lakera_arbitration:unexpected-pass-shape"
 
 
 def test_lakera_flag_honeypot_triggered_rejects_without_judge(monkeypatch):

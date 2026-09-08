@@ -14,7 +14,8 @@ Order (each layer can short-circuit):
                               across 6 canary scenarios; if any judge gets
                               coerced into a bait-tool call or canary echo, fail
   L4  judge                 — arbitration, ONLY for the disagreement case
-                              lakera:prompt_attack + honeypot fully clean:
+                              (lakera:prompt_attack OR exact quota pressure) +
+                              honeypot fully clean:
                               a cross-family panel must unanimously rule the
                               text "describes, not directs" to overturn the
                               flag; any attack vote, outage, or malformed
@@ -58,7 +59,30 @@ from injection_scanner.honeypot import check as honeypot_check
 # original name because that is where consumers already import it from; see
 # the containment module docstring for what the holder does and does not
 # guarantee.
-__all__ = ["QuarantineOnly", "Verdict", "scan", "scan_text"]
+__all__ = [
+    "QuarantineOnly",
+    "Verdict",
+    "is_lakera_quota_degraded",
+    "scan",
+    "scan_text",
+]
+
+
+_LAKERA_QUOTA_REASONS = frozenset(
+    {
+        "lakera_unavailable:HTTPError:429",
+        "lakera_unavailable:throttled",
+    }
+)
+
+
+def is_lakera_quota_degraded(reason: object) -> bool:
+    """True only for the fixed Lakera quota-pressure vocabulary.
+
+    Exact membership is deliberate. No prefix matching, status parsing, or
+    provider text can turn another outage into the narrower degraded path.
+    """
+    return isinstance(reason, str) and reason in _LAKERA_QUOTA_REASONS
 
 
 # ---------- to_audit() allow-lists ----------
@@ -387,11 +411,14 @@ def scan_text(
         res = lakera.check(san.text, max_wait_s=lakera_max_wait_s)
         layers["lakera"] = res.reason
         if not res.ok:
-            if res.reason == "lakera:prompt_attack" and use_honeypot:
-                # DEFER, don't deliver: a definite prompt_attack
-                # classification with the behavioral honeypot available
-                # downstream enters L4 arbitration instead of rejecting
-                # unilaterally. Measured 2026-07-28: the unilateral gate
+            if (
+                res.reason == "lakera:prompt_attack"
+                or is_lakera_quota_degraded(res.reason)
+            ) and use_honeypot:
+                # DEFER, don't deliver: a definite prompt_attack or an exact
+                # quota-pressure result with the behavioral honeypot available
+                # enters L4 arbitration instead of rejecting unilaterally.
+                # Measured 2026-07-28: the unilateral prompt-attack gate
                 # false-positived on benign research prose ABOUT agent
                 # tooling and injection attacks (4/9 fp_* corpus cases,
                 # honeypot clean on all 9), quarantining legitimate
@@ -400,11 +427,11 @@ def scan_text(
                 # cross-family judge panel unanimously rules "describes,
                 # not directs" (see judge.py).
                 #
-                # Everything else stays a hard reject: every
-                # lakera_unavailable:* outage (including a malformed or
-                # incomplete response). With the honeypot off (lakera-only
-                # measurement runs) there is no corroborating signal, so the
-                # prompt-attack classification also stays a hard reject.
+                # Everything else stays a hard reject: service failures,
+                # malformed/incomplete responses, credential/config errors,
+                # and limiter errors. With the honeypot off there is no
+                # corroborating signal, so both prompt-attack and quota
+                # outcomes stay hard rejects.
                 lakera_deferred = True
             else:
                 return Verdict(
@@ -476,12 +503,10 @@ def scan_text(
                 honeypot_api_errors=hp_api_errors,
             )
 
-        # L4 judge — arbitration of the Lakera-flag / honeypot-clean
-        # disagreement. Reached ONLY when L2 said prompt_attack and every
-        # honeypot scenario came back Left_Alone. Fail-closed like every
-        # other layer: a judge outage, a malformed verdict, or a single
-        # "attack" vote all quarantine. Only a unanimous cross-family
-        # "benign" overturns the flag.
+        # L4 judge — arbitration after a Lakera prompt-attack flag or exact
+        # quota pressure, with a fully clean honeypot. Fail-closed like every
+        # other layer: a judge outage, malformed verdict, or one "attack" vote
+        # rejects. Only a unanimous cross-family "benign" verdict proceeds.
         if lakera_deferred:
             try:
                 jr = judge.check(san.text)
@@ -498,7 +523,7 @@ def scan_text(
             layers["judge"] = jr.reason
             for v in jr.votes:
                 layers[f"judge.{v.judge}"] = f"{v.vote}:{v.signal}"
-            if not jr.ok:
+            if not (jr.ok and jr.reason == "benign-unanimous"):
                 return Verdict(
                     ok=False,
                     reason=f"lakera_arbitration:{jr.reason}",
