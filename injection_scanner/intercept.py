@@ -14,7 +14,8 @@ Order (each layer can short-circuit):
                               across 6 canary scenarios; if any judge gets
                               coerced into a bait-tool call or canary echo, fail
   L4  judge                 — arbitration, ONLY for the disagreement case
-                              lakera:prompt_attack + honeypot fully clean:
+                              (lakera:prompt_attack OR exact quota pressure) +
+                              honeypot fully clean:
                               a cross-family panel must unanimously rule the
                               text "describes, not directs" to overturn the
                               flag; any attack vote, outage, or malformed
@@ -58,7 +59,30 @@ from injection_scanner.honeypot import check as honeypot_check
 # original name because that is where consumers already import it from; see
 # the containment module docstring for what the holder does and does not
 # guarantee.
-__all__ = ["QuarantineOnly", "Verdict", "scan", "scan_text"]
+__all__ = [
+    "QuarantineOnly",
+    "Verdict",
+    "is_lakera_quota_degraded",
+    "scan",
+    "scan_text",
+]
+
+
+_LAKERA_QUOTA_REASONS = frozenset(
+    {
+        "lakera_unavailable:HTTPError:429",
+        "lakera_unavailable:throttled",
+    }
+)
+
+
+def is_lakera_quota_degraded(reason: object) -> bool:
+    """True only for the fixed Lakera quota-pressure vocabulary.
+
+    Exact membership is deliberate. No prefix matching, status parsing, or
+    provider text can turn another outage into the narrower degraded path.
+    """
+    return isinstance(reason, str) and reason in _LAKERA_QUOTA_REASONS
 
 
 # ---------- to_audit() allow-lists ----------
@@ -185,22 +209,39 @@ class Verdict(QuarantineFieldsCoerced):
         return d
 
 
-def scan(path: Path, use_honeypot: bool = True, use_lakera: bool = True) -> Verdict:
+def scan(
+    path: Path,
+    use_honeypot: bool = True,
+    use_lakera: bool = True,
+    lakera_max_wait_s: float | None = None,
+) -> Verdict:
     """Run all layers on the file at `path`. Returns a Verdict.
 
     `use_honeypot` and `use_lakera` default to True and are kept only so
     tests can force them off for unit runs that must not hit an external
     API. In production call paths, callers should NOT pass these — the
     honeypot and the Lakera gate are always on.
+
+    `lakera_max_wait_s` is how long the L2 call may wait for its turn in the
+    fleet-wide Lakera budget. `None` (the default) means "whatever
+    INJECTION_SCANNER_LAKERA_MAX_WAIT_S says", which is 0 — an interactive
+    scan refuses immediately rather than parking a report. Batch callers pass
+    a real budget so they queue instead of failing.
     """
     return scan_text(
         path.read_text(encoding="utf-8", errors="replace"),
         use_honeypot=use_honeypot,
         use_lakera=use_lakera,
+        lakera_max_wait_s=lakera_max_wait_s,
     )
 
 
-def scan_text(raw: str, use_honeypot: bool = True, use_lakera: bool = True) -> Verdict:
+def scan_text(
+    raw: str,
+    use_honeypot: bool = True,
+    use_lakera: bool = True,
+    lakera_max_wait_s: float | None = None,
+) -> Verdict:
     """Run all layers on pre-read `raw` text. Returns a Verdict.
 
     Separate entry point so callers that need symlink/TOCTOU-safe reads can
@@ -212,6 +253,9 @@ def scan_text(raw: str, use_honeypot: bool = True, use_lakera: bool = True) -> V
     Invariant 3: any exception inside a layer must reduce to *reject*, not
     propagate. The exception *type name* lands in the reason — never
     `str(e)`, which can echo input bytes back to the caller.
+
+    `lakera_max_wait_s` is passed straight to `lakera.check`; nothing here
+    interprets it. See `scan` for what it means.
     """
     layers: dict[str, str] = {}
     # Audit-only provider diagnostics from L3; stays empty unless a honeypot
@@ -260,19 +304,63 @@ def scan_text(raw: str, use_honeypot: bool = True, use_lakera: bool = True) -> V
     # decoded prose-injection is left to the planned L2 classifier. As with
     # the audit-leak rule, the verdict reason carries only the encoding and
     # the detector name — never the decoded bytes or the secret snippet.
-    blobs = decode.find_encoded_blobs(san.text)
-    encodings = sorted({b.encoding for b in blobs})
+    #
+    # Blanket try/except per Invariant 3, like every sibling layer. This block
+    # was the one without one, and it is not a layer that can be trusted to
+    # stay quiet: `find_encoded_blobs` runs candidate decoders over
+    # attacker-shaped bytes, and `secret_shapes.scan` then runs regexes over
+    # whatever those decoders produced — the deepest point in the scanner where
+    # a crafted input meets code that has to guess at a format. An exception
+    # here escaped `scan_text` outright, which is worse than any rejection: it
+    # aborts the scan rather than failing it closed, and it breaks `run_smoke`'s
+    # contract of raising nothing but `SmokeFailure`.
+    #
+    # The reason carries the exception TYPE name only, never `str(e)` — this is
+    # precisely the layer whose exceptions are most likely to embed the decoded
+    # bytes that caused them (Invariant 4). `decode` is already a layer name
+    # research-agent's closed vocabulary knows and `_unavailable` is the infra
+    # head suffix, so `eval._is_infra_reason` and the downstream diagnosis
+    # classify this as the outage it is with no new vocabulary crossing the
+    # boundary.
+    #
+    # `<layer>_unavailable:unhandled:<ExcType>` is the exact shape all four
+    # sibling blanket-excepts use (unicode_sanitize, secret_shapes, honeypot,
+    # judge). The `unhandled:` segment is what distinguishes an outage a layer
+    # DIAGNOSED — `lakera_unavailable:HTTPError:429`, which `lakera.check`
+    # builds deliberately — from one it merely fell over on, and this is the
+    # latter. Spelled identically to its siblings so the five read as one
+    # vocabulary rather than four plus an exception.
+    #
+    # The guard covers the decode WORK and nothing else: `layers` and the
+    # detection return are built after it, so a rejecting Verdict can never be
+    # swallowed by the except that exists to reject.
+    encoded_hit: tuple[str, str] | None = None
+    try:
+        blobs = decode.find_encoded_blobs(san.text)
+        encodings = sorted({b.encoding for b in blobs})
+        for blob in blobs:
+            decoded_hits = secret_shapes.scan(blob.decoded)
+            if decoded_hits:
+                encoded_hit = (blob.encoding, decoded_hits[0].name)
+                break
+    except Exception as e:
+        layers["decode"] = f"unhandled:{type(e).__name__}"
+        return Verdict(
+            ok=False,
+            reason=f"decode_unavailable:unhandled:{type(e).__name__}",
+            layers=layers,
+            sanitize_stats=asdict(san),
+            sanitized_text=san.text,
+        )
     layers["decode"] = f"blobs={len(blobs)} encodings={','.join(encodings)}"
-    for blob in blobs:
-        decoded_hits = secret_shapes.scan(blob.decoded)
-        if decoded_hits:
-            return Verdict(
-                ok=False,
-                reason=f"encoded_secret:{blob.encoding}:{decoded_hits[0].name}",
-                layers=layers,
-                sanitize_stats=asdict(san),
-                sanitized_text=san.text,
-            )
+    if encoded_hit is not None:
+        return Verdict(
+            ok=False,
+            reason=f"encoded_secret:{encoded_hit[0]}:{encoded_hit[1]}",
+            layers=layers,
+            sanitize_stats=asdict(san),
+            sanitized_text=san.text,
+        )
 
     # L1b — secret-shape scan.
     try:
@@ -320,14 +408,17 @@ def scan_text(raw: str, use_honeypot: bool = True, use_lakera: bool = True) -> V
     # measurement runs that must not depend on a live key or hit the network.
     lakera_deferred = False
     if use_lakera:
-        res = lakera.check(san.text)
+        res = lakera.check(san.text, max_wait_s=lakera_max_wait_s)
         layers["lakera"] = res.reason
         if not res.ok:
-            if res.reason == "lakera:prompt_attack" and use_honeypot:
-                # DEFER, don't deliver: a definite prompt_attack
-                # classification with the behavioral honeypot available
-                # downstream enters L4 arbitration instead of rejecting
-                # unilaterally. Measured 2026-07-28: the unilateral gate
+            if (
+                res.reason == "lakera:prompt_attack"
+                or is_lakera_quota_degraded(res.reason)
+            ) and use_honeypot:
+                # DEFER, don't deliver: a definite prompt_attack or an exact
+                # quota-pressure result with the behavioral honeypot available
+                # enters L4 arbitration instead of rejecting unilaterally.
+                # Measured 2026-07-28: the unilateral prompt-attack gate
                 # false-positived on benign research prose ABOUT agent
                 # tooling and injection attacks (4/9 fp_* corpus cases,
                 # honeypot clean on all 9), quarantining legitimate
@@ -336,12 +427,11 @@ def scan_text(raw: str, use_honeypot: bool = True, use_lakera: bool = True) -> V
                 # cross-family judge panel unanimously rules "describes,
                 # not directs" (see judge.py).
                 #
-                # Everything else stays a hard reject: every
-                # lakera_unavailable:* outage (fail-closed unchanged) and
-                # the no-breakdown `lakera:flagged` fallback (unknown
-                # detector mix — conservative). With the honeypot off
-                # (lakera-only measurement runs) there is no corroborating
-                # signal, so the flag also stays a hard reject.
+                # Everything else stays a hard reject: service failures,
+                # malformed/incomplete responses, credential/config errors,
+                # and limiter errors. With the honeypot off there is no
+                # corroborating signal, so both prompt-attack and quota
+                # outcomes stay hard rejects.
                 lakera_deferred = True
             else:
                 return Verdict(
@@ -413,12 +503,10 @@ def scan_text(raw: str, use_honeypot: bool = True, use_lakera: bool = True) -> V
                 honeypot_api_errors=hp_api_errors,
             )
 
-        # L4 judge — arbitration of the Lakera-flag / honeypot-clean
-        # disagreement. Reached ONLY when L2 said prompt_attack and every
-        # honeypot scenario came back Left_Alone. Fail-closed like every
-        # other layer: a judge outage, a malformed verdict, or a single
-        # "attack" vote all quarantine. Only a unanimous cross-family
-        # "benign" overturns the flag.
+        # L4 judge — arbitration after a Lakera prompt-attack flag or exact
+        # quota pressure, with a fully clean honeypot. Fail-closed like every
+        # other layer: a judge outage, malformed verdict, or one "attack" vote
+        # rejects. Only a unanimous cross-family "benign" verdict proceeds.
         if lakera_deferred:
             try:
                 jr = judge.check(san.text)
@@ -435,7 +523,7 @@ def scan_text(raw: str, use_honeypot: bool = True, use_lakera: bool = True) -> V
             layers["judge"] = jr.reason
             for v in jr.votes:
                 layers[f"judge.{v.judge}"] = f"{v.vote}:{v.signal}"
-            if not jr.ok:
+            if not (jr.ok and jr.reason == "benign-unanimous"):
                 return Verdict(
                     ok=False,
                     reason=f"lakera_arbitration:{jr.reason}",
