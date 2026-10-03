@@ -34,11 +34,12 @@ from dataclasses import dataclass
 # (security review 2026-10-03). Still a hard bound on pathological inputs.
 MAX_SCAN_LEN = 600_000
 
-# Cap on returned blobs, i.e. on downstream rescan work. It was 50, which a
-# report could exhaust with harmless base64 placed in front of the real one;
-# rescanning a blob is a few regex passes over a short string, so a high cap
-# costs little.
-MAX_BLOBS = 5_000
+# Cap on returned blobs. Any count that fits inside MAX_SCAN_LEN can be used
+# to push a real blob past the cap with harmless ones (50 did; so did 5000,
+# at ~150 KiB), so the cap sits above the most blobs MAX_SCAN_LEN can hold
+# (a blob is >= 16 chars plus a separator) — the length bound is the real
+# limit. Rescanning a blob is a few regex passes over a short string.
+MAX_BLOBS = MAX_SCAN_LEN // 17 + 1
 
 # Minimum decoded length worth rescanning. Shorter decodes cannot hold any
 # secret shape and only add noise.
