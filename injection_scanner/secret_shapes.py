@@ -60,6 +60,10 @@ PATTERNS: list[tuple[str, re.Pattern[str]]] = [
     # Stripe.
     ("stripe_key", re.compile(r"\b(sk|rk|pk)_(test|live)_[A-Za-z0-9]{24,}\b")),
 
+    # eBay OAuth access tokens. Their `^` and `#` characters fall outside
+    # the generic bearer_long alphabet, so they need their own rule.
+    ("ebay_oauth_token", re.compile(r"\bv\^1\.1#i\^1#[A-Za-z0-9^#+/=_\-]{40,}")),
+
     # Tavily.
     ("tavily_key", re.compile(r"\btvly-(?:dev-)?[A-Za-z0-9_\-]{20,}\b")),
 
@@ -89,7 +93,7 @@ PATTERNS: list[tuple[str, re.Pattern[str]]] = [
     (
         "env_assignment_secret",
         re.compile(
-            r"(?mi)^(?:EXA_API_KEY|TAVILY_API_KEY|CLAUDE_CODE_OAUTH_TOKEN|ANTHROPIC_API_KEY|OPENAI_API_KEY|GITHUB_TOKEN|AWS_SECRET_ACCESS_KEY)\s*=\s*[A-Za-z0-9._/+\-]{15,}\s*$"
+            r"(?mi)^(?:EXA_API_KEY|TAVILY_API_KEY|CLAUDE_CODE_OAUTH_TOKEN|ANTHROPIC_API_KEY|OPENAI_API_KEY|GITHUB_TOKEN|AWS_SECRET_ACCESS_KEY|EBAY_CLIENT_ID|EBAY_CLIENT_SECRET|TRADERA_APP_ID|TRADERA_APP_KEY|EUIPO_CLIENT_ID|EUIPO_CLIENT_SECRET|LAKERA_API_KEY)\s*=\s*[A-Za-z0-9._/+\-]{15,}\s*$"
         ),
     ),
 ]

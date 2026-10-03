@@ -50,10 +50,12 @@ jobs:
       INJECTION_SCANNER_LAKERA_MIN_INTERVAL_S: "60"
       INJECTION_SCANNER_LAKERA_BURST: "2"
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
 
       - name: install uv
-        uses: astral-sh/setup-uv@v3
+        uses: astral-sh/setup-uv@caf0cab7a618c569241d31dcd442f54681755d39 # v3
         with:
           version: latest
 
@@ -108,10 +110,12 @@ jobs:
       INJECTION_SCANNER_LAKERA_MIN_INTERVAL_S: "60"
       INJECTION_SCANNER_LAKERA_BURST: "2"
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
 
       - name: install uv
-        uses: astral-sh/setup-uv@v3
+        uses: astral-sh/setup-uv@caf0cab7a618c569241d31dcd442f54681755d39 # v3
         with:
           version: latest
 
