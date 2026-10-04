@@ -29,12 +29,17 @@ import codecs
 import re
 from dataclasses import dataclass
 
-# Only inspect the first ~200 KB; encoded exfil that matters shows up early
-# and this bounds worst-case decode cost on pathological inputs.
-MAX_SCAN_LEN = 200_000
+# Inspect the whole report. research-agent delivers reports up to 512 KiB, so
+# a shorter window (it was 200k chars) let an encoded key ride in the tail
+# (security review 2026-10-03). Still a hard bound on pathological inputs.
+MAX_SCAN_LEN = 600_000
 
-# Never return more than this many blobs; caps total downstream rescan work.
-MAX_BLOBS = 50
+# Cap on returned blobs. Any count that fits inside MAX_SCAN_LEN can be used
+# to push a real blob past the cap with harmless ones (50 did; so did 5000,
+# at ~150 KiB), so the cap sits above the most blobs MAX_SCAN_LEN can hold
+# (a blob is >= 16 chars plus a separator) — the length bound is the real
+# limit. Rescanning a blob is a few regex passes over a short string.
+MAX_BLOBS = MAX_SCAN_LEN // 17 + 1
 
 # Minimum decoded length worth rescanning. Shorter decodes cannot hold any
 # secret shape and only add noise.
