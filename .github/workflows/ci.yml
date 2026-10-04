@@ -58,3 +58,42 @@ jobs:
       # 2026-09-06: "ci tests should not call external services in general".
       - name: pytest
         run: .venv/bin/python -m pytest tests/ -v
+
+  # Quick security gates from the 2026-10-03 security review (each tool runs
+  # in seconds; measured locally 2026-10-04). Tools come from one pinned
+  # nixpkgs revision, the same one research-agent's CI uses, so CI runs the
+  # binaries the review ran. Existing hits are baselined narrowly:
+  # .gitleaks.toml (detect-secrets baseline hashes) and .gitleaksignore (one
+  # historic test-fixture fingerprint); a new secret anywhere else fails.
+  security:
+    name: security (static)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      NIXPKGS: github:NixOS/nixpkgs/b7c2ada94fe99c15b0dbcf4d11fd7850b957a436
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+      - uses: cachix/install-nix-action@13d8dd58da0234aa297dedd986986ccb8e7f3e24 # v31.11.1
+      - name: gitleaks (full history)
+        run: nix shell "$NIXPKGS#gitleaks" -c gitleaks git . --redact --no-banner
+      - name: bandit (high severity + high confidence)
+        run: nix shell "$NIXPKGS#bandit" -c bandit -r injection_scanner -lll -iii -q
+      # No lockfile in this repo: audit what `pip install` resolves today, so
+      # a newly published CVE in a dependency shows up on the next run.
+      - name: osv-scanner (resolved dependencies)
+        run: |
+          nix shell "$NIXPKGS#uv" -c uv pip compile pyproject.toml --all-extras --quiet -o "$RUNNER_TEMP/requirements.txt"
+          nix shell "$NIXPKGS#osv-scanner" -c osv-scanner scan source -L "requirements.txt:$RUNNER_TEMP/requirements.txt"
+      - name: actionlint
+        run: nix shell "$NIXPKGS#actionlint" -c actionlint
+      - name: zizmor
+        run: nix shell "$NIXPKGS#zizmor" -c zizmor --offline .github/workflows
+      # unverified-creator is skipped: it flags any action without the
+      # Marketplace badge, and every action here is pinned to a commit SHA.
+      - name: poutine
+        run: >-
+          nix shell "$NIXPKGS#poutine" -c poutine analyze_local . --fail-on-violation
+          --skip github_action_from_unverified_creator_used

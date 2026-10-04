@@ -1,0 +1,2 @@
+# Historic unicode-sanitizer test fixture (invisible-char string), not a credential.
+a8c0d7f228ae3334702bd707acc0098872b9e50f:tests/test_intercept.py:generic-api-key:74
