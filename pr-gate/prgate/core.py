@@ -286,9 +286,15 @@ def _run(ev: Event, cfg: Config, gh, review_fn: ReviewFn) -> Outcome:
         return _report(gh, ev, cfg, _always_on(g, cfg), g.own_hash, "owner-override", reviews)
 
     # Step 5: any writer can re-run a check; only an owner click buys a roll.
+    # No verified block on this head is left to dismiss here. If one was
+    # posted, another workflow edited or removed it, and a blind toggle
+    # would hand that edit a fresh model roll: send the owner to the PR.
     if ev.run_attempt > 1:
-        return Outcome(1, "a re-run never asks the model again; dismiss the gate's review "
-                          "to override, or disable and re-enable auto-merge for a fresh review")
+        return Outcome(1, "a re-run never asks the model again, and this commit has no "
+                          "verified gate block to override. If an earlier run blocked it, "
+                          "that review was edited or removed: look at the PR before "
+                          "anything else. Disabling and re-enabling auto-merge starts a "
+                          "fresh model review")
 
     # Step 6: full review.
     result = full_review(g, cfg, review_fn, lambda: _text_contents(gh, ev, g.files))

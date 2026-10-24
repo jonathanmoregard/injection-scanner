@@ -190,11 +190,15 @@ their maximum suspicion.
   which only the gate step receives. A marker that does not verify counts as
   no marker. Another workflow with a write token (e.g. CI that builds PR
   code) therefore cannot mint a pass or a block. It can still copy, edit or
-  dismiss the gate's own reviews (same bot identity), which buys nothing: a
-  re-posted real pass only re-asserts content that was passed, an edited
-  block is no longer a block but a re-run never asks the model, and only the
-  owner's dismissal clears a block. Still, keep `pull-requests: write` away
-  from workflows that run PR code.
+  dismiss the gate's own reviews (same bot identity). A re-posted real pass
+  only re-asserts content that was passed, and only the owner's dismissal
+  clears a block. But an edited block no longer verifies, so it stops
+  guarding its commit: a re-run still never asks the model, yet the owner's
+  next auto-merge toggle gets a fresh model review, a second roll at the
+  same change. Only the owner's toggle triggers it, so it costs the owner a
+  click, not nothing. When a re-run reports "no verified gate block" on a
+  commit you expected to be blocked, look at the PR before toggling. Keep
+  `pull-requests: write` away from workflows that run PR code.
 - Anyone acting as `owner` (including an agent with the owner's token) can
   enable auto-merge and dismiss the gate's review, so the gate is only as
   strong as the custody of that identity.

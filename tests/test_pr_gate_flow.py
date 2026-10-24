@@ -504,6 +504,11 @@ def test_an_unverified_bot_request_changes_is_not_a_gate_block(body):
                      dismissals=[dismissal(100, OWNER)])
     out2, model2 = run(gh2, attempt=2)
     assert out2.exit_code == 1 and model2.calls == [] and gh2.posted == []
+    # An edited block costs the owner a fresh roll only if they toggle
+    # blindly: the message sends them to the PR first, and offers no
+    # dismissal (there is no verified block to dismiss).
+    assert "no verified gate block" in out2.message and "look at the PR" in out2.message
+    assert "dismiss" not in out2.message
 
 
 

@@ -228,9 +228,15 @@ it, each with the reason. Design: `docs/superpowers/specs/2026-10-24-pr-gate-des
     old markers: re-click auto-merge. Dry-run renders `mac=unsigned`, which
     never parses. v1 markers (unsigned) are ignored. A workflow with a write
     token can still copy, edit or dismiss the gate's own reviews (same bot
-    identity); items 11-13 make that worthless: a replayed pass re-asserts
-    passed content, an edited block is just no block (and a re-run still
-    never reaches the model), and only the owner's dismissal overrides.
+    identity). A replayed pass re-asserts passed content and only the
+    owner's dismissal overrides (items 11-13), but an edited block is just
+    no block: a re-run still never reaches the model, yet the owner's next
+    auto-merge toggle is a fresh model roll at the same change. Accepted:
+    each roll costs an owner click, and the step-5 re-run message tells the
+    owner that the commit has no verified block and to look at the PR before
+    toggling. The earlier rule that made an unverified bot
+    CHANGES_REQUESTED a procedural fail (replaced by item 12) is
+    deliberately not reintroduced.
 
 ## Packaging
 
