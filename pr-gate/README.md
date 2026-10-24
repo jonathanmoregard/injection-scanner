@@ -133,6 +133,11 @@ their maximum suspicion.
   get past a strong monitor roughly 40% of the time. This is a tripwire that
   forces a human look, not a guarantee.
 - Binary files are blocked, not scanned (malware scanning is a follow-up).
+- A PR whose diff is too large for GitHub to serve (GitHub answers 406 above
+  roughly 300 files or 20 000 lines) or over 5 MB cannot pass the gate: the
+  check fails with "the diff is too large for the gate to read; split the PR",
+  and a re-run does not help. Split the PR, or merge it with an admin bypass
+  outside the gate.
 - The fake-check defence rests on no agent credential having the `workflows`
   permission; a host PAT with that scope defeats it.
 - A forged gate review would need a `github-actions[bot]` token, i.e. a

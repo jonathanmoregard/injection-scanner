@@ -83,6 +83,22 @@ def test_diff_over_limit_raises_too_large():
         client.diff("main", HEAD, 10)
 
 
+def test_diff_406_means_too_large_not_a_retryable_error():
+    # GitHub answers 406 when a compare diff exceeds its own file/line limits;
+    # a re-run can never clear that, so it must not read as infra.
+    err = urllib.error.HTTPError("https://x", 406, "Not Acceptable", {}, io.BytesIO(b""))
+    client, _ = gh(err)
+    with pytest.raises(TooLarge):
+        client.diff("main", HEAD, 10)
+
+
+def test_406_from_other_endpoints_stays_a_github_error():
+    err = urllib.error.HTTPError("https://x", 406, "Not Acceptable", {}, io.BytesIO(b""))
+    client, _ = gh(err)
+    with pytest.raises(GitHubError):
+        client.file_content("a.py", HEAD, 10)
+
+
 def test_file_content_quotes_the_path_and_pins_the_ref():
     client, op = gh(b"data")
     assert client.file_content("dir/sp ace#é.txt", HEAD, 100) == b"data"

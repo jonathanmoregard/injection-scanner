@@ -53,7 +53,9 @@ it, each with the reason. Design: `docs/superpowers/specs/2026-10-24-pr-gate-des
    rest of the PR without any model review.
 9. **Size caps.** Diff over 400 kB: the model passes are skipped and a
    `too-large` hit (owner-overridable) blocks. The deterministic checks still
-   read diffs up to 5 MB; beyond that the run fails procedurally. Monitor B
+   read diffs up to 5 MB; beyond that, or when GitHub refuses the compare
+   diff with 406 (its own size limits), the run fails procedurally with
+   "split the PR", not as a retryable infra error. Monitor B
    gets up to 400 kB of post-change contents; files past the budget are
    listed to the model as omitted. Binaries are fetched up to 25 MB.
 10. **Prior block** = a review by `github-actions[bot]` whose body starts with

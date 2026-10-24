@@ -119,8 +119,15 @@ class GitHub:
 
     def diff(self, base_ref: str, head: str, limit: int) -> bytes:
         url = f"{self._api}/compare/{urllib.parse.quote(base_ref, safe='/')}...{head}"
-        return self._request("diff", "GET", url, accept="application/vnd.github.diff",
-                             limit=limit)
+        try:
+            return self._request("diff", "GET", url, accept="application/vnd.github.diff",
+                                 limit=limit)
+        except GitHubError as e:
+            # 406: the diff exceeds GitHub's own limits (~300 files / 20k
+            # lines). A re-run cannot fix that.
+            if e.status == 406:
+                raise TooLarge("diff") from None
+            raise
 
     def file_content(self, path: str, ref: str, limit: int) -> bytes:
         url = (f"{self._api}/contents/{urllib.parse.quote(path, safe='/')}"
