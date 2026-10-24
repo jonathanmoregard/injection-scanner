@@ -1,4 +1,8 @@
-"""Cross-process rate limiting for the hosted Lakera Guard gate (L2).
+"""Cross-process rate limiting for the hosted L2 classifiers.
+
+One limiter per vendor (`CrossProcessLimiter.from_env(<vendor>)`), each with
+its own `INJECTION_SCANNER_<VENDOR>_*` inputs and its own state file. The
+history below is Lakera's, which is why the module exists.
 
 Lakera Guard is called from ONE function — `injection_scanner.lakera.check()`
 — by several independent processes that share a single Lakera account: a
@@ -84,6 +88,7 @@ import fcntl
 import json
 import math
 import os
+import re
 import stat
 import tempfile
 import time
@@ -101,12 +106,23 @@ _SCHEMA = 2
 # ---------- environment variable names ----------
 
 ENV_CACHE_DIR = "INJECTION_SCANNER_CACHE_DIR"
-ENV_MIN_INTERVAL_S = "INJECTION_SCANNER_LAKERA_MIN_INTERVAL_S"
-ENV_BURST = "INJECTION_SCANNER_LAKERA_BURST"
-ENV_BACKOFF_BASE_S = "INJECTION_SCANNER_LAKERA_BACKOFF_BASE_S"
-ENV_BACKOFF_MAX_S = "INJECTION_SCANNER_LAKERA_BACKOFF_MAX_S"
-ENV_LOCK_WAIT_S = "INJECTION_SCANNER_LAKERA_LOCK_WAIT_S"
-ENV_MAX_WAIT_S = "INJECTION_SCANNER_LAKERA_MAX_WAIT_S"
+
+# Per-vendor knobs are `INJECTION_SCANNER_<VENDOR>_<SUFFIX>`, built by
+# `vendor_env`: Lakera's are `INJECTION_SCANNER_LAKERA_MIN_INTERVAL_S` and so
+# on, Model Armor's `INJECTION_SCANNER_MODEL_ARMOR_MIN_INTERVAL_S`. Each vendor
+# is a separate account with its own limits, so each gets its own inputs and
+# its own state file; the algorithm is shared.
+ENV_MIN_INTERVAL_S = "MIN_INTERVAL_S"
+ENV_BURST = "BURST"
+ENV_BACKOFF_BASE_S = "BACKOFF_BASE_S"
+ENV_BACKOFF_MAX_S = "BACKOFF_MAX_S"
+ENV_LOCK_WAIT_S = "LOCK_WAIT_S"
+ENV_MAX_WAIT_S = "MAX_WAIT_S"
+
+# A vendor name becomes an env prefix (upper-cased) and a state-file name, so
+# it must be a plain lower-case identifier. Anything else would read no
+# operator setting at all, silently.
+_VENDOR_NAME = re.compile(r"[a-z][a-z0-9_]*\Z")
 
 # ---------- defaults + clamps ----------
 #
@@ -291,13 +307,26 @@ def cache_dir() -> Path:
         return Path(tempfile.gettempdir()) / f"injection-scanner-{os.getuid()}"
 
 
-def default_max_wait_s() -> float:
+def vendor_env(vendor: str, suffix: str) -> str:
+    """`INJECTION_SCANNER_<VENDOR>_<SUFFIX>` for one vendor's knob.
+
+    Raises ValueError for a name that is not a lower-case identifier; every
+    caller sits inside a fail-closed guard, and the registry names are fixed.
+    """
+    if not isinstance(vendor, str) or not _VENDOR_NAME.match(vendor):
+        raise ValueError("vendor name must be a lower-case identifier")
+    return f"INJECTION_SCANNER_{vendor.upper()}_{suffix}"
+
+
+def default_max_wait_s(vendor: str) -> float:
     """`acquire`'s wait budget when the caller does not name one.
 
     Default 0: an interactive scan refuses immediately rather than parking a
     report behind the fleet's budget. Batch callers (`eval`) pass their own.
     """
-    return env_float(ENV_MAX_WAIT_S, DEFAULT_MAX_WAIT_S, MAX_WAIT_RANGE)
+    return env_float(
+        vendor_env(vendor, ENV_MAX_WAIT_S), DEFAULT_MAX_WAIT_S, MAX_WAIT_RANGE
+    )
 
 
 @dataclass(frozen=True)
@@ -324,20 +353,28 @@ class LimiterConfig:
     """Bounded wait for the flock before `acquire` gives up with `ERROR`."""
 
     @classmethod
-    def from_env(cls) -> "LimiterConfig":
+    def from_env(cls, vendor: str) -> "LimiterConfig":
+        """One vendor's limits from `INJECTION_SCANNER_<VENDOR>_*`.
+
+        Every vendor starts from the same defaults (measured against Lakera's
+        published quota, see above) and is retuned through its own variables.
+        """
+        def env(suffix: str) -> str:
+            return vendor_env(vendor, suffix)
+
         return cls(
             min_interval_s=env_float(
-                ENV_MIN_INTERVAL_S, DEFAULT_MIN_INTERVAL_S, MIN_INTERVAL_RANGE
+                env(ENV_MIN_INTERVAL_S), DEFAULT_MIN_INTERVAL_S, MIN_INTERVAL_RANGE
             ),
-            burst=env_int(ENV_BURST, DEFAULT_BURST, BURST_RANGE),
+            burst=env_int(env(ENV_BURST), DEFAULT_BURST, BURST_RANGE),
             backoff_base_s=env_float(
-                ENV_BACKOFF_BASE_S, DEFAULT_BACKOFF_BASE_S, BACKOFF_BASE_RANGE
+                env(ENV_BACKOFF_BASE_S), DEFAULT_BACKOFF_BASE_S, BACKOFF_BASE_RANGE
             ),
             backoff_max_s=env_float(
-                ENV_BACKOFF_MAX_S, DEFAULT_BACKOFF_MAX_S, BACKOFF_MAX_RANGE
+                env(ENV_BACKOFF_MAX_S), DEFAULT_BACKOFF_MAX_S, BACKOFF_MAX_RANGE
             ),
             lock_wait_s=env_float(
-                ENV_LOCK_WAIT_S, DEFAULT_LOCK_WAIT_S, LOCK_WAIT_RANGE
+                env(ENV_LOCK_WAIT_S), DEFAULT_LOCK_WAIT_S, LOCK_WAIT_RANGE
             ),
         )
 
@@ -657,8 +694,9 @@ class CrossProcessLimiter:
         self._lock_path = self._state_dir / f"{name}-throttle.lock"
 
     @classmethod
-    def from_env(cls, name: str = "lakera") -> "CrossProcessLimiter":
-        return cls(cache_dir(), LimiterConfig.from_env(), name=name)
+    def from_env(cls, name: str) -> "CrossProcessLimiter":
+        """The limiter for vendor `name`: its own env inputs, its own file."""
+        return cls(cache_dir(), LimiterConfig.from_env(name), name=name)
 
     @property
     def state_path(self) -> Path:
@@ -680,9 +718,9 @@ class CrossProcessLimiter:
 
         Note what the `0.0` in the signature is and is not. It is this
         method's own default, NOT the value of
-        `INJECTION_SCANNER_LAKERA_MAX_WAIT_S`: nothing here reads that
+        `INJECTION_SCANNER_<VENDOR>_MAX_WAIT_S`: nothing here reads that
         variable, and it takes effect only where a caller threads
-        `default_max_wait_s()` through — which `lakera.check` does for callers
+        `default_max_wait_s(vendor)` through — which every adapter does for callers
         that name no budget of their own. Calling `acquire()` bare therefore
         ignores the operator's configured wait, deliberately, so that a
         caller which has not thought about waiting never blocks by accident.

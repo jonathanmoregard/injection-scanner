@@ -467,9 +467,9 @@ def check(text: str, *, max_wait_s: float | None = None) -> LakeraResult:
     # the same fail-closed reason.
     started_at = 0.0
     try:
-        limiter = CrossProcessLimiter.from_env()
+        limiter = CrossProcessLimiter.from_env("lakera")
         if max_wait_s is None:
-            max_wait_s = default_max_wait_s()
+            max_wait_s = default_max_wait_s("lakera")
         decision = limiter.acquire(max_wait_s)
         # The moment this call is ISSUED, off the same wall clock the limiter
         # writes into its state file. Read HERE, not when the response lands:

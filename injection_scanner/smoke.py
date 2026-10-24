@@ -184,7 +184,7 @@ def _liveness_lock_wait_s() -> float:
     rather than a new knob: the flock discipline is shared, so the bound on it
     should be too, and an operator who widens one has widened both.
     """
-    return throttle.LimiterConfig.from_env().lock_wait_s
+    return throttle.LimiterConfig.from_env("lakera").lock_wait_s
 
 
 def _cached_liveness_age(now: float) -> float | None:
