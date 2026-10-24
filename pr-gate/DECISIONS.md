@@ -103,8 +103,21 @@ it, each with the reason. Design: `docs/superpowers/specs/2026-10-24-pr-gate-des
    listed to the model as omitted. Binaries are fetched up to 25 MB.
 10. **Block on this head** = a review by `github-actions[bot]` whose body
     starts with a VERIFIED gate marker `verdict=block` whose (MAC'd) head is
-    this head (item 27), in any state (dismissed or COMMENT-fallback
+    this head AND whose (MAC'd) own-changes hash is the hash of what would
+    land now (item 27), in any state (dismissed or COMMENT-fallback
     included). An unverifiable block marker is not a block.
+    **The hash too, not only the head:** the override passes on the
+    always-on checks only, so it must apply to the change the model and
+    the owner saw. If the base moves between the block and the dismissal,
+    the same head merges into a different result (a criss-cross revert
+    can land exactly this way), which neither saw. A verified block of
+    this head with another own-changes hash is stale: it neither enables
+    an override nor stops a fresh review. A re-run (step 5) fails with
+    fixed text saying the base moved and to toggle auto-merge
+    (`STALE_BLOCK`); the owner's toggle reaches step 6, a fresh model
+    review of the current landed diff, and a pass then dismisses the
+    stale block like any earlier one. A base move elsewhere that leaves
+    the landed change's hash alone keeps the override.
 10a. **A COMMENT-fallback block says it cannot be dismissed.** GitHub
     cannot dismiss a COMMENT review (the dismissals endpoint answers 422),
     so "dismiss to override" would leave the owner stuck. No new override
@@ -215,6 +228,14 @@ it, each with the reason. Design: `docs/superpowers/specs/2026-10-24-pr-gate-des
     different tree; the README says to turn it off (a residual if left on).
     Dry-run takes a diff file and skips this step; the README shows how to
     produce the merge diff for it.
+    An up-to-date PR (the head already contains the base tip) is not
+    stuck: checked on live PR #25, GitHub still creates a test merge for
+    it, with parents `[baseRefOid, headRefOid]` and `mergeable` =
+    `MERGEABLE`, so the parents check passes.
+    What lands later is a separate matter: a pass on head H is a check on
+    H, and if the base moves after it GitHub would merge H into a base the
+    gate never saw. The ruleset's "require branches to be up to date
+    before merging" (README setup step 2) closes that; the gate assumes it.
     Paths follow git's format: the TAB git appends to a `---`/`+++` path
     containing a space is dropped, and C-style quoted paths
     (`"b/caf\303\251.txt"`) are unquoted. A path that starts with `"` but is

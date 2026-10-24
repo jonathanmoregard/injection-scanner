@@ -44,7 +44,11 @@ the base branch). In order, failing closed at every step:
    reopen with nothing changed). Then the pass carries over.
 4. **Override.** If the gate blocked this head commit, the model is not asked
    again: the run passes (always-on checks only) once `owner` has dismissed
-   that review while the PR sat at this commit; until then it fails.
+   that review while the PR sat at this commit; until then it fails. A block
+   counts only for the change it saw: if the base has since moved so that
+   what would land differs (another own-changes hash), the block is stale.
+   Dismissing it overrides nothing; a re-run fails saying so, and the
+   owner's next auto-merge toggle gets a fresh model review.
 5. **Re-runs never ask the model.** Any other re-run of the check fails with
    no model call. A fresh review takes an auto-merge toggle.
 6. **Deterministic checks** (any hit blocks):
@@ -132,8 +136,14 @@ the check says what failed.
    `name: ai-gate` and never add a job-level `if:` (a skipped required check
    counts as passing).
 2. Ruleset on the default branch: require a pull request; require status
-   check `ai-gate` with source **GitHub Actions**; block force pushes; **no
-   bypass actors**. If offered, restrict who can dismiss reviews to the owner
+   check `ai-gate` with source **GitHub Actions**; **require branches to be
+   up to date before merging**; block force pushes; **no bypass actors**.
+   The up-to-date rule is what stops a pass on head H from landing on a
+   base that moved after the check: the check result lives on H, and
+   without the rule GitHub would merge H into the newer base, a merge
+   nobody reviewed. With it, the PR must first take the new base ("Update
+   branch"), and that push only carries the pass over if the PR's own
+   changes are unchanged. If offered, restrict who can dismiss reviews to the owner
    **and GitHub Actions**: the gate dismisses its own superseded blocks when
    a later run passes. Without that they stay on the PR; never dismiss them
    by hand, since dismissing a gate review is the override (a dismissal by
@@ -175,8 +185,12 @@ Org repos need their own secret and ruleset.
   that commit can no longer be overridden: push a new commit, then
   re-enable auto-merge for a fresh review. Don't dismiss a
   block of an older commit to tidy up; a passing run dismisses those itself.
+  A dismissal also covers only the change the gate blocked: if the base
+  moved in between and changed what would land, it does not count, and the
+  check says to toggle auto-merge for a fresh review.
 - **Re-runs never call the model.** A re-run either applies your override or
-  fails with "a re-run never asks the model again". For a fresh review
+  fails with "a re-run never asks the model again" (or, for a block the
+  base has since outdated, a message saying so). For a fresh review
   (after an infra error, say), disable and re-enable auto-merge.
 - **Pushes:** any push while auto-merge is on fails the gate. Disable and
   re-enable auto-merge to request a fresh review. Exception: "Update branch"
@@ -278,6 +292,11 @@ their maximum suspicion.
   can land a different tree than the test merge in a criss-cross history.
   Disable "Allow rebase merging" in repos using the gate (Settings →
   General); if left on, that difference is a residual gap.
+- A pass is on the head commit, but what lands depends on the base too.
+  The gate relies on the ruleset's "require branches to be up to date"
+  (setup step 2) so that a pass is never merged onto a base that moved
+  after the check. Without that rule, a base move after a pass lands a
+  merge result nobody reviewed.
 - The fake-check defence rests on no agent credential having the `workflows`
   permission; a host PAT with that scope defeats it.
 - Any workflow in the repo can post reviews as `github-actions[bot]`, so the
