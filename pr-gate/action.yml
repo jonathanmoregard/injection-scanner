@@ -1,0 +1,66 @@
+name: pr-gate
+description: >
+  AI merge gate against sabotage by prompt-injected coding agents. Deterministic
+  checks plus hostile-author model reviews of the PR diff; blocks, never approves.
+  Use from a pull_request_target workflow; see caller-example.yml and README.md.
+
+inputs:
+  owner:
+    description: GitHub login whose auto-merge click requests the review and whose approval clears a block.
+    required: true
+  model:
+    description: Claude model for all three passes (sensitive repos use claude-fable-5-1).
+    required: false
+    default: claude-opus-5-5
+  effort:
+    description: Model effort (low, medium, high, xhigh, max).
+    required: false
+    default: high
+  suspicion-threshold:
+    description: Block when a monitor's suspicion (0-100) is at or above this.
+    required: false
+    default: "25"
+  exceptions:
+    description: >
+      Newline-separated path globs whose sensitive-path rule becomes extra scrutiny
+      instead of a block. Never covers .github/workflows/, .github/actions/, the
+      hidden-Unicode check or the lockfile-host check.
+    required: false
+    default: ""
+  anthropic-api-key:
+    description: Anthropic API key from a dedicated, spend-capped Console workspace.
+    required: true
+  github-token:
+    description: Token for reading the PR and posting the review.
+    required: false
+    default: ${{ github.token }}
+
+runs:
+  using: composite
+  steps:
+    # Hash-pinned, wheels only, no dependency resolution, no pip config or
+    # PIP_* variables: nothing unpinned is fetched. The gate's own code and
+    # injection_scanner come from this action's pinned checkout, not PyPI.
+    - name: install pinned dependencies
+      shell: bash
+      run: |
+        set -euo pipefail
+        python3 -m venv "$RUNNER_TEMP/pr-gate-venv"
+        "$RUNNER_TEMP/pr-gate-venv/bin/python" -m pip --isolated install \
+          --quiet --disable-pip-version-check --no-input \
+          --require-hashes --no-deps --only-binary=:all: \
+          -r "$GITHUB_ACTION_PATH/requirements.txt"
+
+    # Every input reaches Python through env, never interpolated into the
+    # script. The API key is scoped to this one step.
+    - name: ai-gate
+      shell: bash
+      env:
+        PR_GATE_OWNER: ${{ inputs.owner }}
+        PR_GATE_MODEL: ${{ inputs.model }}
+        PR_GATE_EFFORT: ${{ inputs.effort }}
+        PR_GATE_THRESHOLD: ${{ inputs.suspicion-threshold }}
+        PR_GATE_EXCEPTIONS: ${{ inputs.exceptions }}
+        PR_GATE_GITHUB_TOKEN: ${{ inputs.github-token }}
+        ANTHROPIC_API_KEY: ${{ inputs.anthropic-api-key }}
+      run: '"$RUNNER_TEMP/pr-gate-venv/bin/python" -I "$GITHUB_ACTION_PATH/gate.py"'

@@ -1,0 +1,40 @@
+# Copy to .github/workflows/ai-gate.yml in a consuming repo. Setup checklist:
+# injection-scanner pr-gate/README.md.
+#
+# Load-bearing details:
+# - pull_request_target: the workflow always comes from the base branch, never
+#   from the PR. There is no checkout step; the diff is fetched as data.
+# - The job must NOT get a job-level `if:` — GitHub counts a skipped required
+#   check as passing.
+# - The job's `name:` is the required status check: keep it `ai-gate`.
+# - Pin the action to a full commit SHA. Updating the gate is a PR bumping it.
+name: ai-gate
+
+on:
+  pull_request_target:
+    types: [auto_merge_enabled, synchronize, reopened]
+
+permissions:
+  contents: read
+  pull-requests: write
+
+# One run per PR at a time. Not cancel-in-progress: a review that is already
+# running finishes and records its pass, so a following "Update branch"
+# push can carry it over instead of failing.
+concurrency:
+  group: ai-gate-${{ github.event.pull_request.number }}
+  cancel-in-progress: false
+
+jobs:
+  ai-gate:
+    name: ai-gate
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: jonathanmoregard/injection-scanner/pr-gate@<FULL_SHA>
+        with:
+          owner: jonathanmoregard
+          model: claude-opus-5-5          # claude-fable-5-1 for sensitive repos
+          anthropic-api-key: ${{ secrets.AI_GATE_ANTHROPIC_KEY }}
+          # exceptions: |
+          #   .claude/**
