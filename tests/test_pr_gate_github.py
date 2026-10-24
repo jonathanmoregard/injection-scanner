@@ -43,11 +43,53 @@ def gh(*responses):
                   graphql_url="https://api.github.test/graphql", urlopen=opener), opener
 
 
+MERGE = "d" * 40
+
+
+def merge_commit(oid=MERGE, parents=(BASE, HEAD)):
+    return {"oid": oid, "parents": {"nodes": [{"oid": p} for p in parents]}}
+
+
 def pull(**kw):
     pr = {"headRefOid": HEAD, "baseRefName": "main", "baseRefOid": BASE,
-          "autoMergeRequest": {"enabledBy": {"login": "jonathan"}}}
+          "autoMergeRequest": {"enabledBy": {"login": "jonathan"}},
+          "mergeable": "MERGEABLE", "potentialMergeCommit": merge_commit()}
     pr.update(kw)
     return {"data": {"repository": {"pullRequest": pr}}}
+
+
+def test_pull_state_reads_the_test_merge_commit_and_its_parents():
+    # The same snapshot as head and base: the parents check compares them.
+    client, op = gh(pull())
+    s = client.pull_state(7)
+    assert (s.mergeable, s.merge_sha, s.merge_parents) == ("MERGEABLE", MERGE, (BASE, HEAD))
+    query = json.loads(op.requests[0].data)["query"]
+    assert "potentialMergeCommit" in query and "mergeable" in query
+
+
+def test_no_test_merge_commit_yet_reads_as_none():
+    client, _ = gh(pull(mergeable="UNKNOWN", potentialMergeCommit=None))
+    s = client.pull_state(7)
+    assert (s.mergeable, s.merge_sha, s.merge_parents) == ("UNKNOWN", None, ())
+
+
+@pytest.mark.parametrize("value", [None, "", "mergeable", "DIRTY", 1, True])
+def test_an_unrecognised_mergeable_value_reads_as_unknown(value):
+    client, _ = gh(pull(mergeable=value))
+    assert client.pull_state(7).mergeable == "UNKNOWN"
+
+
+@pytest.mark.parametrize("commit", [
+    merge_commit(oid="main"), merge_commit(oid=None), merge_commit(parents=("main", HEAD)),
+    merge_commit(parents=(BASE, None)), {"oid": MERGE}, {"oid": MERGE, "parents": None},
+    "x"])
+def test_a_malformed_test_merge_commit_fails_closed(commit):
+    # Its oid is fetched as content, and its parents decide whether it is
+    # the merge of this base and head.
+    client, _ = gh(pull(potentialMergeCommit=commit))
+    with pytest.raises(GitHubError) as e:
+        client.pull_state(7)
+    assert e.value.op == "pull-state"
 
 
 def test_pull_state_from_graphql():

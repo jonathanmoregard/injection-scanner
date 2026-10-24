@@ -26,6 +26,8 @@ query($owner: String!, $name: String!, $number: Int!) {
       baseRefName
       baseRefOid
       autoMergeRequest { enabledBy { login } }
+      mergeable
+      potentialMergeCommit { oid parents(first: 3) { nodes { oid } } }
     }
   }
 }
@@ -51,6 +53,11 @@ class PullState:
     enabled_by: str | None
     base_ref: str      # live base branch name, for the default-branch check
     base_oid: str      # live base commit; the diff is taken against this, never a name
+    # GitHub's test merge of head into base: what a merge or squash lands.
+    # It lags a push or a base move; the parents say which pair it merged.
+    mergeable: str = "UNKNOWN"         # MERGEABLE | CONFLICTING | UNKNOWN
+    merge_sha: str | None = None
+    merge_parents: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -77,6 +84,13 @@ class TimelineEvent:
 
 
 _REWRITES = ("head_ref_force_pushed", "head_ref_restored")
+_MERGEABLE = ("MERGEABLE", "CONFLICTING")
+
+
+def _oid(v) -> str:
+    if not (isinstance(v, str) and _SHA.match(v)):
+        raise TypeError
+    return v
 
 
 def _int(v) -> int:
@@ -140,21 +154,26 @@ class GitHub:
             pr = data["data"]["repository"]["pullRequest"]
             amr = pr["autoMergeRequest"]
             enabled_by = (amr.get("enabledBy") or {}).get("login") if amr else None
-            base_oid = pr["baseRefOid"]
-            if not (isinstance(base_oid, str) and _SHA.match(base_oid)):
-                raise TypeError
+            merge_sha, parents = None, ()
+            merge = pr["potentialMergeCommit"]   # null until GitHub has computed it
+            if merge is not None:
+                merge_sha = _oid(merge["oid"])
+                parents = tuple(_oid(p["oid"]) for p in merge["parents"]["nodes"])
+            mergeable = pr["mergeable"]
             return PullState(head_sha=pr["headRefOid"], auto_merge=amr is not None,
                              enabled_by=enabled_by, base_ref=str(pr["baseRefName"] or ""),
-                             base_oid=base_oid)
+                             base_oid=_oid(pr["baseRefOid"]),
+                             mergeable=mergeable if mergeable in _MERGEABLE else "UNKNOWN",
+                             merge_sha=merge_sha, merge_parents=parents)
         except (KeyError, TypeError, AttributeError):
             raise GitHubError("pull-state") from None
 
-    def diff(self, base_oid: str, head: str, limit: int) -> bytes:
-        """base_oid...head. Commit oids only: a branch name could resolve to
+    def diff(self, base_oid: str, ref: str, limit: int) -> bytes:
+        """base_oid...ref. Commit oids only: a branch name could resolve to
         a writer-pushed tag of the same name."""
-        if not (_SHA.match(base_oid or "") and _SHA.match(head or "")):
+        if not (_SHA.match(base_oid or "") and _SHA.match(ref or "")):
             raise GitHubError("diff")
-        url = f"{self._api}/compare/{base_oid}...{head}"
+        url = f"{self._api}/compare/{base_oid}...{ref}"
         try:
             return self._request("diff", "GET", url, accept="application/vnd.github.diff",
                                  limit=limit)
