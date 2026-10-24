@@ -301,6 +301,36 @@ def test_escaped_allowlisted_lockfile_urls_still_pass(path, line):
     assert checks.lockfile_hosts([fc(path, [line])]) == []
 
 
+@pytest.mark.parametrize("path,lines", [
+    # A backslash-newline continuation joins the next line onto the URL:
+    # the parser sees https://registry.npmjs.org.evil.example/p.tgz.
+    ("pnpm-lock.yaml", ['    resolution: {tarball: "https://registry.npmjs.org\\',
+                        '      .evil.example/p.tgz"}']),
+    # TOML allows whitespace after a line-ending backslash.
+    ("uv.lock", ['url = """https://files.pythonhosted.org\\  ', '.evil.example/x.whl"""']),
+    ("uv.lock", ['url = """https://files.pythonhosted.org\\\\\\', '.evil.example/x.whl"""']),
+    # pip joins any trailing backslash run, odd or even.
+    ("requirements.txt", ["--index-url https://pypi.org\\", ".evil.example/simple"]),
+    ("requirements.txt", ["--index-url https://pypi.org\\\\", ".evil.example/simple"]),
+])
+def test_a_lockfile_line_continuation_is_a_hit(path, lines):
+    hits = checks.lockfile_hosts([fc(path, lines)])
+    assert [(h.rule, h.overridable) for h in hits] == [("lockfile-host", False)]
+    assert "line 1" in hits[0].detail
+
+
+@pytest.mark.parametrize("path,line", [
+    # An escaped backslash at the end of a quoted line is not a continuation.
+    ("pnpm-lock.yaml", '    description: "ends in a backslash\\\\'),
+    ("uv.lock", 'path = """C:\\\\'),
+    # pip-compile's own continuation: whitespace before the backslash.
+    ("requirements.txt", "requests==2.32.3 \\"),
+    ("requirements.txt", "    --hash=sha256:0123abcd \\"),
+])
+def test_lockfile_lines_without_a_url_splitting_continuation_are_not_hits(path, line):
+    assert checks.lockfile_hosts([fc(path, [line])]) == []
+
+
 def test_non_lockfiles_are_not_host_checked():
     assert checks.lockfile_hosts([fc("README.md", ["https://evil.example/"])]) == []
 

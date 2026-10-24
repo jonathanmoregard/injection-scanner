@@ -168,7 +168,18 @@ it, each with the reason. Design: `docs/superpowers/specs/2026-10-24-pr-gate-des
     (`\/`, `\uXXXX`, `\UXXXXXXXX`, `\xXX`, the one-letter ones), because
     package managers decode them before resolving the URL. An escape the
     decoder does not know, on a line with a scheme-like token, is a hit
-    (fail closed).
+    (fail closed). Lines are checked one at a time, so a backslash-newline
+    continuation (YAML double-quoted, TOML multi-line strings, pip) could
+    split a URL across two lines (`"https://registry.npmjs.org\` +
+    `.evil.x/p.tgz"`). An added lockfile line ending in such a
+    continuation is therefore a hit on its own: an odd trailing backslash
+    run (trailing whitespace ignored; an even run is escaped backslashes).
+    In `requirements*.txt` pip joins on any trailing run, so parity does not
+    count there; instead a run preceded by whitespace is fine, which is how
+    pip-compile writes its `pkg==1.0 \` / `--hash=... \` lines and which
+    cannot glue a URL together. Joining lines before checking was the
+    alternative; a per-line rule is simpler and lockfiles have no
+    legitimate need for a URL-splitting continuation.
 23. **Binary magic** table covers common images, fonts, archives, PDF, and
     executables (ELF, PE, Mach-O, wasm, `#!` scripts); executables are
     labelled. Every binary blocks either way (design option (a)). A binary

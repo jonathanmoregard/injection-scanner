@@ -269,6 +269,23 @@ def _odd_userinfo(scheme: str, netloc: str) -> bool:
                 and netloc.startswith("git@"))
 
 
+def _continues(line: str, pip: bool) -> bool:
+    """The line ends in a backslash-newline continuation that can glue the
+    next line onto a URL ("https://registry.npmjs.org\\" + ".evil.x/p.tgz").
+
+    YAML/TOML: an odd trailing backslash run (an even one is escaped
+    backslashes); TOML allows whitespace after it. pip joins on ANY trailing
+    backslash run, so parity does not matter there, but pip-compile's own
+    "pkg==1.0 \\" puts whitespace before it, which cannot glue a URL.
+    """
+    body = line.rstrip()
+    n = len(body) - len(body.rstrip("\\"))
+    if not pip:
+        return n % 2 == 1
+    prev = body[:len(body) - n][-1:]
+    return n > 0 and prev != "" and not prev.isspace()
+
+
 def lockfile_hosts(files: list[FileChange]) -> list[Hit]:
     hits = []
     for f in files:
@@ -276,9 +293,12 @@ def lockfile_hosts(files: list[FileChange]) -> list[Hit]:
         if allowed is None:
             continue
         flake = PurePosixPath(f.path).name == "flake.lock"
+        pip = bool(_REQUIREMENTS.match(PurePosixPath(f.path).name.casefold()))
         for line_no, original in f.added:
             text, undecoded = _decode_escapes(original)
             bad = []
+            if _continues(original, pip):
+                bad.append("line continuation")
             if undecoded and _SCHEMEISH.search(text):
                 bad.append("undecodable escape near a URL")
             # Parse the way npm/Node (WHATWG URL) does: tab/newline are

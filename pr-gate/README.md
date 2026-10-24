@@ -41,7 +41,11 @@ the base branch). In order, failing closed at every step:
    - lockfile entries resolving to a host outside the per-ecosystem allowlist
      (npm/yarn registries, crates.io, PyPI, github.com and NixOS release hosts
      for flakes, rubygems). Any URL form a package manager accepts counts
-     (`https:evil.x`, `https:\\evil.x`, escaped slashes, IPv6 hosts).
+     (`https:evil.x`, `https:\\evil.x`, escaped slashes, IPv6 hosts). An
+     added lockfile line ending in a backslash continuation that could
+     glue the next line onto a URL is a hit too (an odd trailing backslash
+     run; in `requirements*.txt` any run not preceded by whitespace, since
+     pip joins them all).
      **Never overridable.**
    - a source/text file (`.js`, `.py`, `.lock`, `.md`, ...) that git treats
      as binary, e.g. because of a NUL byte, whatever its first bytes look
