@@ -69,7 +69,7 @@ def ready_env(monkeypatch, spies):
         monkeypatch.setenv(name, value)
     # The Model Armor adapter's own `ready()` arrives with its transport; until
     # then the panel treats it as not implemented (pinned below).
-    monkeypatch.setattr(modelarmor, "ready", lambda: None, raising=False)
+    monkeypatch.setattr(modelarmor, "ready", lambda: None)
     return spies
 
 

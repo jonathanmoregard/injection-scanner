@@ -1036,7 +1036,7 @@ def test_the_budget_is_shared_across_processes(tmp_path):
 # is that a wedged peer degrades to a bounded `TimeoutError` — and it hangs the
 # scan rather than failing it closed. `+inf` is the same shape by another route.
 #
-# `file_lock` is public and shared with `smoke.py`'s liveness cache, so the
+# `file_lock` is public and shared with the budget ledger, so the
 # guard belongs at the boundary rather than in each caller. Both callers today
 # pass an `env_float`-clamped value, which is why this was reachable only by a
 # new call site — the kind of footgun worth closing before it is stepped on.

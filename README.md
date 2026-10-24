@@ -86,13 +86,11 @@ Lakera Guard is called from one function, `lakera.check()`, by several independe
 
 | Caller | Lakera calls per event | What paces it |
 |---|---|---|
-| research-agent boot smoke (one MCP server per Claude Code pane) | 1 per spawn, 0 while a cached pass is fresh | liveness cache, then the shared limiter |
-| research-agent degraded recheck | same as a boot smoke — it calls `run_smoke()` too | same |
-| research-agent per-report scan | 1 per `research()` / `retry_research()` | the shared limiter; refuses immediately unless the caller passes a wait budget |
-| CI `smoke` job (`live-eval.yml`) | 1 per run — nightly, or on dispatch | runner-local limiter at 60 s / burst 2, inside the `lakera-live` concurrency group |
-| CI `eval` job (`live-eval.yml`) | 16, plus up to 2 re-scans per disagreeing case | same, plus `--l2-max-wait 1800` and `needs: smoke` |
-| per-push CI (`ci.yml`) | 0 | hermetic — no vendor call, no secret |
-| ad-hoc local `eval` runs | 16+ | the shared limiter, `--l2-max-wait` default 900 |
+| research-agent boot readiness (one MCP server per Claude Code pane) | 0 — no vendor call | nothing to pace |
+| research-agent degraded recheck | same as boot readiness — 0 | same |
+| research-agent per-report scan | 1 per vendor per `research()` / `retry_research()` | each vendor's shared limiter; refuses immediately unless the caller passes a wait budget |
+| CI (`ci.yml`) | 0 | hermetic — no vendor call, no secret |
+| local `eval` runs (by hand) | 16+ per vendor | each vendor's shared limiter, `--l2-max-wait` default 900 |
 
 `injection_scanner/throttle.py` is the shared memory they were missing: one token bucket plus one circuit breaker in a JSON file under the cache directory, every operation a read-modify-write under an exclusive `flock`. With N processes sharing the file, at most `burst + elapsed / min_interval_s` calls reach Lakera in any window of length `elapsed`, and zero while the breaker is open. **N does not appear in the bound**, so adding a pane or a CI runner cannot raise the ceiling.
 
@@ -106,11 +104,10 @@ Every limit is an input. There is no on/off switch: "off" is `MIN_INTERVAL_S=0` 
 | `INJECTION_SCANNER_LAKERA_BURST` | `10` | `[1, 1000]` | Bucket capacity: how many calls may go out back-to-back after an idle period. |
 | `INJECTION_SCANNER_LAKERA_BACKOFF_BASE_S` | `300` | `[0, 3600]` | Breaker delay after the first consecutive throttle that carried no usable `Retry-After`. Doubles per consecutive failure. |
 | `INJECTION_SCANNER_LAKERA_BACKOFF_MAX_S` | `3600` | `[0, 86400]` | Cap on **every** breaker delay, a server-supplied `Retry-After` included. |
-| `INJECTION_SCANNER_LAKERA_LOCK_WAIT_S` | `2` | `[0, 60]` | Bounded wait for the state-file lock before the call is refused. Also bounds the liveness cache's lock. |
+| `INJECTION_SCANNER_LAKERA_LOCK_WAIT_S` | `2` | `[0, 60]` | Bounded wait for the state-file lock before the call is refused. Also bounds the budget ledger's lock. |
 | `INJECTION_SCANNER_LAKERA_MAX_WAIT_S` | `0` | `[0, 86400]` | Default wait budget for `check()` when the caller passes none. `0` refuses immediately rather than parking a report. |
 | `INJECTION_SCANNER_LAKERA_MAX_RESPONSE_BYTES` | `1048576` | `[4096, 67108864]` | How much of a Guard response body is read. A larger one is an outage (`lakera_unavailable:ResponseTooLarge`), not an OOM: the timeout bounds how long a call takes, this bounds how much it can return. |
-| `INJECTION_SCANNER_SMOKE_LIVENESS_TTL_S` | `3600` | `[0, 86400]` | How long one passing boot-smoke liveness probe is trusted fleet-wide (see below). `0` disables the cache. |
-| `INJECTION_SCANNER_CACHE_DIR` | `~/.cache/injection-scanner` | — | State directory (`lakera-throttle.json` + `.lock`, `smoke-liveness.json` + `.lock`). Same directory the self-updater defaults to. |
+| `INJECTION_SCANNER_CACHE_DIR` | `~/.cache/injection-scanner` | — | State directory (`<vendor>-throttle.json` + `.lock` per vendor, and `model_armor-budget.json` + `.lock`). Same directory the self-updater defaults to. |
 
 **What the defaults rest on (measured 2026-09-06).** Lakera publishes exactly one limit: the Community plan's **10,000 requests per month** — 13.9 per hour, one every 4.3 minutes. That equals the trickle measured through the 2026-09-05 throttle (one success per 4–5 minutes fleet-wide, regardless of how many attempts were made), which is what identifies the monthly quota rather than some unpublished QPS ceiling as the thing the fleet was hitting. Overnight, 25 calls in 30 minutes were accepted before ~40 minutes of 429s, so Lakera's own bucket is roughly 25–50 deep with a slow refill. The defaults sit under that: 12 calls/hour sustained, a burst of 10 so one multi-pane session restore passes, and a breaker that waits minutes rather than seconds because recovery was observed to take tens of them. The plan tier is visible only on the Lakera dashboard; on a paid tier every knob loosens via environment, and the algorithm does not change.
 
@@ -120,7 +117,7 @@ Batch callers pass a wait budget instead of being refused: `scan(..., l2_max_wai
 
 **The cache directory is a shared, single-uid resource.** `INJECTION_SCANNER_CACHE_DIR` must name an ABSOLUTE path — `~` is shell syntax, and a relative path resolves per process, so every process would find its own full bucket and pace itself against nobody. A value that is not absolute after expansion falls back to the default, the same way an out-of-range number falls back to its clamp. If `HOME` cannot be resolved at all (a scratch container, `docker run --user 1234`, some CI runners), the fallback is `<tempdir>/injection-scanner-<uid>` — absolute and per-uid, not durable across reboots, which costs one reset bucket.
 
-The final directory component is checked with `lstat` before every use. It must be a real directory owned by the current uid; symlinks and foreign owners are refused. A same-owner directory is also refused when it grants group or world write unless it has the sticky bit. Sticky world-writable directories are allowed because other unprivileged users cannot rename or unlink entries they do not own; the directory owner or a privileged process still can. A refusal makes the limiter fail closed with `lakera_unavailable:limiter-error` and the liveness cache read as a miss. This covers both hostile pre-creation under a shared temp directory and ordinary `sudo -E` ownership accidents. **Sharing one cache directory between accounts is unsupported by design.**
+The final directory component is checked with `lstat` before every use. It must be a real directory owned by the current uid; symlinks and foreign owners are refused. A same-owner directory is also refused when it grants group or world write unless it has the sticky bit. Sticky world-writable directories are allowed because other unprivileged users cannot rename or unlink entries they do not own; the directory owner or a privileged process still can. A refusal makes the limiter fail closed with `lakera_unavailable:limiter-error`. This covers both hostile pre-creation under a shared temp directory and ordinary `sudo -E` ownership accidents. **Sharing one cache directory between accounts is unsupported by design.**
 
 ### Prompt size: one request per text, measured past 8k tokens
 

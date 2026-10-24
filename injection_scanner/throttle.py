@@ -145,7 +145,7 @@ _VENDOR_NAME = re.compile(r"[a-z][a-z0-9_]*\Z")
 # without being refused; and the breaker waits MINUTES rather than seconds
 # because recovery was observed to take tens of minutes, so a 30 s retry would
 # simply re-spend the budget on 429s. For scale: research-agent boot smokes
-# alone ran ~632 per day before the liveness cache in smoke.py (~19k/month,
+# alone ran ~632 per day before the boot smoke stopped probing (~19k/month,
 # about twice the entire quota) — spawn frequency, not scan volume, is what
 # exhausts this account.
 #
@@ -211,12 +211,11 @@ def env_float(name: str, default: float, bounds: tuple[float, float]) -> float:
     unchanged on CPython, and would then make every comparison in `acquire`
     false — a limiter that neither allows nor refuses.
 
-    PUBLIC because `smoke.py` parses `INJECTION_SCANNER_SMOKE_LIVENESS_TTL_S`
-    with it. That knob is not a limiter setting, but it wants exactly this
-    contract — "every limit is an input with a range", malformed to the
-    default, NaN refused — and one audited implementation of it beats two.
-    `env_int` is public for the same reason: `lakera.py` bounds its response
-    read with it.
+    PUBLIC because `vendor_http.py` parses non-limiter knobs (timeouts) with
+    it. They want exactly this contract — "every limit is an input with a
+    range", malformed to the default, NaN refused — and one audited
+    implementation of it beats two. `env_int` is public for the same reason:
+    `l2.py` and `lakera.py` bound their knobs with it.
     """
     raw = os.environ.get(name)
     value = default
@@ -501,12 +500,10 @@ def _require_own_directory(state_dir: Path) -> None:
     answer is to refuse, not to repair.
 
     Called from `file_lock`, so it guards EVERY user of the cache directory
-    rather than the limiter alone. `smoke.py`'s liveness cache needs it just as
-    much and for the same reason in the opposite direction: a planted
-    `{"ok": true}` there would let a foreign file suppress the fleet's vendor
-    probe. Both callers reach this inside a guard that renders a raise as their
-    own safe default — the limiter's `ERROR` -> `limiter-error` fail-closed
-    reject, the liveness cache's "miss, probe as before".
+    rather than the limiter alone: the budget ledger reaches it too. A planted
+    state file would let a foreign file steer the fleet's pacing. Each caller
+    reaches this inside a guard that renders a raise as its own safe default —
+    the limiter's `ERROR` -> `limiter-error` fail-closed reject.
 
     Ownership is necessary and NOT sufficient, which is the third shape:
 
@@ -576,11 +573,11 @@ def file_lock(lock_path: Path, wait_s: float, *, clock=time.time, sleep=time.sle
 
     `LOCK_NB` plus a retry, rather than a blocking `LOCK_EX`, because the wait
     has to be BOUNDED: a wedged peer must degrade to a caught `TimeoutError`
-    (which the limiter renders as a fail-closed reject, and the smoke liveness
-    cache renders as a miss) rather than hanging a scan or a boot forever.
+    (which the limiter renders as a fail-closed reject) rather than hanging a
+    scan forever.
 
-    Shared with `smoke.py`'s liveness cache, which keeps a different file in
-    the same directory under the same discipline.
+    Shared by the limiter and the monthly budget ledger, which keep different
+    files in the same directory under the same discipline.
     """
     lock_path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
     _require_own_directory(lock_path.parent)
@@ -599,7 +596,7 @@ def file_lock(lock_path: Path, wait_s: float, *, clock=time.time, sleep=time.sle
     # manager whose callers are written to expect `TimeoutError`.
     #
     # Sanitised HERE rather than in the callers because `file_lock` is public
-    # and shared: the limiter and `smoke.py`'s liveness cache both reach it,
+    # and shared: the limiter and the budget ledger both reach it,
     # both happen to pass an `env_float`-clamped value today, and the next
     # caller should not have to know that this arithmetic is load-bearing.
     try:
@@ -613,8 +610,7 @@ def file_lock(lock_path: Path, wait_s: float, *, clock=time.time, sleep=time.sle
     # fleet's flock on an inode of somebody else's choosing — and the file is
     # created if absent, so the plant does not even have to race a writer. The
     # link raises `ELOOP`, which is an ordinary `OSError` here: the limiter
-    # renders it `ERROR` -> `limiter-error`, the liveness cache renders it a
-    # miss. Paired with `_require_own_directory`, which is what keeps the link
+    # renders it `ERROR` -> `limiter-error`. Paired with `_require_own_directory`, which is what keeps the link
     # from being plantable, and with the same flag in `atomic_write_json`.
     fd = os.open(lock_path, os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600)
     try:
@@ -645,7 +641,7 @@ def atomic_write_json(path: Path, payload: dict) -> None:
     invisible here until it is added on purpose.
 
     There is deliberately NO fsync: what this package keeps in the cache
-    directory is a pacing hint (and a liveness hint) rebuilt on the next call,
+    directory is a pacing hint rebuilt on the next call,
     not a ledger, and paying a disk flush on every scan to protect it would be
     the wrong trade. The exposure is a power loss, after which the file may be
     torn or empty; every reader in this package treats that as unusable and
@@ -661,7 +657,7 @@ def atomic_write_json(path: Path, payload: dict) -> None:
     fail-closed default. `os.replace` needs no such flag: rename operates on
     the link itself and never on what it points at.
 
-    Shared with `smoke.py`'s liveness cache. Call it inside `file_lock`.
+    Shared by the limiter and the budget ledger. Call it inside `file_lock`.
     """
     tmp = path.parent / (path.name + ".tmp")
     fd = os.open(tmp, os.O_CREAT | os.O_WRONLY | os.O_TRUNC | os.O_NOFOLLOW, 0o600)
