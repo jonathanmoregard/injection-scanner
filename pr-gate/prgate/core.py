@@ -1,7 +1,9 @@
 """The gate's decision flow. Fails closed everywhere.
 
   1. auto-merge on, enabled by the owner, head not stale
-  2. the PR targets the default branch
+  2. the PR targets the default branch; GitHub's test merge of this exact
+     base and head exists (awaited briefly) and has no conflicts. Every
+     later step reads the change as base...merge, i.e. what would land
   3. push / reopen: carry over iff the newest verified gate marker is a pass
      of these exact own changes; else fail
   4. a verified gate block on this head: override (always-on checks only)
@@ -11,9 +13,10 @@
   6. full review: deterministic checks + model passes
 
 Three kinds of failure, deliberately different:
-  - procedural (steps 1-5, unreadable diff): the check fails with a message
-    and NO review is posted.
-  - infra (GitHub or model API errors): the check fails, no review. Not a
+  - procedural (steps 1-5, merge conflicts, unreadable diff): the check
+    fails with a message and NO review is posted.
+  - infra (GitHub or model API errors, a test merge GitHub has not
+    computed in time): the check fails, no review. Not a
     verdict on the PR; an owner auto-merge toggle retries. A model 4xx other
     than 408/409/429 (model name, key, prompt size), or a timeline 403/404
     (no `issues: read`), is reported as a config error instead: retrying
@@ -26,6 +29,7 @@ from __future__ import annotations
 
 import hashlib
 import re
+import time
 from dataclasses import dataclass, field
 from typing import Callable
 
@@ -44,6 +48,11 @@ _LOGIN = re.compile(r"^[A-Za-z0-9](?:[A-Za-z0-9-]{0,38})$")
 _SHA = re.compile(r"^[0-9a-f]{40}$")
 
 RETRY = "disable and re-enable auto-merge to retry"
+CONFLICTS = "the PR has merge conflicts; resolve them"
+# GitHub computes the test merge in the background after a push or a base
+# move: re-read with these pauses (30 s in all), then give up as infra.
+MERGE_WAITS = (2, 4, 8, 16)
+_sleep = time.sleep
 # The timeline answers 403/404 on every run without `issues: read`, and
 # the fix is a workflow change the gate blocks, whose override needs the
 # timeline: "toggle to retry" would loop.
@@ -106,27 +115,28 @@ class Gathered:
     lockfiles: dict[str, checks.Lockfile]
 
 
-def gather(gh, base_oid: str, ev: Event) -> Gathered:
-    """Fetch and parse the base_oid...head diff; hash the PR's own changes.
+def gather(gh, base_oid: str, ref: str) -> Gathered:
+    """Fetch and parse the base_oid...ref diff; hash the PR's own changes.
+    `ref` is the test merge commit, so file contents are what would land.
 
     Binary contents are fetched here because the hash needs them: the diff
     shows only "Binary files differ", which would let a binary change ride
     a carried-over pass. Parsed lockfiles (and line-checked ones renamed
-    from another kind) are fetched whole, head and live base, for the
-    always-on lockfile check that every path runs.
+    from another kind) are fetched whole, at `ref` and the live base, for
+    the always-on lockfile check that every path runs.
     """
-    diff_bytes = gh.diff(base_oid, ev.head_sha, DIFF_HARD_CAP)
+    diff_bytes = gh.diff(base_oid, ref, DIFF_HARD_CAP)
     return gather_from(diff_bytes,
-                       lambda path: gh.file_content(path, ev.head_sha, FILE_FETCH_CAP),
-                       lambda f: _lockfile(gh, f, base_oid, ev.head_sha))
+                       lambda path: gh.file_content(path, ref, FILE_FETCH_CAP),
+                       lambda f: _lockfile(gh, f, base_oid, ref))
 
 
-def _lockfile(gh, f: FileChange, base_oid: str, head: str) -> checks.Lockfile:
-    """Head and base contents; None where over the cap or (base) absent.
+def _lockfile(gh, f: FileChange, base_oid: str, ref: str) -> checks.Lockfile:
+    """Contents at `ref` and the base; None where over the cap or (base) absent.
     The base is the old path of a rename only if that was the same kind of
     lockfile: any other file was never checked as one."""
     try:
-        head_data = gh.file_content(f.path, head, FILE_FETCH_CAP)
+        head_data = gh.file_content(f.path, ref, FILE_FETCH_CAP)
     except TooLarge:
         head_data = None
     if checks.renamed_from_other_kind(f):
@@ -247,7 +257,7 @@ def _always_on(g: Gathered, cfg: Config) -> verdict.Result:
     return verdict.decide(hits, scrutiny, [], cfg.threshold)
 
 
-def _text_contents(gh, ev: Event, files: list[FileChange]) -> tuple[dict[str, str], list[str]]:
+def _text_contents(gh, ref: str, files: list[FileChange]) -> tuple[dict[str, str], list[str]]:
     contents: dict[str, str] = {}
     omitted: list[str] = []
     left = CONTENTS_BUDGET
@@ -255,7 +265,7 @@ def _text_contents(gh, ev: Event, files: list[FileChange]) -> tuple[dict[str, st
         if f.status == "deleted" or f.binary or f.gitlink or f.new_mode == "120000":
             continue
         try:
-            data = gh.file_content(f.path, ev.head_sha, left)
+            data = gh.file_content(f.path, ref, left)
         except TooLarge:
             omitted.append(f.path)
             continue
@@ -315,6 +325,42 @@ def run(ev: Event, cfg: Config, gh, review_fn: ReviewFn) -> Outcome:
         return Outcome(1, "could not parse the diff; human review needed")
 
 
+def _preflight(state, ev: Event, cfg: Config) -> Outcome | None:
+    # Step 1: owner intent and freshness.
+    if not state.auto_merge:
+        return Outcome(1, "enable auto-merge to request the AI gate")
+    if (state.enabled_by or "").casefold() != cfg.owner.casefold():
+        return Outcome(1, f"auto-merge must be enabled by {cfg.owner}")
+    if state.head_sha != ev.head_sha:
+        return Outcome(1, "stale: the PR head moved since this event")
+    # Step 2: a check result lives on the head SHA, so a pass for a PR into
+    # another branch would satisfy a later PR of the same head into main.
+    # The live base: a re-run replays the original event payload.
+    if not ev.default_branch or state.base_ref != ev.default_branch:
+        return Outcome(1, f"the AI gate only reviews PRs into {ev.default_branch}")
+    return None
+
+
+def _merge_ready(gh, ev: Event, cfg: Config):
+    """The live PR state once GitHub's test merge is the merge of exactly
+    this base and head, or the Outcome that ends the run. Steps 1-2 run on
+    every read, so a procedural failure never waits."""
+    for wait in (0, *MERGE_WAITS):
+        if wait:
+            _sleep(wait)
+        state = gh.pull_state(ev.number)
+        failed = _preflight(state, ev, cfg)
+        if failed:
+            return failed
+        if state.mergeable == "CONFLICTING":
+            return Outcome(1, CONFLICTS)
+        if (state.mergeable == "MERGEABLE" and state.merge_sha
+                and state.merge_parents == (state.base_oid, state.head_sha)):
+            return state
+    return Outcome(1, "infra: GitHub has not computed the PR's test merge of the current "
+                      f"base and head; {RETRY}")
+
+
 def _run(ev: Event, cfg: Config, gh, review_fn: ReviewFn) -> Outcome:
     if ev.action not in ACTIONS:
         return Outcome(1, "unsupported pull_request_target action; see the caller template")
@@ -324,23 +370,15 @@ def _run(ev: Event, cfg: Config, gh, review_fn: ReviewFn) -> Outcome:
         return Outcome(1, "config: anthropic-api-key is empty (it also signs the gate's "
                           "review markers)")
 
-    # Step 1: owner intent and freshness.
-    state = gh.pull_state(ev.number)
-    if not state.auto_merge:
-        return Outcome(1, "enable auto-merge to request the AI gate")
-    if (state.enabled_by or "").casefold() != cfg.owner.casefold():
-        return Outcome(1, f"auto-merge must be enabled by {cfg.owner}")
-    if state.head_sha != ev.head_sha:
-        return Outcome(1, "stale: the PR head moved since this event")
-
-    # Step 2: a check result lives on the head SHA, so a pass for a PR into
-    # another branch would satisfy a later PR of the same head into main.
-    # The live base: a re-run replays the original event payload.
-    if not ev.default_branch or state.base_ref != ev.default_branch:
-        return Outcome(1, f"the AI gate only reviews PRs into {ev.default_branch}")
-
+    state = _merge_ready(gh, ev, cfg)
+    if isinstance(state, Outcome):
+        return state
     reviews = gh.reviews(ev.number)
-    g = gather(gh, state.base_oid, ev)
+    # What lands is the merge, not base...head: in a criss-cross history the
+    # merge-base diff can hide a revert of an earlier PR. base_oid is a
+    # parent of the merge, so this three-dot diff is the merge's own diff.
+    # Content is read at the merge; identity (reviews, markers) is the head.
+    g = gather(gh, state.base_oid, state.merge_sha)
 
     # Step 3: a push or a close/reopen while auto-merge stays on is not an
     # owner click: no model roll, only a carry-over of identical own changes.
@@ -382,7 +420,8 @@ def _run(ev: Event, cfg: Config, gh, review_fn: ReviewFn) -> Outcome:
                           "fresh model review")
 
     # Step 6: full review.
-    result = full_review(g, cfg, review_fn, lambda: _text_contents(gh, ev, g.files))
+    result = full_review(g, cfg, review_fn,
+                         lambda: _text_contents(gh, state.merge_sha, g.files))
     if result.infra:
         failed = ", ".join(result.infra)
         if any(p.status == "infra" and is_config_error(p.reason) for p in result.passes):

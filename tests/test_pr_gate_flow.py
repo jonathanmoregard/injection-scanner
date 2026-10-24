@@ -4,8 +4,12 @@ from __future__ import annotations
 
 import _prgate  # noqa: F401
 
+import dataclasses
 import io
 import json
+import os
+import shutil
+import subprocess
 
 import pytest
 
@@ -19,6 +23,7 @@ HEAD = "1" * 40
 OLD = "2" * 40
 NEWER = "3" * 40
 BASE_OID = "b" * 40
+MERGE = "d" * 40      # GitHub's test merge of HEAD into BASE_OID
 KEY = b"sk-ant-gate-key"
 REPO = "jonathan/app"
 
@@ -51,14 +56,29 @@ def shifted(diff, delta=40):
     return diff.replace("@@ -10,3 +10,4 @@", f"@@ -{10 + delta},3 +{10 + delta},4 @@")
 
 
+def merge_state(state, mergeable="MERGEABLE", merge=MERGE, parents=None):
+    """`state` with GitHub's test merge filled in; parents default to the
+    merge of exactly this base and head."""
+    return dataclasses.replace(
+        state, mergeable=mergeable, merge_sha=merge if mergeable == "MERGEABLE" else None,
+        merge_parents=(parents if parents is not None else (state.base_oid, state.head_sha))
+        if mergeable == "MERGEABLE" else ())
+
+
 class FakeGitHub:
     def __init__(self, diff=DIFF, head=HEAD, enabled_by=OWNER, auto_merge=True,
                  reviews=(), files=None, dismissals=(), base_ref="main", base_oid=BASE_OID,
-                 timeline=None, base_files=None):
-        self.state = PullState(head_sha=head, auto_merge=auto_merge, enabled_by=enabled_by,
-                               base_ref=base_ref, base_oid=base_oid)
+                 timeline=None, base_files=None, diffs=None, states=None):
+        self.state = merge_state(PullState(head_sha=head, auto_merge=auto_merge,
+                                           enabled_by=enabled_by, base_ref=base_ref,
+                                           base_oid=base_oid))
+        # Successive pull_state reads; the last one repeats.
+        self.states = list(states) if states is not None else [self.state]
+        self.state_reads = 0
         self.compared: list[tuple[str, str]] = []
         self.diff_text = diff
+        self.diffs = diffs or {}             # (base, ref) -> diff text; else diff_text
+        self.content_refs: set[str] = set()  # refs of every non-base content fetch
         self._reviews = list(reviews)
         self.files = files or {}
         self.base_files = base_files or {}   # contents at base_oid; absent = 404
@@ -72,11 +92,13 @@ class FakeGitHub:
         self.timeline_reads = 0
 
     def pull_state(self, number):
+        self.state = self.states[min(self.state_reads, len(self.states) - 1)]
+        self.state_reads += 1
         return self.state
 
-    def diff(self, base, head, limit):
-        self.compared.append((base, head))
-        data = self.diff_text.encode()
+    def diff(self, base, ref, limit):
+        self.compared.append((base, ref))
+        data = self.diffs.get((base, ref), self.diff_text).encode()
         if len(data) > limit:
             raise TooLarge("diff")
         return data
@@ -92,6 +114,7 @@ class FakeGitHub:
                 raise TooLarge("contents")
             return data
         self.fetched.append(path)
+        self.content_refs.add(ref)
         data = self.files.get(path, b"x = 1\n")
         if len(data) > limit:
             raise TooLarge("contents")
@@ -155,7 +178,7 @@ def gate_review(verdict_, head, own_hash, state=None, rid=100, login=BOT):
 
 def own_hash_of(diff):
     gh = FakeGitHub(diff=diff)
-    return core.gather(gh, BASE_OID, event()).own_hash
+    return core.gather(gh, BASE_OID, MERGE).own_hash
 
 
 # ----- step 1: owner intent and freshness ---------------------------------------
@@ -682,7 +705,7 @@ def test_binary_content_change_breaks_carry_over():
     diff = DIFF + ("diff --git a/logo.png b/logo.png\nnew file mode 100644\n"
                    "Binary files /dev/null and b/logo.png differ\n")
     gh1 = FakeGitHub(diff=diff, files={"logo.png": b"\x89PNG\r\n\x1a\nAAAA"})
-    h1 = core.gather(gh1, BASE_OID, event()).own_hash
+    h1 = core.gather(gh1, BASE_OID, MERGE).own_hash
     passed = gate_review("pass", OLD, h1, rid=5)
     gh2 = FakeGitHub(diff=shifted(diff), reviews=[passed], files={"logo.png": b"\x89PNG\r\n\x1a\nBBBB"})
     out, _ = run(gh2, action="synchronize")
@@ -706,7 +729,165 @@ def test_the_diff_is_taken_against_the_live_base_commit_not_a_name():
     # resolve to it and make the reviewed diff attacker-chosen.
     gh = FakeGitHub()
     out, _ = run(gh)
-    assert out.exit_code == 0 and gh.compared == [(BASE_OID, HEAD)]
+    assert out.exit_code == 0 and gh.compared == [(BASE_OID, MERGE)]
+
+
+# ----- the merge result: review what a merge would land ------------------------------
+
+# A criss-cross history: the head merged an earlier, already-landed PR's tip
+# with `-s ours` (keeping the file it fixed at its old content), then added a
+# benign file. base...head (the merge-base diff) shows only the benign file;
+# the merge GitHub would land also reverts g.
+BENIGN = ("diff --git a/j b/j\nnew file mode 100644\nindex 0000000..3333333\n"
+          "--- /dev/null\n+++ b/j\n@@ -0,0 +1 @@\n+j\n")
+REVERT = ("diff --git a/g b/g\nindex 4444444..5555555 100644\n--- a/g\n+++ b/g\n"
+          "@@ -1 +1 @@\n-security-fix\n+safe\n") + BENIGN
+CRISS_CROSS = {(BASE_OID, HEAD): BENIGN, (BASE_OID, MERGE): REVERT}
+
+
+@pytest.fixture
+def slept(monkeypatch):
+    waits: list[float] = []
+    monkeypatch.setattr(core, "_sleep", waits.append)
+    return waits
+
+
+def test_the_gate_reviews_the_merge_result_not_the_merge_base_diff():
+    gh = FakeGitHub(diffs=CRISS_CROSS)
+    out, model = run(gh)
+    assert gh.compared == [(BASE_OID, MERGE)]
+    [call] = model.calls
+    assert "-security-fix\n+safe" in call["diff"]
+    assert set(call["contents"]) == {"g", "j"}
+
+
+def test_a_pass_of_the_merge_base_diff_does_not_carry_over_the_merge_result():
+    passed = gate_review("pass", OLD, own_hash_of(BENIGN), rid=5)
+    gh = FakeGitHub(diffs=CRISS_CROSS, reviews=[passed])
+    out, model = run(gh, action="synchronize")
+    assert out.exit_code == 1 and gh.posted == [] and model.calls == []
+
+
+def test_contents_are_read_at_the_merge_commit_and_the_review_goes_on_the_head():
+    diff = DIFF + ("diff --git a/logo.png b/logo.png\nnew file mode 100644\n"
+                   "Binary files /dev/null and b/logo.png differ\n") + LOCK_DIFF
+    gh = FakeGitHub(diff=diff, files={"logo.png": b"\x89PNG\r\n\x1a\nAAAA"})
+    out, _ = run(gh)
+    assert gh.content_refs == {MERGE}
+    [(_, head, body)] = gh.posted
+    assert head == HEAD and verdict.verify_marker(body, KEY, repo=REPO, number=7)[1] == HEAD
+
+
+def test_a_test_merge_of_another_base_or_head_is_awaited(slept):
+    s = FakeGitHub().state
+    gh = FakeGitHub(states=[merge_state(s, parents=(OLD, HEAD)),
+                            merge_state(s, mergeable="UNKNOWN"), s])
+    out, model = run(gh)
+    assert out.exit_code == 0 and len(model.calls) == 1
+    assert gh.state_reads == 3 and len(slept) == 2
+
+
+@pytest.mark.parametrize("parents", [(OLD, HEAD), (BASE_OID, OLD), (HEAD, BASE_OID),
+                                     (BASE_OID,), (BASE_OID, HEAD, OLD)])
+def test_a_test_merge_that_never_matches_this_base_and_head_fails_as_infra(slept, parents):
+    gh = FakeGitHub(states=[merge_state(FakeGitHub().state, parents=parents)])
+    out, model = run(gh)
+    assert out.exit_code == 1 and out.message.startswith("infra:") and core.RETRY in out.message
+    assert model.calls == [] and gh.posted == [] and gh.compared == []
+    assert gh.state_reads == len(slept) + 1 >= 3 and sum(slept) <= 60
+
+
+def test_a_test_merge_github_never_computes_fails_as_infra(slept):
+    gh = FakeGitHub(states=[merge_state(FakeGitHub().state, mergeable="UNKNOWN")])
+    out, model = run(gh)
+    assert out.exit_code == 1 and out.message.startswith("infra:")
+    assert model.calls == [] and gh.posted == [] and len(slept) >= 2
+
+
+@pytest.mark.parametrize("action", core.ACTIONS)
+def test_merge_conflicts_fail_without_a_review_or_model_call(slept, action):
+    passed = gate_review("pass", OLD, own_hash_of(DIFF), rid=5)
+    gh = FakeGitHub(states=[merge_state(FakeGitHub().state, mergeable="CONFLICTING")],
+                    reviews=[passed])
+    out, model = run(gh, action=action)
+    assert out.exit_code == 1 and out.message == "the PR has merge conflicts; resolve them"
+    assert model.calls == [] and gh.posted == [] and gh.compared == [] and slept == []
+
+
+def test_the_head_moving_while_the_test_merge_is_awaited_is_stale(slept):
+    s = FakeGitHub().state
+    moved = merge_state(dataclasses.replace(s, head_sha=NEWER))
+    gh = FakeGitHub(states=[merge_state(s, mergeable="UNKNOWN"), moved])
+    out, model = run(gh)
+    assert out.exit_code == 1 and "stale" in out.message and model.calls == []
+
+
+def test_a_procedural_failure_does_not_wait_for_the_test_merge(slept):
+    s = FakeGitHub(auto_merge=False, enabled_by=None).state
+    gh = FakeGitHub(states=[merge_state(s, mergeable="UNKNOWN")])
+    out, _ = run(gh)
+    assert "enable auto-merge" in out.message and slept == [] and gh.state_reads == 1
+
+
+def test_update_branch_keeps_the_own_changes_hash_of_the_merge_result(slept):
+    # Pass at OLD on base BASE_OID. "Update branch" makes NEWER = OLD + the
+    # moved base B2; the synchronize run first sees the old test merge, then
+    # GitHub's new one, which lands the same own changes on B2 (shifted hunks).
+    first = FakeGitHub(head=OLD, diffs={(BASE_OID, MERGE): DIFF})
+    out, _ = run(first, head=OLD)
+    assert out.exit_code == 0
+    passed = Review(id=5, login=BOT, state="COMMENTED", commit_id=OLD, body=first.posted[0][2])
+    b2, m2 = "e" * 40, "f" * 40
+    moved = PullState(head_sha=NEWER, auto_merge=True, enabled_by=OWNER, base_ref="main",
+                      base_oid=b2)
+    gh = FakeGitHub(states=[merge_state(moved, parents=(BASE_OID, OLD)),
+                            merge_state(moved, merge=m2)],
+                    diffs={(b2, m2): shifted(DIFF)}, reviews=[passed])
+    out, model = run(gh, action="synchronize", head=NEWER)
+    assert out.exit_code == 0 and model.calls == [] and "carried over" in gh.posted[0][2]
+    assert gh.compared == [(b2, m2)] and len(slept) == 1
+
+
+def _git(cwd, *args):
+    env = {"PATH": os.environ.get("PATH", ""), "HOME": str(cwd), "GIT_CONFIG_NOSYSTEM": "1",
+           "GIT_CONFIG_GLOBAL": os.devnull, "GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@t",
+           "GIT_COMMITTER_NAME": "t", "GIT_COMMITTER_EMAIL": "t@t"}
+    return subprocess.run(["git", *args], cwd=cwd, env=env, check=True,
+                          capture_output=True).stdout
+
+
+@pytest.mark.skipif(shutil.which("git") is None, reason="needs git")
+def test_with_real_git_only_the_merge_result_diff_shows_the_revert(tmp_path):
+    """The premise of CRISS_CROSS, built with git: the merge-base diff hides
+    the revert, the base...merge diff (what lands) shows it."""
+    def commit(msg, **files):
+        for name, text in files.items():
+            (tmp_path / name).write_text(text)
+        _git(tmp_path, "add", ".")
+        _git(tmp_path, "commit", "-qm", msg)
+        return _git(tmp_path, "rev-parse", "HEAD").decode().strip()
+
+    _git(tmp_path, "init", "-q", "-b", "main")
+    commit("root", g="safe\n", f="1\n")
+    _git(tmp_path, "switch", "-qc", "pr-a")
+    pr_a = commit("PR A", g="security-fix\n")
+    _git(tmp_path, "switch", "-q", "main")
+    main_old = commit("main work", f="2\n")
+    _git(tmp_path, "merge", "-q", "--no-ff", "-m", "merge A", pr_a)
+    base = commit("later", h="3\n")
+    _git(tmp_path, "switch", "-qc", "atk", main_old)
+    _git(tmp_path, "merge", "-q", "-s", "ours", "--no-ff", "-m", "ours", pr_a)
+    head = commit("benign", j="j\n")
+    _git(tmp_path, "switch", "-qc", "landed", base)
+    _git(tmp_path, "merge", "-q", "--no-ff", "-m", "land", head)
+    merge = _git(tmp_path, "rev-parse", "HEAD").decode().strip()
+
+    def paths(ref):
+        diff = _git(tmp_path, "diff", f"{base}...{ref}")
+        return sorted(f.path for f in core.gather_from(diff, lambda p: b"", lambda f: None).files)
+
+    assert paths(head) == ["j"]
+    assert paths(merge) == ["g", "j"]
 
 
 # ----- step 4: owner override by dismissing the gate's review ------------------------
