@@ -139,8 +139,11 @@ their maximum suspicion.
   workflow, i.e. the same `workflows` permission.
 - Lockfile hosts outside the allowlist (e.g. a private registry) cannot be
   cleared per repo; that needs a gate change.
-- Emoji with U+FE0F in source or docs trip the hidden-Unicode check and cannot
-  be approved through; drop the selector (the emoji still renders).
+- A single emoji presentation selector straight after an emoji (the usual
+  spelling of a warning-sign emoji) is allowed. Anything else with variation
+  selectors, zero-width joiners or other invisible characters (including
+  emoji ZWJ sequences such as family emoji) trips the hidden-Unicode check and
+  cannot be approved through; rewrite the text without it.
 - Things to verify on the first pilot are listed in the design doc ("Must be
   verified empirically"), notably whether the REQUEST_CHANGES review from
   `github-actions[bot]` is accepted on personal repos and whether
