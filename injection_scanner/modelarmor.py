@@ -20,6 +20,9 @@ Order, each step before anything that costs more:
      `before_send`), so a call the limiter refuses spends no budget;
   6. strict parse of the `pi_and_jailbreak` filter result.
 
+Steps 1-2 are `_preflight`, shared with `ready()` (boot readiness), so boot
+refuses on exactly what a scan would, without any network call.
+
 Invariant 4 ("the caught bytes never return"): `reason` carries only fixed
 labels, exception TYPE names and a bounded HTTP status — never the text, the
 credential, the token, or anything Model Armor said (`sanitizationMetadata`
@@ -355,6 +358,39 @@ _TOKENS = _TokenSource()
 # ---------- the check ----------
 
 
+@dataclass(frozen=True)
+class _Prepared:
+    credential: _Credential = field(repr=False)
+    url: str
+
+
+def _preflight() -> _Prepared | VendorResult:
+    """Everything `check` resolves before it costs anything: the credential
+    (`no-key` / `key-config-error`) and the endpoint (`url-config-error`).
+    Local only — no network, no limiter, no budget — so `ready` can run it
+    at boot and refuse on exactly what a scan would."""
+    try:
+        cred = _credential()
+    except KeyConfigError:
+        return _unavailable("key-config-error")
+    if cred is None:
+        return _unavailable("no-key")
+    ids = _endpoint()
+    if ids is None:
+        return _unavailable("url-config-error")
+    url = _url(*ids)
+    if not _is_trusted_endpoint(url, *ids):
+        return _unavailable("url-config-error")
+    return _Prepared(credential=cred, url=url)
+
+
+def ready() -> str | None:
+    """None if a call could be sent, else the closed reason `check` would
+    return before sending. Touches no network and spends no token."""
+    prepared = _preflight()
+    return prepared.reason if isinstance(prepared, VendorResult) else None
+
+
 def _charge(cost: int) -> VendorResult | None:
     """Spend `cost` from the fleet's monthly budget, after the limiter."""
     try:
@@ -403,19 +439,10 @@ def check(text: str, *, max_wait_s: float | None = None) -> VendorResult:
     `max_wait_s` is how long this call may wait for a fleet token; `None`
     means `INJECTION_SCANNER_MODEL_ARMOR_MAX_WAIT_S` (default 0).
     """
-    try:
-        cred = _credential()
-    except KeyConfigError:
-        return _unavailable("key-config-error")
-    if cred is None:
-        return _unavailable("no-key")
-
-    ids = _endpoint()
-    if ids is None:
-        return _unavailable("url-config-error")
-    url = _url(*ids)
-    if not _is_trusted_endpoint(url, *ids):
-        return _unavailable("url-config-error")
+    prepared = _preflight()
+    if isinstance(prepared, VendorResult):
+        return prepared
+    cred, url = prepared.credential, prepared.url
 
     if len(text) > max_chars():
         return _unavailable("too-large")

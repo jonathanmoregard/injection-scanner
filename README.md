@@ -70,7 +70,7 @@ Quota-class is exact membership in `<vendor>_unavailable:HTTPError:429` and `<ve
 | `INJECTION_SCANNER_MODEL_ARMOR_MAX_CHARS` | Default `240000`, clamp `[1000, 262144]`. Longer text is `too-large` and never sent. |
 | `INJECTION_SCANNER_MODEL_ARMOR_MONTHLY_TOKENS` | Default `1900000`, clamp `[0, 100000000]`. Fleet-wide monthly token budget; `0` refuses every call. |
 
-The endpoint is built from the three ids, never read from the environment: `https://modelarmor.<location>.rep.googleapis.com/v1/projects/<project>/locations/<location>/templates/<template>:sanitizeUserPrompt`, then checked against that exact destination before the token is attached.
+The endpoint is built from the three ids, never read from the environment: `https://modelarmor.<location>.rep.googleapis.com/v1/projects/<project>/locations/<location>/templates/<template>:sanitizeUserPrompt`, then checked against that exact destination before the token is attached. `modelarmor.ready()` runs the same credential and endpoint checks with no network call and returns the reason a scan would get (`no-key`, `key-config-error`, `url-config-error`), or `None`.
 
 **The template** should enable the prompt-injection and jailbreak filter only, at confidence `MEDIUM_AND_ABOVE`, with template logging off so report text is not written to Cloud Logging. Results of any other filter are ignored; the always-on CSAM filter is expected in the response and does not matter.
 

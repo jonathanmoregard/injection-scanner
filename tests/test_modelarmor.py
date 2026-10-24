@@ -803,3 +803,56 @@ def test_an_unusable_budget_ledger_is_a_limiter_error(google, monkeypatch, tmp_p
     assert result == _unavailable("limiter-error")
     assert not l2._is_quota("model_armor", result.reason)
     assert SANITIZE_URL not in google.urls()
+
+
+# ----- readiness (boot) -----
+
+
+def _no_network(monkeypatch):
+    def _post(*_a, **_kw):
+        pytest.fail("ready() must not touch the network")
+
+    monkeypatch.setattr(vendor_http, "_post", _post)
+
+
+def test_ready_is_none_for_a_complete_configuration_and_sends_nothing(
+    monkeypatch, tmp_path, rsa_key
+):
+    _configure(monkeypatch, tmp_path, rsa_key)
+    _no_network(monkeypatch)
+
+    assert modelarmor.ready() is None
+    assert not (tmp_path / "cache").exists(), "no limiter or budget state touched"
+
+
+@pytest.mark.parametrize(
+    "breakage,reason",
+    [
+        ("no-credential", "model_armor_unavailable:no-key"),
+        ("unreadable-file", "model_armor_unavailable:key-config-error"),
+        ("wrong-type", "model_armor_unavailable:key-config-error"),
+        ("no-project", "model_armor_unavailable:url-config-error"),
+        ("bad-location", "model_armor_unavailable:url-config-error"),
+    ],
+)
+def test_ready_refuses_on_exactly_what_a_scan_would(
+    monkeypatch, tmp_path, rsa_key, breakage, reason
+):
+    _configure(monkeypatch, tmp_path, rsa_key)
+    if breakage == "no-credential":
+        monkeypatch.delenv("MODEL_ARMOR_CREDENTIALS_FILE")
+    elif breakage == "unreadable-file":
+        monkeypatch.setenv("MODEL_ARMOR_CREDENTIALS_FILE", str(tmp_path / "missing"))
+    elif breakage == "wrong-type":
+        _configure(
+            monkeypatch, tmp_path, rsa_key,
+            cred=_credential(rsa_key, type="authorized_user"),
+        )
+    elif breakage == "no-project":
+        monkeypatch.delenv("MODEL_ARMOR_PROJECT")
+    elif breakage == "bad-location":
+        monkeypatch.setenv("MODEL_ARMOR_LOCATION", "eu.attacker.invalid")
+    _no_network(monkeypatch)
+
+    assert modelarmor.ready() == reason
+    assert modelarmor.check("text").reason == reason
