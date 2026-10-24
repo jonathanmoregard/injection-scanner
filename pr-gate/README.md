@@ -178,6 +178,13 @@ their maximum suspicion.
   get past a strong monitor roughly 40% of the time. This is a tripwire that
   forces a human look, not a guarantee.
 - Binary files are blocked, not scanned (malware scanning is a follow-up).
+- Carry-over compares the PR's own changes without line offsets, so base
+  merges keep a pass. The price: a push that moves an added line to
+  another spot with the same three context lines above and below (repeated
+  boilerplate) counts as identical and carries the pass over unreviewed.
+  Accepted for v1 because offsets would break carry-over on every base
+  merge; the follow-up is to hash each touched region with wider context
+  (see DECISIONS item 1).
 - A PR whose diff is too large for GitHub to serve (GitHub answers 406 above
   roughly 300 files or 20 000 lines) or over 5 MB cannot pass the gate: the
   check fails with "the diff is too large for the gate to read; split the PR",

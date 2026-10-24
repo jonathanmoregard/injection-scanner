@@ -14,6 +14,16 @@ it, each with the reason. Design: `docs/superpowers/specs/2026-10-24-pr-gate-des
    dropped. A base merge still carries over unless the base changed lines
    within three lines of the PR's own changes; then the owner re-clicks
    (fail-safe direction).
+   **Accepted v1 residual:** with the offsets dropped, a hunk moved to
+   another spot whose three context lines above and below are identical
+   (repeated boilerplate, say two `except ...: return True` blocks) hashes
+   the same, so a push that moves an added line there carries the earlier
+   pass over unreviewed. Accepted because putting offsets back would break
+   carry-over on every base merge that adds lines above the change, and
+   base-merge carry-over is an owner directive; the move also needs
+   byte-identical surroundings. Follow-up idea: hash each touched region
+   with wider context (e.g. the enclosing function, or N lines until the
+   context is unique in the file) instead of the fixed three lines.
 2. **Binary content is in the hash** (SHA-256 of the head blob, fetched
    anyway for the magic-byte check). The diff shows only "Binary files
    differ", so without it a swapped binary would ride a carried-over pass.
