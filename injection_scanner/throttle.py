@@ -2,7 +2,9 @@
 
 One limiter per vendor (`CrossProcessLimiter.from_env(<vendor>)`), each with
 its own `INJECTION_SCANNER_<VENDOR>_*` inputs and its own state file. The
-history below is Lakera's, which is why the module exists.
+history below is Lakera's, which is why the module exists. `MonthlyBudget`,
+at the end, is the other shared ledger: a monthly allowance for a vendor that
+bills past its free tier instead of refusing.
 
 Lakera Guard is called from ONE function — `injection_scanner.lakera.check()`
 — by several independent processes that share a single Lakera account: a
@@ -93,7 +95,7 @@ import stat
 import tempfile
 import time
 from dataclasses import dataclass
-from datetime import timezone
+from datetime import UTC, datetime, timezone
 from email.utils import parsedate_to_datetime
 from pathlib import Path
 
@@ -1040,3 +1042,107 @@ class CrossProcessLimiter:
                 "tripped_at": st.tripped_at,
             },
         )
+
+
+# ---------- monthly spend budget ----------
+
+# Bumped only when the ledger's on-disk shape changes.
+_BUDGET_SCHEMA = 1
+_MONTH = re.compile(r"[0-9]{4}-[0-9]{2}\Z")
+
+
+def _utc_month(now: float) -> str:
+    return datetime.fromtimestamp(now, UTC).strftime("%Y-%m")
+
+
+class MonthlyBudget:
+    """A fleet-wide allowance per UTC calendar month, shared through one file.
+
+    For a vendor whose free tier is a monthly allowance with no server-side
+    cap: past the allowance the vendor bills rather than refuses, so the only
+    thing that can stop the spend is this ledger. `charge(amount)` is called
+    BEFORE each request with the vendor's own size estimate.
+
+    `state_dir` holds `<name>-budget.json` and `<name>-budget.lock`, under the
+    same `file_lock` discipline as the limiter (fresh fd per operation,
+    bounded wait, `0700` directory refused unless owned and not group/world
+    writable, `O_NOFOLLOW` opens). The lock serialises threads and processes
+    alike, so concurrent chargers can never overspend.
+
+    The ledger is `{"schema", "month": "YYYY-MM", "used"}`. A missing file is
+    an empty month. A charge in a LATER month than the stored one starts that
+    month at zero; a clock that stepped back into an earlier month keeps the
+    stored count, so a step can delay calls but never mint a budget.
+
+    Unlike the limiter's pacing state, an unreadable, torn or foreign ledger
+    is an ERROR, not a reset: resetting would re-mint a month of billable
+    calls. The operator deletes `<name>-budget.json` to start the month over.
+    """
+
+    def __init__(
+        self,
+        state_dir: Path | str,
+        name: str,
+        limit: int,
+        *,
+        clock=time.time,
+        lock_wait_s: float = DEFAULT_LOCK_WAIT_S,
+    ) -> None:
+        self._state_dir = Path(state_dir)
+        self._name = name
+        self._limit = limit
+        self._clock = clock
+        self._lock_wait_s = lock_wait_s
+        self._state_path = self._state_dir / f"{name}-budget.json"
+        self._lock_path = self._state_dir / f"{name}-budget.lock"
+
+    @property
+    def state_path(self) -> Path:
+        return self._state_path
+
+    def charge(self, amount: int) -> Decision:
+        """Spend `amount` if it fits in this month's remainder. Never raises.
+
+        All-or-nothing: `ALLOWED` (spent), `THROTTLED` (would exceed the
+        limit; nothing spent) or `ERROR` (the ledger is unusable, or `amount`
+        is not a non-negative integer).
+        """
+        try:
+            if not isinstance(self._name, str) or not _VENDOR_NAME.match(self._name):
+                raise ValueError("budget name must be a lower-case identifier")
+            if type(amount) is not int or amount < 0:
+                raise ValueError("amount must be a non-negative integer")
+            with file_lock(self._lock_path, self._lock_wait_s, clock=self._clock):
+                month = _utc_month(self._clock())
+                stored_month, used = self._load(month)
+                if month > stored_month:
+                    stored_month, used = month, 0
+                if used + amount > self._limit:
+                    return Decision.THROTTLED
+                atomic_write_json(
+                    self._state_path,
+                    {
+                        "schema": _BUDGET_SCHEMA,
+                        "month": stored_month,
+                        "used": used + amount,
+                    },
+                )
+                return Decision.ALLOWED
+        except Exception:  # noqa: BLE001 — fails CLOSED; see the docstring
+            return Decision.ERROR
+
+    def _load(self, month: str) -> tuple[str, int]:
+        try:
+            raw = self._state_path.read_text(encoding="utf-8")
+        except FileNotFoundError:
+            return month, 0
+        obj = json.loads(raw)
+        if not isinstance(obj, dict) or obj.get("schema") != _BUDGET_SCHEMA:
+            raise ValueError("foreign budget ledger")
+        stored_month = obj["month"]
+        used = obj["used"]
+        if not isinstance(stored_month, str) or not _MONTH.match(stored_month):
+            raise ValueError("malformed budget month")
+        if type(used) is not int or used < 0:
+            raise ValueError("malformed budget count")
+        return stored_month, used
