@@ -142,11 +142,15 @@ it, each with the reason. Design: `docs/superpowers/specs/2026-10-24-pr-gate-des
     old markers: re-click auto-merge. Dry-run renders `mac=unsigned`, which
     never parses. v1 markers (unsigned) are ignored. A workflow with a write
     token can still copy or edit the gate's own review bodies (same bot
-    identity). Defused by two rules: carry-over is refused if ANY verified
-    block of the same own-changes hash exists (replayed old pass), and any
-    `github-actions[bot]` REQUEST_CHANGES on the head arms the reroll guard
-    regardless of body (a body edit can strip a marker, not the state). A
-    forged REQUEST_CHANGES therefore only costs the owner an approval.
+    identity). Defused by three rules: (a) a pass of changes that were ever
+    blocked carries over only if the owner approved that pass's head (the
+    legitimate block -> approve -> override sequence; a replayed pass has
+    no such approval); (b) a bot REQUEST_CHANGES on the head without a valid
+    marker (forged, or a real block whose body was edited) fails the run
+    until the owner dismisses it, and then the model runs — owner approval
+    never clears an unverified block; (c) the reroll guard arms on any
+    verified block of the same own-changes hash, not just the same head, so
+    an amend/rebase can't buy a fresh model roll.
 
 ## Packaging
 

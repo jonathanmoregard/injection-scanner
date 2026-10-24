@@ -228,6 +228,15 @@ def _host(netloc: str) -> str:
     return host.lower().rstrip(".")
 
 
+def _odd_userinfo(scheme: str, netloc: str) -> bool:
+    """Userinfo in a URL authority is a host-confusion vector; the only kind
+    lockfiles legitimately carry is ssh's "git@"."""
+    if "@" not in netloc:
+        return False
+    return not (scheme.lower() in ("ssh", "git+ssh") and netloc.count("@") == 1
+                and netloc.startswith("git@"))
+
+
 def lockfile_hosts(files: list[FileChange]) -> list[Hit]:
     hits = []
     for f in files:
@@ -240,9 +249,13 @@ def lockfile_hosts(files: list[FileChange]) -> list[Hit]:
             bad = []
             if undecoded and _SCHEMEISH.search(text):
                 bad.append("undecodable escape near a URL")
+            # Parse the way npm/Node (WHATWG URL) does: tab/newline are
+            # stripped anywhere and a backslash is a path separator, so
+            # "https://evil\@registry.npmjs.org" goes to evil.
+            text = re.sub(r"[\t\n\r]", "", text).replace("\\", "/")
             for scheme, netloc in _URL.findall(text):
                 host = _host(netloc)
-                if scheme.lower() not in _OK_SCHEMES or host not in allowed:
+                if scheme.lower() not in _OK_SCHEMES or host not in allowed or _odd_userinfo(scheme, netloc):
                     bad.append(f"{scheme.lower()}://{host}")
             if flake:
                 for kind in _FLAKE_TYPE.findall(text):

@@ -205,10 +205,25 @@ def test_escaped_lockfile_urls_are_decoded_before_the_host_check(path, line):
     assert (hit.rule, hit.overridable) == ("lockfile-host", False)
 
 
+@pytest.mark.parametrize("line", [
+    # WHATWG (npm/Node): a backslash is a path separator -> host evil.example.
+    r'"resolved": "https://evil.example\\@registry.npmjs.org/x.tgz",',
+    # WHATWG strips tab/newline anywhere -> host registry.npmjs.org.evil.example.
+    r'"resolved": "https://registry.npmjs.org\t.evil.example/x.tgz",',
+    # Any userinfo in the authority is a confusion vector.
+    '"resolved": "https://registry.npmjs.org@evil.example/x.tgz",',
+    '"resolved": "https://user@registry.npmjs.org/x.tgz",',
+])
+def test_lockfile_urls_are_parsed_like_npm_parses_them(line):
+    [hit] = checks.lockfile_hosts([fc("package-lock.json", [line])])
+    assert (hit.rule, hit.overridable) == ("lockfile-host", False)
+
+
 @pytest.mark.parametrize("path,line", [
     ("package-lock.json", r'"resolved": "https:\/\/registry.npmjs.org\/a\/-\/a-1.0.0.tgz",'),
     ("uv.lock", r'url = "https:\u002f\u002ffiles.pythonhosted.org/x.whl"'),
     ("package-lock.json", r'"description": "a \"quoted\" word\\path",'),
+    ("Cargo.lock", 'source = "git+ssh://git@github.com/org/dep.git#0123abcd"'),
 ])
 def test_escaped_allowlisted_lockfile_urls_still_pass(path, line):
     assert checks.lockfile_hosts([fc(path, [line])]) == []

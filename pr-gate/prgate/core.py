@@ -130,16 +130,22 @@ def _gate_reviews(reviews: list[Review], ev: Event, key: bytes):
                 yield r, m
 
 
-def _blocked_before(reviews: list[Review], ev: Event, key: bytes) -> bool:
-    """A verified gate block on this head, or ANY github-actions[bot]
-    REQUEST_CHANGES on it. The second clause matters because the same bot
-    identity can edit a review body (stripping the marker) but not its state;
-    a forged one only costs the owner an approval."""
-    if any(r.login == GATE_LOGIN and r.state == "CHANGES_REQUESTED"
-           and r.commit_id == ev.head_sha for r in reviews):
-        return True
-    return any(m[0] == "block" and (m[1] == ev.head_sha or r.commit_id == ev.head_sha)
+def _verified_block(reviews: list[Review], ev: Event, key: bytes, own_hash: str) -> bool:
+    """The gate itself blocked this head, or these exact own changes at any
+    head (an amend/rebase must not buy a fresh model roll)."""
+    return any(m[0] == "block" and (m[1] == ev.head_sha or r.commit_id == ev.head_sha
+                                    or m[2] == own_hash)
                for r, m in _gate_reviews(reviews, ev, key))
+
+
+def _unverified_bot_block(reviews: list[Review], ev: Event, key: bytes) -> bool:
+    """A github-actions[bot] REQUEST_CHANGES on this head without a valid
+    marker: either another workflow's forgery or a real gate block whose body
+    was edited (a body can be edited, the state can't). Neither may be cleared
+    by an owner approval that skips the model, so it must be dismissed."""
+    verified = {r.id for r, _ in _gate_reviews(reviews, ev, key)}
+    return any(r.login == GATE_LOGIN and r.state == "CHANGES_REQUESTED"
+               and r.commit_id == ev.head_sha and r.id not in verified for r in reviews)
 
 
 def _owner_approved(reviews: list[Review], owner: str, head: str) -> bool:
@@ -149,16 +155,19 @@ def _owner_approved(reviews: list[Review], owner: str, head: str) -> bool:
     return bool(states) and states[-1] == "APPROVED"
 
 
-def _carries_over(reviews: list[Review], ev: Event, key: bytes, own_hash: str) -> bool:
+def _carries_over(reviews: list[Review], ev: Event, cfg: Config, own_hash: str) -> bool:
     """The NEWEST gate marker (pass or block) is a pass of these exact own
     changes. An older pass never outlives a later block."""
-    markers = [m for _, m in _gate_reviews(reviews, ev, key)]
+    markers = [m for _, m in _gate_reviews(reviews, ev, cfg.marker_key)]
     if not markers or markers[-1][0] != "pass" or markers[-1][2] != own_hash:
         return False
-    # A real pass can be re-posted (replayed) by another workflow running as
-    # the same bot after a later block; so any block of these changes, at
-    # any position, rules carry-over out.
-    return not any(m[0] == "block" and m[2] == own_hash for m in markers)
+    if not any(m[0] == "block" and m[2] == own_hash for m in markers):
+        return True
+    # These changes were blocked at some point. A real pass can be re-posted
+    # (replayed) after that block by another workflow running as the same
+    # bot, so the pass only carries over if the owner approved its head —
+    # which is exactly the legitimate block -> approve -> override sequence.
+    return _owner_approved(reviews, cfg.owner, markers[-1][1])
 
 
 def _text_contents(gh, ev: Event, files: list[FileChange]) -> tuple[dict[str, str], list[str]]:
@@ -239,7 +248,7 @@ def _run(ev: Event, cfg: Config, gh, review_fn: ReviewFn) -> Outcome:
     # A push or a close/reopen while auto-merge stays on is not an owner
     # click: no model roll, only a carry-over of identical own changes.
     if ev.action in ("synchronize", "reopened"):
-        if not _carries_over(reviews, ev, cfg.marker_key, g.own_hash):
+        if not _carries_over(reviews, ev, cfg, g.own_hash):
             return Outcome(1, "the PR was pushed to or reopened after auto-merge was "
                               "enabled; disable and re-enable auto-merge to re-request review")
         hits, scrutiny = checks.run_all(g.files, g.binaries, cfg.exceptions, always_on_only=True)
@@ -247,13 +256,17 @@ def _run(ev: Event, cfg: Config, gh, review_fn: ReviewFn) -> Outcome:
         return _report(gh, ev, cfg, result, g.own_hash, "carry-over", reviews)
 
     # Step 2: reroll guard / owner override.
-    if _blocked_before(reviews, ev, cfg.marker_key):
+    if _verified_block(reviews, ev, cfg.marker_key, g.own_hash):
         if not _owner_approved(reviews, cfg.owner, ev.head_sha):
-            return Outcome(1, f"the gate already blocked {ev.head_sha}; {cfg.owner} must "
-                              "approve that commit, then re-run this check")
+            return Outcome(1, f"the gate already blocked these changes; {cfg.owner} must "
+                              f"approve {ev.head_sha}, then re-run this check")
         hits, scrutiny = checks.run_all(g.files, g.binaries, cfg.exceptions, always_on_only=True)
         result = verdict.decide(hits, scrutiny, [], cfg.threshold)
         return _report(gh, ev, cfg, result, g.own_hash, "owner-override", reviews)
+
+    if _unverified_bot_block(reviews, ev, cfg.marker_key):
+        return Outcome(1, "a github-actions[bot] review without a valid gate marker requests "
+                          "changes on this commit; dismiss it, then re-run this check")
 
     # Steps 3-7: full review.
     result = full_review(g, cfg, review_fn, lambda: _text_contents(gh, ev, g.files))

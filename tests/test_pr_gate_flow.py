@@ -372,8 +372,44 @@ def test_a_bot_request_changes_with_its_marker_edited_away_still_guards_rerolls(
                     body="looks fine now")
     gh = FakeGitHub(reviews=[edited])
     out, model = run(gh)
-    assert out.exit_code == 1 and "must approve" in out.message
+    assert out.exit_code == 1 and "dismiss it" in out.message
     assert model.calls == [] and gh.posted == []
+
+
+def test_owner_approval_cannot_clear_an_unverified_bot_block_without_a_model_review():
+    # A forged REQUEST_CHANGES plus one owner click must never merge code no
+    # model saw: only a VERIFIED gate block can be overridden by approval.
+    forged_cr = Review(id=6, login=BOT, state="CHANGES_REQUESTED", commit_id=HEAD, body="x")
+    gh = FakeGitHub(reviews=[forged_cr, owner_review("APPROVED", HEAD)])
+    out, model = run(gh)
+    assert out.exit_code == 1 and "dismiss it" in out.message
+    assert model.calls == [] and gh.posted == []
+
+
+def test_a_dismissed_unverified_bot_block_gets_a_full_model_review():
+    dismissed = Review(id=6, login=BOT, state="DISMISSED", commit_id=HEAD, body="x")
+    gh = FakeGitHub(reviews=[dismissed, owner_review("APPROVED", HEAD)])
+    out, model = run(gh)
+    assert len(model.calls) == 1 and out.exit_code == 0
+
+
+def test_a_block_of_the_same_changes_at_an_older_head_still_guards_rerolls():
+    # Amend/rebase to a new SHA with identical own changes is not a new review.
+    gh = FakeGitHub(reviews=[gate_review("block", OLD, own_hash_of(DIFF), rid=6)])
+    out, model = run(gh)
+    assert out.exit_code == 1 and "must" in out.message and "approve" in out.message
+    assert model.calls == [] and gh.posted == []
+
+
+def test_after_an_owner_override_a_base_update_carries_over():
+    # block X -> owner approves -> override pass X; then "Update branch".
+    h = own_hash_of(DIFF)
+    reviews = [gate_review("block", OLD, h, rid=5), owner_review("APPROVED", OLD, rid=6),
+               gate_review("pass", OLD, h, rid=7)]
+    gh = FakeGitHub(diff=shifted(DIFF), reviews=reviews)
+    out, model = run(gh, action="synchronize")
+    assert out.exit_code == 0 and model.calls == []
+    assert "carried over" in gh.posted[0][2]
 
 
 def test_reopened_without_a_pass_fails_without_a_model_call():

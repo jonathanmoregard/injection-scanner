@@ -152,11 +152,13 @@ their maximum suspicion.
   no marker. Another workflow with a write token (e.g. CI that builds PR
   code) therefore cannot mint a pass or a block. It can still copy or edit
   the gate's own review bodies (same bot identity), which the gate defuses:
-  any block of the same changes rules out carry-over (so a re-posted old
-  pass does nothing), and any `github-actions[bot]` REQUEST_CHANGES on the
-  head arms the reroll guard whatever its body says (state can't be edited).
-  The worst such a workflow can do is force an owner approval. Still, keep
-  `pull-requests: write` away from workflows that run PR code.
+  a re-posted old pass of changes that were later blocked only carries over
+  if the owner approved that pass's head; and a `github-actions[bot]`
+  REQUEST_CHANGES on the head without a valid marker (forged, or a real block
+  whose body was edited) must be dismissed by the owner, after which the
+  gate runs a full model review. An owner approval only clears a VERIFIED
+  gate block, so no forgery plus one click can merge code no model saw.
+  Still, keep `pull-requests: write` away from workflows that run PR code.
 - Lockfile hosts outside the allowlist (e.g. a private registry) cannot be
   cleared per repo; that needs a gate change.
 - A single emoji presentation selector straight after an emoji (the usual
