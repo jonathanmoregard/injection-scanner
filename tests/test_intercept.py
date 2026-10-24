@@ -402,6 +402,29 @@ def test_a_flag_with_a_judge_attack_vote_rejects(monkeypatch):
     assert v.reason == "l2_arbitration:attack:openai_4o_mini"
 
 
+def test_a_judge_outage_is_an_unavailable_reason_under_l2_arbitration(monkeypatch):
+    """A judge that could not answer is an OUTAGE: the verdict reason is
+    `l2_arbitration:judge_unavailable:<judge>:<signal>`, the
+    `<wrapper>:<layer>_unavailable:*` shape consumers classify as infra.
+    Driven through the real vote aggregation in judge._run_all."""
+    from injection_scanner import intercept, judge
+    from injection_scanner.judge import JudgeVote
+
+    async def one(j, _sealed):
+        if j["id"] == "openai_41_mini":
+            return JudgeVote(j["id"], "unavailable", "api-error:RateLimitError:429")
+        return JudgeVote(j["id"], "benign", "verdict")
+
+    _panel(monkeypatch, "lakera:prompt_attack", "pass")
+    monkeypatch.setattr(intercept, "honeypot_check", _hp_clean)
+    monkeypatch.setattr(judge, "_ask_one", one)
+    v = intercept.scan_text("x", use_honeypot=True, use_l2=True)
+    assert not v.ok
+    assert v.reason == (
+        "l2_arbitration:judge_unavailable:openai_41_mini:api-error:RateLimitError:429"
+    )
+
+
 def test_judge_ok_with_non_unanimous_reason_still_rejects(monkeypatch):
     from injection_scanner import intercept, judge
     from injection_scanner.judge import JudgeResult

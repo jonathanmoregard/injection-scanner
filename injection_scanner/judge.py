@@ -260,15 +260,23 @@ async def _ask_one(judge: dict, sealed: str) -> JudgeVote:
     return JudgeVote(judge["id"], "unavailable", "unknown-provider")
 
 
+def _outage(*parts: str) -> str:
+    """The judge's OUTAGE reason: `judge_unavailable:<judge>:<signal>` or
+    `judge_unavailable:panel-incomplete`. The `<layer>_unavailable` head is
+    the infra vocabulary every consumer reads, also under intercept's
+    `l2_arbitration:` wrapper; judgements (`attack:<judge>`) never use it."""
+    return ":".join(("judge_unavailable", *parts))
+
+
 def ready() -> str | None:
     """`None` when every judge's provider could be called, else
-    `l2_arbitration:unavailable:<judge>:<signal>`: the reason a scan needing
-    arbitration would be rejected with. No call is made."""
+    `l2_arbitration:judge_unavailable:<judge>:<signal>`: the reason a scan
+    needing arbitration would be rejected with. No call is made."""
     loaders = {"anthropic": _anthropic_key, "openai": _openai_key}
     for j in _JUDGES:
         signal = provider_unready(j["provider"], loaders.get(j["provider"], lambda: None))
         if signal is not None:
-            return f"l2_arbitration:unavailable:{j['id']}:{signal}"
+            return f"l2_arbitration:{_outage(j['id'], signal)}"
     return None
 
 
@@ -296,12 +304,10 @@ async def _run_all(report_text: str) -> JudgeResult:
             return JudgeResult(ok=False, reason=f"attack:{v.judge}", votes=votes)
     for v in votes:
         if v.vote != "benign":
-            return JudgeResult(
-                ok=False, reason=f"unavailable:{v.judge}:{v.signal}", votes=votes
-            )
+            return JudgeResult(ok=False, reason=_outage(v.judge, v.signal), votes=votes)
     # Defensive: can't happen (all benign is handled above), but never
     # fail-open on logic drift.
-    return JudgeResult(ok=False, reason="unavailable:panel-incomplete", votes=votes)
+    return JudgeResult(ok=False, reason=_outage("panel-incomplete"), votes=votes)
 
 
 def check(report_text: str) -> JudgeResult:

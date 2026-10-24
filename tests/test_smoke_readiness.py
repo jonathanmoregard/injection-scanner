@@ -117,7 +117,7 @@ def test_a_judge_without_a_key_names_the_judge(ready_env, monkeypatch) -> None:
     separate check exists for."""
     monkeypatch.setattr(judge, "_openai_key", lambda: None)
     msg = _fails()
-    assert "l2_arbitration:unavailable:" in msg
+    assert "l2_arbitration:judge_unavailable:" in msg
     assert ":no-openai-api-key" in msg
     assert "Failed layer — judge: openai model" in msg
 

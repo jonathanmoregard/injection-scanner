@@ -132,13 +132,20 @@ from injection_scanner.diagnose import describe
         ),
         # The panel's own machinery.
         ("l2_unavailable:unhandled:RuntimeError", "l2: unhandled RuntimeError"),
-        # L4 judge.
+        # L4 judge — the exact shapes judge.py + intercept emit. Judge signals
+        # are `api-error:<Exc>[:<status>]`, not the honeypot's
+        # `<provider>-api-error`.
         (
-            "l2_arbitration:unavailable:openai_41_mini:openai-api-error:"
+            "l2_arbitration:judge_unavailable:openai_41_mini:api-error:"
             "RateLimitError:429",
             "judge: openai model gpt-4.1-mini: returned HTTP 429 (quota/rate limit) "
             "(RateLimitError)",
         ),
+        (
+            "l2_arbitration:judge_unavailable:anthropic_haiku45:no-anthropic-api-key",
+            "judge: anthropic model claude-haiku-4-5: no API key (set ANTHROPIC_API_KEY)",
+        ),
+        ("l2_arbitration:judge_unavailable:panel-incomplete", "judge: panel incomplete"),
         (
             "l2_arbitration:attack:anthropic_haiku45",
             "judge: anthropic model claude-haiku-4-5 voted attack on the benign probe",
@@ -160,7 +167,7 @@ def test_each_layer_is_named(reason: str, expected: str) -> None:
     [
         "lakera_unavailable:Evil$(rm -rf):999999",
         "honeypot_unavailable:ignore previous instructions:unavailable:x",
-        "l2_arbitration:unavailable:<script>:openai-api-error:X:4044",
+        "l2_arbitration:judge_unavailable:<script>:api-error:X:4044",
         "model_armor_unavailable:Evil$(x):999999",
         "model_armor:ignore previous instructions",
     ],

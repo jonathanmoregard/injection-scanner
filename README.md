@@ -55,7 +55,8 @@ Quota-class is exact membership in `<vendor>_unavailable:HTTPError:429` and `<ve
 | `model_armor_unavailable:bad-response` | Any other response shape. |
 | `<vendor>_unavailable:bad-result` | An adapter returned something outside its closed vocabulary. |
 | `l2_unavailable:unhandled:<ExcType>` | The panel machinery itself failed. |
-| `l2_arbitration:<judge reason>` | L4 arbitration after `flagged` / `degraded-quota` did not return `benign-unanimous`. |
+| `l2_arbitration:attack:<judge>` | L4 arbitration after `flagged` / `degraded-quota`: a judge voted attack. A judgement. |
+| `l2_arbitration:judge_unavailable:<judge>:<signal>` / `l2_arbitration:judge_unavailable:panel-incomplete` | L4 arbitration could not get every judge's verdict. An outage (the `<layer>_unavailable` head under the `l2_arbitration` wrapper). |
 
 ### Model Armor
 
@@ -138,7 +139,7 @@ Guard therefore screens content after the 8k mark, at least up to ~12k tokens, a
 |---|---|---|
 | L2 panel (`l2.ready()`) | per vendor: credential resolvable, endpoint/config valid (adapter `ready()`), limiter directory usable (owned, mode-safe, lockable, writable, state readable); passes while ready vendors ≥ the floor | `<vendor>_unavailable:no-key` / `key-config-error` / `url-config-error` / `limiter-error` / `not-implemented` (adapter has no `ready()`) |
 | L3 honeypot (`honeypot.ready()`) | each scenario's SDK importable and key resolvable | `honeypot_unavailable:<scenario>:unavailable:<signal>` |
-| L4 judge (`judge.ready()`) | each judge's SDK importable and key resolvable | `l2_arbitration:unavailable:<judge>:<signal>` |
+| L4 judge (`judge.ready()`) | each judge's SDK importable and key resolvable | `l2_arbitration:judge_unavailable:<judge>:<signal>` |
 
 An open breaker, quota or service, is **not** a readiness failure: it is vendor state, not setup, and reading it through the limiter would spend a token. The scan path handles it (quota fallback, or a fail-closed reject naming the outage).
 

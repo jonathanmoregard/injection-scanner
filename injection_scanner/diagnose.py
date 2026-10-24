@@ -76,25 +76,24 @@ def _status_text(code: str) -> str:
 
 
 def _provider_signal(parts: list[str]) -> str:
-    """Describe a provider-call signal such as `openai-api-error:NotFoundError:404`."""
+    """Describe a provider-call signal such as `openai-api-error:NotFoundError:404`
+    (honeypot) or `api-error:RateLimitError:429` (judge)."""
     if not parts:
         return "unavailable"
     head = _seg(parts[0])
+    exc = _seg(parts[1]) if len(parts) > 1 else "other"
+    if head in ("api-error", "openai-api-error", "anthropic-api-error"):
+        if len(parts) > 2:
+            return f"returned {_status_text(parts[2])} ({exc})"
+        return f"API call failed ({exc})"
+    if head in ("parse-error", "openai-parse-error", "anthropic-parse-error"):
+        return f"unparseable response ({exc})"
     for provider in ("openai", "anthropic"):
-        if head == f"{provider}-api-error":
-            exc = _seg(parts[1]) if len(parts) > 1 else "other"
-            if len(parts) > 2:
-                return f"returned {_status_text(parts[2])} ({exc})"
-            return f"API call failed ({exc})"
         if head == f"no-{provider}-api-key":
             return f"no API key (set {provider.upper()}_API_KEY)"
         if head == f"{provider}-lib-missing":
             return f"{provider} SDK not installed"
-        if head == f"{provider}-parse-error":
-            exc = _seg(parts[1]) if len(parts) > 1 else "other"
-            return f"unparseable response ({exc})"
     if head == "unhandled":
-        exc = _seg(parts[1]) if len(parts) > 1 else "other"
         return f"unhandled {exc}"
     return head
 
@@ -123,16 +122,24 @@ def _honeypot(rest: str, *, triggered: bool) -> str:
     return f"honeypot: {where}: {_provider_signal(signal)}{skipped}"
 
 
+def _judge_outage(parts: list[str]) -> str:
+    """The `judge_unavailable:` tail: `<judge>:<signal>` or `panel-incomplete`
+    (judge.py), or `unhandled:<ExcType>` (intercept's guard around the layer)."""
+    if parts[0] == "unhandled":
+        return f"judge: {_provider_signal(parts)}"
+    if parts[0] == "panel-incomplete":
+        return "judge: panel incomplete"
+    judge = _seg(parts[0])
+    return f"judge: {_model_for(_JUDGE_MODEL, judge)}: {_provider_signal(parts[1:])}"
+
+
 def _judge(rest: str) -> str:
     parts = rest.split(":")
     if parts[0] == "attack":
         judge = _seg(parts[1]) if len(parts) > 1 else "other"
         return f"judge: {_model_for(_JUDGE_MODEL, judge)} voted attack on the benign probe"
-    if parts[0] == "unavailable" and len(parts) > 1:
-        if parts[1] == "panel-incomplete":
-            return "judge: panel incomplete"
-        judge = _seg(parts[1])
-        return f"judge: {_model_for(_JUDGE_MODEL, judge)}: {_provider_signal(parts[2:])}"
+    if parts[0] == "judge_unavailable":
+        return _judge_outage(parts[1:] or ["other"])
     return f"judge: {_seg(parts[0])}"
 
 
@@ -165,7 +172,7 @@ def describe(reason: str) -> str:
     if head == "l2_arbitration":
         return _judge(rest)
     if head == "judge_unavailable":
-        return f"judge: {_provider_signal(rest.split(':'))}"
+        return _judge_outage(rest.split(":"))
     if head == "honeypot_unavailable":
         return _honeypot(rest, triggered=False)
     if head == "honeypot":
