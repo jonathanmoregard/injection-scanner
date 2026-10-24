@@ -17,7 +17,8 @@ from urllib.error import HTTPError, URLError
 
 import pytest
 
-from injection_scanner import keyloader, lakera, throttle, vendor_http
+from injection_scanner import keyloader, lakera, modelarmor, throttle, vendor_http
+from injection_scanner.vendor_http import VendorResult
 from injection_scanner.intercept import scan_text
 from injection_scanner.throttle import CrossProcessLimiter, Decision, LimiterConfig
 
@@ -46,6 +47,14 @@ def _clean_env(monkeypatch):
 
 def _with_key(monkeypatch, value: str = "lk-test-key"):
     monkeypatch.setenv("LAKERA_API_KEY", value)
+
+
+def _armor_passes(monkeypatch):
+    """Model Armor answers `pass`, so a `scan_text` verdict through the L2
+    panel is decided by what Lakera returns."""
+    monkeypatch.setattr(
+        modelarmor, "check", lambda _t, **_kw: VendorResult(ok=True, reason="pass")
+    )
 
 
 # ----- (a) prompt_attack detected -> reject -----
@@ -542,6 +551,7 @@ def test_no_server_supplied_text_reaches_the_reason(monkeypatch):
 
 def test_scan_text_passes_when_lakera_clean_and_key_present(monkeypatch):
     _with_key(monkeypatch)
+    _armor_passes(monkeypatch)
     monkeypatch.setattr(
         vendor_http, "_post",
         lambda *a, **k: {
@@ -549,14 +559,14 @@ def test_scan_text_passes_when_lakera_clean_and_key_present(monkeypatch):
             "breakdown": [{"detector_type": "prompt_attack", "detected": False}],
         },
     )
-    v = scan_text(_CLEAN, use_honeypot=False, use_lakera=True)
+    v = scan_text(_CLEAN, use_honeypot=False, use_l2=True)
     assert v.ok, f"expected pass, got {v.reason}"
     assert v.layers["lakera"] == "pass"
 
 
 def test_scan_text_rejects_when_no_key(monkeypatch):
     # No key configured (fixture clears env + stubs keyring to None).
-    v = scan_text(_CLEAN, use_honeypot=False, use_lakera=True)
+    v = scan_text(_CLEAN, use_honeypot=False, use_l2=True)
     assert v.ok is False
     assert v.reason == "lakera_unavailable:no-key"
     assert v.layers["lakera"] == "lakera_unavailable:no-key"
@@ -564,6 +574,7 @@ def test_scan_text_rejects_when_no_key(monkeypatch):
 
 def test_scan_text_rejects_when_lakera_flagged(monkeypatch):
     _with_key(monkeypatch)
+    _armor_passes(monkeypatch)
     monkeypatch.setattr(
         vendor_http, "_post",
         lambda *a, **k: {
@@ -571,7 +582,7 @@ def test_scan_text_rejects_when_lakera_flagged(monkeypatch):
             "breakdown": [{"detector_type": "prompt_attack", "detected": True}],
         },
     )
-    v = scan_text(_CLEAN, use_honeypot=False, use_lakera=True)
+    v = scan_text(_CLEAN, use_honeypot=False, use_l2=True)
     assert v.ok is False
     assert v.reason.startswith("lakera:")
 
@@ -580,6 +591,7 @@ def test_scan_text_surfaces_the_http_status_without_server_text(monkeypatch):
     """End to end: the status reaches the two caller-visible strings, and the
     server-supplied text reaches neither. Fail-closed is unchanged."""
     _with_key(monkeypatch)
+    _armor_passes(monkeypatch)
     exc = _http_error(
         429,
         msg=f"Too Many Requests {_SERVER_TEXT_MARKER}",
@@ -590,7 +602,7 @@ def test_scan_text_surfaces_the_http_status_without_server_text(monkeypatch):
         raise exc
 
     monkeypatch.setattr(vendor_http, "_post", _boom)
-    v = scan_text(_CLEAN, use_honeypot=False, use_lakera=True)
+    v = scan_text(_CLEAN, use_honeypot=False, use_l2=True)
 
     assert v.ok is False  # an HTTP error still quarantines the report
     assert v.reason == "lakera_unavailable:HTTPError:429"
@@ -1028,6 +1040,7 @@ def test_scan_text_surfaces_the_throttled_reason_and_fails_closed(monkeypatch):
     """End to end: the two new reasons behave like every other outage — the
     report is rejected and the diagnosis is visible in `layers`."""
     _with_key(monkeypatch)
+    _armor_passes(monkeypatch)
     monkeypatch.setenv("INJECTION_SCANNER_LAKERA_MIN_INTERVAL_S", "3600")
     monkeypatch.setenv("INJECTION_SCANNER_LAKERA_BURST", "1")
     monkeypatch.setattr(
@@ -1037,8 +1050,8 @@ def test_scan_text_surfaces_the_throttled_reason_and_fails_closed(monkeypatch):
             "breakdown": [{"detector_type": "prompt_attack", "detected": False}],
         },
     )
-    assert scan_text(_CLEAN, use_honeypot=False, use_lakera=True).ok is True
-    v = scan_text(_CLEAN, use_honeypot=False, use_lakera=True)
+    assert scan_text(_CLEAN, use_honeypot=False, use_l2=True).ok is True
+    v = scan_text(_CLEAN, use_honeypot=False, use_l2=True)
     assert v.ok is False
     assert v.reason == "lakera_unavailable:throttled"
     assert v.layers["lakera"] == "lakera_unavailable:throttled"

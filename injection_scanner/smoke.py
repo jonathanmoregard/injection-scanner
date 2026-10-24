@@ -23,7 +23,7 @@ Two phases:
      use_honeypot=False — no API cost, deterministic.
 
   2. Scanner-stack liveness — one benign payload with
-     use_honeypot=True AND use_lakera=True (both left ON), run through
+     use_honeypot=True AND use_l2=True (both left ON), run through
      scan(Path). Pays one honeypot round-trip per scenario plus one
      Lakera Guard call. If L2 (Lakera) or L3 (honeypot) is degraded
      (SDK missing, key unset/revoked, provider down), production scans
@@ -57,11 +57,11 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable
 
-from injection_scanner import throttle
+from injection_scanner import l2, throttle
 from injection_scanner.diagnose import describe
 from injection_scanner.intercept import (
     Verdict,
-    is_lakera_quota_degraded,
+    l2_outcome,
     scan,
     scan_text,
 )
@@ -285,7 +285,7 @@ def _record_liveness_pass(now: float) -> None:
         return
 
 
-def _scan_via_path(payload: str, *, use_honeypot: bool, use_lakera: bool = True) -> Verdict:
+def _scan_via_path(payload: str, *, use_honeypot: bool, use_l2: bool = True) -> Verdict:
     """Write payload to a temp file and run scan(Path). Cleans up the
     temp file even if scan raises. Exists so the disk-read wrapper
     doesn't sit untested."""
@@ -295,7 +295,7 @@ def _scan_via_path(payload: str, *, use_honeypot: bool, use_lakera: bool = True)
         tf.write(payload)
         tpath = Path(tf.name)
     try:
-        return scan(tpath, use_honeypot=use_honeypot, use_lakera=use_lakera)
+        return scan(tpath, use_honeypot=use_honeypot, use_l2=use_l2)
     finally:
         try:
             tpath.unlink()
@@ -331,8 +331,8 @@ def run_smoke(
     # research-agent's hot path; scan(Path) covers claude-cl-sync's.
     for c in _DETERMINISTIC:
         for variant, runner in (
-            ("scan_text", lambda p: scan_text(p, use_honeypot=False, use_lakera=False)),
-            ("scan",      lambda p: _scan_via_path(p, use_honeypot=False, use_lakera=False)),
+            ("scan_text", lambda p: scan_text(p, use_honeypot=False, use_l2=False)),
+            ("scan",      lambda p: _scan_via_path(p, use_honeypot=False, use_l2=False)),
         ):
             v: Verdict = runner(c.payload)
             tag = f"{c.label}[{variant}]"
@@ -369,7 +369,7 @@ def run_smoke(
         )
         return
 
-    v = _scan_via_path(_BENIGN_PROBE, use_honeypot=True, use_lakera=True)
+    v = _scan_via_path(_BENIGN_PROBE, use_honeypot=True, use_l2=True)
     if not v.ok:
         msg = (
             f"benign liveness probe returned ok=False ({v.reason}). "
@@ -385,15 +385,21 @@ def run_smoke(
         )
         err(f"scanner self-test FAILED: {msg}")
         raise SmokeFailure(msg)
-    lk = v.layers.get("lakera", "")
+    outcome = l2_outcome(v)
     quota_fallback = (
-        is_lakera_quota_degraded(lk)
+        outcome is l2.Outcome.DEGRADED_QUOTA
         and v.layers.get("judge", "") == "benign-unanimous"
     )
-    if lk != "pass" and not quota_fallback:
+    if outcome is not l2.Outcome.PASS and not quota_fallback:
+        failed = [
+            describe(v.layers[name])
+            for name in l2.VENDORS
+            if v.layers.get(name, "pass") != "pass"
+        ]
         msg = (
-            f"lakera layer not 'pass' and strict quota fallback incomplete "
-            f"on benign probe (got {lk!r}). Failed layer — {describe(lk)}."
+            f"l2 panel not 'pass' and strict quota fallback incomplete "
+            f"on benign probe (got {v.layers.get('l2', '')!r}). Failed layer — "
+            f"{'; '.join(failed) or 'l2: no panel outcome'}."
         )
         err(f"scanner self-test FAILED: {msg}")
         raise SmokeFailure(msg)
@@ -410,7 +416,7 @@ def run_smoke(
     live_detail = (
         "strict quota fallback live via scan(Path)"
         if quota_fallback
-        else "lakera + honeypot live via scan(Path)"
+        else "l2 panel + honeypot live via scan(Path)"
     )
     info(
         f"scanner self-test OK ({len(_DETERMINISTIC)} canaries × "

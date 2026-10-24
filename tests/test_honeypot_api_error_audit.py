@@ -553,7 +553,7 @@ def test_scan_text_audit_has_detail_reason_and_layers_do_not(monkeypatch):
     v = intercept.scan_text(
         "Benign report. Sources: 1. example.",
         use_honeypot=True,
-        use_lakera=False,
+        use_l2=False,
     )
 
     # (e) fail-closed reject still happens.
@@ -597,6 +597,6 @@ def test_clean_scan_has_empty_api_error_audit_field(monkeypatch):
     monkeypatch.setattr(
         intercept, "honeypot_check", lambda _t: HoneypotResult(ok=True, reason="pass")
     )
-    v = intercept.scan_text("Benign.", use_honeypot=True, use_lakera=False)
+    v = intercept.scan_text("Benign.", use_honeypot=True, use_l2=False)
     assert v.ok is True
     assert v.to_audit()["honeypot_api_errors"] == {}

@@ -150,7 +150,7 @@ jobs:
       # Lakera pacing: the job-level MIN_INTERVAL_S above spaces the calls
       # 60 s apart and BURST=2 stops the fresh runner bucket from clumping
       # (~15 min for 16 cases, inside the 45-minute timeout), and
-      # --lakera-max-wait 1800 lets this batch caller QUEUE for its turn
+      # --l2-max-wait 1800 lets this batch caller QUEUE for its turn
       # rather than be refused mid-corpus. The wait budget is deliberately
       # shorter than the job timeout, so a wedged call surfaces as an eval
       # failure with a scorecard rather than as a killed job without one.
@@ -176,7 +176,7 @@ jobs:
           LAKERA_API_KEY: ${{ secrets.LAKERA_API_KEY }}
         run: |
           status=0
-          .venv/bin/python -m injection_scanner.eval tests/payloads/labels.jsonl --use-lakera --use-honeypot --min-recall 1.0 --max-fp-rate 0.0 --confirm-disagreements 2 --lakera-max-wait 1800 || status=$?
+          .venv/bin/python -m injection_scanner.eval tests/payloads/labels.jsonl --use-l2 --use-honeypot --min-recall 1.0 --max-fp-rate 0.0 --confirm-disagreements 2 --l2-max-wait 1800 || status=$?
           if [ "$status" -eq 3 ]; then
             echo "::error::scanner outage during eval (exit 3) — see the INFRA line above; no scorecard produced"
           fi

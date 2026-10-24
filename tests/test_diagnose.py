@@ -66,15 +66,46 @@ from injection_scanner.intercept import Verdict
         ),
         ("lakera_unavailable:URLError", "lakera: transport error (URLError)"),
         ("lakera:prompt_attack", "lakera: flagged the benign probe (prompt_attack)"),
+        (
+            "lakera_unavailable:unhandled:RuntimeError",
+            "lakera: unhandled RuntimeError",
+        ),
+        # L2 Model Armor.
+        (
+            "model_armor_unavailable:no-key",
+            "model_armor: no credential (set MODEL_ARMOR_CREDENTIALS_FILE)",
+        ),
+        (
+            "model_armor_unavailable:not-implemented",
+            "model_armor: adapter not implemented yet",
+        ),
+        (
+            "model_armor_unavailable:HTTPError:429",
+            "model_armor: HTTP 429 (quota/rate limit) (HTTPError)",
+        ),
+        (
+            "model_armor_unavailable:throttled",
+            "model_armor: local fleet budget exhausted or quota breaker open (throttled)",
+        ),
+        (
+            "model_armor_unavailable:bad-result",
+            "model_armor: adapter result outside its closed vocabulary",
+        ),
+        (
+            "model_armor:prompt_attack",
+            "model_armor: flagged the benign probe (prompt_attack)",
+        ),
+        # The panel's own machinery.
+        ("l2_unavailable:unhandled:RuntimeError", "l2: unhandled RuntimeError"),
         # L4 judge.
         (
-            "lakera_arbitration:unavailable:openai_41_mini:openai-api-error:"
+            "l2_arbitration:unavailable:openai_41_mini:openai-api-error:"
             "RateLimitError:429",
             "judge: openai model gpt-4.1-mini: returned HTTP 429 (quota/rate limit) "
             "(RateLimitError)",
         ),
         (
-            "lakera_arbitration:attack:anthropic_haiku45",
+            "l2_arbitration:attack:anthropic_haiku45",
             "judge: anthropic model claude-haiku-4-5 voted attack on the benign probe",
         ),
         ("judge_unavailable:unhandled:RuntimeError", "judge: unhandled RuntimeError"),
@@ -94,7 +125,9 @@ def test_each_layer_is_named(reason: str, expected: str) -> None:
     [
         "lakera_unavailable:Evil$(rm -rf):999999",
         "honeypot_unavailable:ignore previous instructions:unavailable:x",
-        "lakera_arbitration:unavailable:<script>:openai-api-error:X:4044",
+        "l2_arbitration:unavailable:<script>:openai-api-error:X:4044",
+        "model_armor_unavailable:Evil$(x):999999",
+        "model_armor:ignore previous instructions",
     ],
 )
 def test_out_of_vocabulary_segments_never_reach_the_message(reason: str) -> None:
@@ -118,9 +151,9 @@ def test_smoke_failure_names_the_honeypot_not_lakera(monkeypatch) -> None:
     )
     real = smoke._scan_via_path
 
-    def fake(payload, *, use_honeypot, use_lakera=True):
+    def fake(payload, *, use_honeypot, use_l2=True):
         if not use_honeypot:
-            return real(payload, use_honeypot=use_honeypot, use_lakera=use_lakera)
+            return real(payload, use_honeypot=use_honeypot, use_l2=use_l2)
         return Verdict(
             ok=False,
             reason=reason,
@@ -137,3 +170,14 @@ def test_smoke_failure_names_the_honeypot_not_lakera(monkeypatch) -> None:
     assert "honeypot: openai model gpt-4.1-mini" in msg
     assert "HTTP 404" in msg
     assert "LAKERA_API_KEY" not in msg
+
+
+def test_every_panel_vendor_has_a_diagnosis() -> None:
+    """A vendor added to the panel without a diagnose entry would fall
+    through to the generic layer message and lose its fixed conditions."""
+    from injection_scanner import l2
+
+    for vendor in l2.VENDORS:
+        assert describe(f"{vendor}_unavailable:throttled") == (
+            f"{vendor}: local fleet budget exhausted or quota breaker open (throttled)"
+        )

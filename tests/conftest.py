@@ -109,11 +109,19 @@ _SMOKE_ENV = (
     "INJECTION_SCANNER_SMOKE_LIVENESS_TTL_S",
 )
 
+# The panel floor and the Model Armor credential. Cleared so the suite always
+# measures the documented default floor (2) and a keyless Model Armor, whatever
+# the developer's shell exports.
+_PANEL_ENV = (
+    "INJECTION_SCANNER_L2_MIN_VERDICTS",
+    "MODEL_ARMOR_CREDENTIALS_FILE",
+)
+
 
 @pytest.fixture(autouse=True)
 def _isolated_limiter_state(monkeypatch, tmp_path):
     """Private cache directory + the documented "off" budget, cache included."""
-    for name in _LIMITER_ENV + _SMOKE_ENV:
+    for name in _LIMITER_ENV + _SMOKE_ENV + _PANEL_ENV:
         monkeypatch.delenv(name, raising=False)
     monkeypatch.setenv("INJECTION_SCANNER_CACHE_DIR", str(tmp_path / "cache"))
     for vendor in _VENDORS:

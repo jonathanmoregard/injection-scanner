@@ -158,7 +158,7 @@ def test_orchestrator_passes_clean_report():
             "# Python 3.13\n\n*Sources: 1*\n\n## Summary\nReleased October 2024.\n"
         )
         path = Path(f.name)
-    v = scan(path, use_honeypot=False, use_lakera=False)
+    v = scan(path, use_honeypot=False, use_l2=False)
     assert v.ok, f"expected pass, got {v.reason}"
     assert v.layers["secret_shapes"] == "pass"
 
@@ -172,7 +172,7 @@ def test_orchestrator_blocks_secret():
     with tempfile.NamedTemporaryFile("w", suffix=".md", delete=False) as f:
         f.write("# Report\n\nLeaked key: " + secret_bytes + "\n")
         path = Path(f.name)
-    v = scan(path, use_honeypot=False, use_lakera=False)
+    v = scan(path, use_honeypot=False, use_l2=False)
     assert not v.ok
     assert v.reason == "secret_shape:anthropic_oauth_token"
     # No part of the secret bytes appears in reason or layers.
@@ -192,7 +192,7 @@ def test_orchestrator_blocks_unicode_covert():
     with tempfile.NamedTemporaryFile("w", suffix=".md", delete=False) as f:
         f.write("benign \u202Emalicious" * 100)
         path = Path(f.name)
-    v = scan(path, use_honeypot=False, use_lakera=False)
+    v = scan(path, use_honeypot=False, use_l2=False)
     assert not v.ok
     assert "unicode_anomaly" in v.reason
 
@@ -203,16 +203,36 @@ def test_orchestrator_strips_but_passes_single_zw():
     with tempfile.NamedTemporaryFile("w", suffix=".md", delete=False) as f:
         f.write("clean text " * 500 + "\u200Bcontaminated")
         path = Path(f.name)
-    v = scan(path, use_honeypot=False, use_lakera=False)
+    v = scan(path, use_honeypot=False, use_l2=False)
     assert v.ok
     assert "\u200B" not in v.sanitized_text
 
 
-# ----- L4 arbitration wiring (lakera flag + honeypot clean -> judge) -----
+# ----- L2 panel -> L3/L4 wiring -----
+#
+# Both vendors are stubbed at their adapter `check`, so the real panel
+# (`l2.run`, default floor 2) decides and `scan_text` routes its outcome:
+# FLAGGED and DEGRADED_QUOTA go to strict honeypot + unanimous judge
+# arbitration, UNAVAILABLE rejects, and with the honeypot off nothing is
+# arbitrated.
 
-def _flagged(_text, **_kw):
+def _vendor(reason: str):
     from injection_scanner.vendor_http import VendorResult
-    return VendorResult(ok=False, flagged=True, reason="lakera:prompt_attack")
+
+    if reason == "pass":
+        result = VendorResult(ok=True, reason="pass")
+    elif reason.endswith(":prompt_attack"):
+        result = VendorResult(ok=False, flagged=True, reason=reason)
+    else:
+        result = VendorResult(ok=False, reason=reason)
+    return lambda _text, **_kw: result
+
+
+def _panel(monkeypatch, lakera_reason: str, armor_reason: str) -> None:
+    from injection_scanner import lakera, modelarmor
+
+    monkeypatch.setattr(lakera, "check", _vendor(lakera_reason))
+    monkeypatch.setattr(modelarmor, "check", _vendor(armor_reason))
 
 
 def _hp_clean(_text):
@@ -220,124 +240,104 @@ def _hp_clean(_text):
     return HoneypotResult(ok=True, reason="pass")
 
 
+def _judge_benign(_text):
+    from injection_scanner.judge import JudgeResult, JudgeVote
+    return JudgeResult(
+        ok=True,
+        reason="benign-unanimous",
+        votes=[JudgeVote("anthropic_haiku45", "benign", "verdict")],
+    )
+
+
+def _must_not_run(what: str):
+    def _fail(*_a, **_kw):
+        pytest.fail(f"{what} must not run")
+    return _fail
+
+
 @pytest.mark.parametrize(
-    "reason",
+    "lakera_reason,armor_reason",
     [
-        "lakera_unavailable:HTTPError:429",
-        "lakera_unavailable:throttled",
+        ("lakera_unavailable:HTTPError:429", "pass"),
+        ("lakera_unavailable:throttled", "pass"),
+        ("pass", "model_armor_unavailable:HTTPError:429"),
+        ("pass", "model_armor_unavailable:throttled"),
+        ("lakera:prompt_attack", "model_armor_unavailable:throttled"),
     ],
 )
-def test_exact_quota_degradation_uses_strict_benign_arbitration(
-    monkeypatch, reason
+def test_quota_degradation_uses_strict_benign_arbitration(
+    monkeypatch, lakera_reason, armor_reason
 ):
-    from injection_scanner import intercept, judge, lakera
-    from injection_scanner.judge import JudgeResult, JudgeVote
-    from injection_scanner.vendor_http import VendorResult
+    from injection_scanner import intercept, judge
 
-    monkeypatch.setattr(
-        lakera,
-        "check",
-        lambda _t, **_kw: VendorResult(ok=False, reason=reason),
-    )
+    _panel(monkeypatch, lakera_reason, armor_reason)
     monkeypatch.setattr(intercept, "honeypot_check", _hp_clean)
-    monkeypatch.setattr(
-        judge,
-        "check",
-        lambda _t: JudgeResult(
-            ok=True,
-            reason="benign-unanimous",
-            votes=[JudgeVote("anthropic_haiku45", "benign", "verdict")],
-        ),
-    )
+    monkeypatch.setattr(judge, "check", _judge_benign)
 
     verdict = intercept.scan_text("clean prose")
 
     assert verdict.ok is True
-    assert verdict.layers["lakera"] == reason
+    assert verdict.layers["lakera"] == lakera_reason
+    assert verdict.layers["model_armor"] == armor_reason
+    assert verdict.layers["l2"] == "degraded-quota verdicts=1/2 floor=2"
     assert verdict.layers["honeypot"] == "pass"
     assert verdict.layers["judge"] == "benign-unanimous"
 
 
 @pytest.mark.parametrize(
-    "reason",
+    "lakera_reason,armor_reason,expected",
     [
-        "lakera_unavailable:service-unavailable",
-        "lakera_unavailable:HTTPError:503",
-        "lakera_unavailable:HTTPError:429-extra",
-        "lakera_unavailable:no-key",
-        "lakera_unavailable:limiter-error",
+        ("lakera_unavailable:service-unavailable", "pass",
+         "lakera_unavailable:service-unavailable"),
+        ("lakera_unavailable:HTTPError:503", "pass", "lakera_unavailable:HTTPError:503"),
+        ("lakera_unavailable:HTTPError:429-extra", "pass",
+         "lakera_unavailable:HTTPError:429-extra"),
+        ("lakera_unavailable:no-key", "pass", "lakera_unavailable:no-key"),
+        ("pass", "model_armor_unavailable:no-key", "model_armor_unavailable:no-key"),
+        ("lakera_unavailable:throttled", "model_armor_unavailable:limiter-error",
+         "model_armor_unavailable:limiter-error"),
+        ("lakera:prompt_attack", "model_armor_unavailable:not-implemented",
+         "model_armor_unavailable:not-implemented"),
     ],
 )
-def test_non_quota_lakera_failures_never_enter_degraded_arbitration(
-    monkeypatch, reason
+def test_a_non_quota_shortfall_rejects_before_any_arbitration(
+    monkeypatch, lakera_reason, armor_reason, expected
 ):
-    from injection_scanner import intercept, judge, lakera
-    from injection_scanner.vendor_http import VendorResult
+    from injection_scanner import intercept, judge
 
-    monkeypatch.setattr(
-        lakera,
-        "check",
-        lambda _t, **_kw: VendorResult(ok=False, reason=reason),
-    )
-    monkeypatch.setattr(
-        intercept,
-        "honeypot_check",
-        lambda _t: pytest.fail("non-quota Lakera failure must reject first"),
-    )
-    monkeypatch.setattr(
-        judge,
-        "check",
-        lambda _t: pytest.fail("non-quota Lakera failure must not arbitrate"),
-    )
+    _panel(monkeypatch, lakera_reason, armor_reason)
+    monkeypatch.setattr(intercept, "honeypot_check", _must_not_run("honeypot"))
+    monkeypatch.setattr(judge, "check", _must_not_run("judge"))
 
     verdict = intercept.scan_text("x")
 
     assert verdict.ok is False
-    assert verdict.reason == reason
+    assert verdict.reason == expected
+    assert verdict.layers["l2"].startswith("unavailable verdicts=")
 
 
 def test_quota_degradation_without_honeypot_stays_fail_closed(monkeypatch):
-    from injection_scanner import intercept, lakera
-    from injection_scanner.vendor_http import VendorResult
+    from injection_scanner import intercept
 
-    reason = "lakera_unavailable:HTTPError:429"
-    monkeypatch.setattr(
-        lakera,
-        "check",
-        lambda _t, **_kw: VendorResult(ok=False, reason=reason),
-    )
-
+    _panel(monkeypatch, "pass", "model_armor_unavailable:HTTPError:429")
     verdict = intercept.scan_text("x", use_honeypot=False)
-
     assert verdict.ok is False
-    assert verdict.reason == reason
+    assert verdict.reason == "model_armor_unavailable:HTTPError:429"
 
 
 def test_quota_degradation_with_honeypot_trigger_rejects_without_judge(
     monkeypatch,
 ):
-    from injection_scanner import intercept, judge, lakera
+    from injection_scanner import intercept, judge
     from injection_scanner.honeypot import HoneypotResult
-    from injection_scanner.vendor_http import VendorResult
 
-    monkeypatch.setattr(
-        lakera,
-        "check",
-        lambda _t, **_kw: VendorResult(
-            ok=False,
-            reason="lakera_unavailable:throttled",
-        ),
-    )
+    _panel(monkeypatch, "lakera_unavailable:throttled", "pass")
     monkeypatch.setattr(
         intercept,
         "honeypot_check",
         lambda _t: HoneypotResult(ok=False, reason="scenario:triggered"),
     )
-    monkeypatch.setattr(
-        judge,
-        "check",
-        lambda _t: pytest.fail("triggered honeypot must reject before judge"),
-    )
+    monkeypatch.setattr(judge, "check", _must_not_run("judge"))
 
     verdict = intercept.scan_text("x")
 
@@ -345,53 +345,68 @@ def test_quota_degradation_with_honeypot_trigger_rejects_without_judge(
     assert verdict.reason == "honeypot:scenario:triggered"
 
 
-def test_quota_reason_helper_is_an_exact_closed_vocabulary():
+def test_l2_outcome_reads_the_panel_summary_of_a_verdict(monkeypatch):
     from injection_scanner import intercept
+    from injection_scanner.l2 import Outcome
 
-    assert intercept.is_lakera_quota_degraded(
-        "lakera_unavailable:HTTPError:429"
-    )
-    assert intercept.is_lakera_quota_degraded("lakera_unavailable:throttled")
-    assert not intercept.is_lakera_quota_degraded(
-        "lakera_unavailable:HTTPError:429-extra"
-    )
-    assert not intercept.is_lakera_quota_degraded(
-        "lakera_unavailable:service-unavailable"
-    )
+    _panel(monkeypatch, "pass", "pass")
+    assert intercept.l2_outcome(
+        intercept.scan_text("x", use_honeypot=False)
+    ) is Outcome.PASS
+
+    _panel(monkeypatch, "pass", "model_armor_unavailable:throttled")
+    assert intercept.l2_outcome(
+        intercept.scan_text("x", use_honeypot=False)
+    ) is Outcome.DEGRADED_QUOTA
+
+    assert intercept.l2_outcome(
+        intercept.scan_text("x", use_honeypot=False, use_l2=False)
+    ) is None
 
 
-def test_lakera_flag_honeypot_clean_judge_benign_delivers(monkeypatch):
-    from injection_scanner import intercept, judge, lakera
-    from injection_scanner.judge import JudgeResult, JudgeVote
-    monkeypatch.setattr(lakera, "check", _flagged)
+@pytest.mark.parametrize(
+    "lakera_reason,armor_reason",
+    [
+        ("lakera:prompt_attack", "pass"),
+        ("pass", "model_armor:prompt_attack"),
+    ],
+)
+def test_a_flag_honeypot_clean_judge_benign_delivers(
+    monkeypatch, lakera_reason, armor_reason
+):
+    from injection_scanner import intercept, judge
+
+    _panel(monkeypatch, lakera_reason, armor_reason)
     monkeypatch.setattr(intercept, "honeypot_check", _hp_clean)
-    monkeypatch.setattr(judge, "check", lambda _t: JudgeResult(
-        ok=True, reason="benign-unanimous",
-        votes=[JudgeVote("anthropic_haiku45", "benign", "verdict")],
-    ))
-    v = intercept.scan_text("prose about agent tooling", use_honeypot=True, use_lakera=True)
+    monkeypatch.setattr(judge, "check", _judge_benign)
+
+    v = intercept.scan_text("prose about agent tooling", use_honeypot=True, use_l2=True)
+
     assert v.ok
-    assert v.layers["lakera"] == "lakera:prompt_attack"
+    assert v.layers["lakera"] == lakera_reason
+    assert v.layers["model_armor"] == armor_reason
+    assert v.layers["l2"] == "flagged verdicts=2/2 floor=2"
     assert v.layers["judge"] == "benign-unanimous"
 
 
-def test_lakera_flag_judge_attack_rejects(monkeypatch):
-    from injection_scanner import intercept, judge, lakera
+def test_a_flag_with_a_judge_attack_vote_rejects(monkeypatch):
+    from injection_scanner import intercept, judge
     from injection_scanner.judge import JudgeResult
-    monkeypatch.setattr(lakera, "check", _flagged)
+
+    _panel(monkeypatch, "pass", "model_armor:prompt_attack")
     monkeypatch.setattr(intercept, "honeypot_check", _hp_clean)
     monkeypatch.setattr(judge, "check", lambda _t: JudgeResult(
         ok=False, reason="attack:openai_4o_mini"))
-    v = intercept.scan_text("x", use_honeypot=True, use_lakera=True)
+    v = intercept.scan_text("x", use_honeypot=True, use_l2=True)
     assert not v.ok
-    assert v.reason == "lakera_arbitration:attack:openai_4o_mini"
+    assert v.reason == "l2_arbitration:attack:openai_4o_mini"
 
 
 def test_judge_ok_with_non_unanimous_reason_still_rejects(monkeypatch):
-    from injection_scanner import intercept, judge, lakera
+    from injection_scanner import intercept, judge
     from injection_scanner.judge import JudgeResult
 
-    monkeypatch.setattr(lakera, "check", _flagged)
+    _panel(monkeypatch, "lakera:prompt_attack", "pass")
     monkeypatch.setattr(intercept, "honeypot_check", _hp_clean)
     monkeypatch.setattr(
         judge,
@@ -402,130 +417,143 @@ def test_judge_ok_with_non_unanimous_reason_still_rejects(monkeypatch):
     verdict = intercept.scan_text("x")
 
     assert verdict.ok is False
-    assert verdict.reason == "lakera_arbitration:unexpected-pass-shape"
+    assert verdict.reason == "l2_arbitration:unexpected-pass-shape"
 
 
-def test_lakera_flag_honeypot_triggered_rejects_without_judge(monkeypatch):
-    from injection_scanner import intercept, judge, lakera
+def test_a_flag_with_a_triggered_honeypot_rejects_without_judge(monkeypatch):
+    from injection_scanner import intercept, judge
     from injection_scanner.honeypot import HoneypotResult
-    monkeypatch.setattr(lakera, "check", _flagged)
+
+    _panel(monkeypatch, "lakera:prompt_attack", "pass")
     monkeypatch.setattr(intercept, "honeypot_check", lambda _t: HoneypotResult(
         ok=False, reason="honeypot:scn:trap:x"))
-    monkeypatch.setattr(judge, "check", lambda _t: (_ for _ in ()).throw(
-        AssertionError("judge must not run when honeypot triggers")))
-    v = intercept.scan_text("x", use_honeypot=True, use_lakera=True)
+    monkeypatch.setattr(judge, "check", _must_not_run("judge"))
+    v = intercept.scan_text("x", use_honeypot=True, use_l2=True)
     assert not v.ok
     assert v.reason.startswith("honeypot:")
 
 
-def test_lakera_outage_hard_rejects_without_judge(monkeypatch):
-    from injection_scanner import intercept, judge, lakera
-    from injection_scanner.vendor_http import VendorResult
-    monkeypatch.setattr(lakera, "check", lambda _t, **_kw: VendorResult(
-        ok=False, reason="lakera_unavailable:no-key"))
-    monkeypatch.setattr(judge, "check", lambda _t: (_ for _ in ()).throw(
-        AssertionError("judge must not run on lakera outage")))
-    v = intercept.scan_text("x", use_honeypot=True, use_lakera=True)
+def test_a_flag_without_honeypot_hard_rejects(monkeypatch):
+    from injection_scanner import intercept
+
+    _panel(monkeypatch, "pass", "model_armor:prompt_attack")
+    v = intercept.scan_text("x", use_honeypot=False, use_l2=True)
     assert not v.ok
-    assert v.reason == "lakera_unavailable:no-key"
+    assert v.reason == "model_armor:prompt_attack"
 
 
-def test_lakera_flag_without_honeypot_hard_rejects(monkeypatch):
-    from injection_scanner import intercept, lakera
-    monkeypatch.setattr(lakera, "check", _flagged)
-    v = intercept.scan_text("x", use_honeypot=False, use_lakera=True)
-    assert not v.ok
-    assert v.reason == "lakera:prompt_attack"
+def test_a_clean_panel_never_calls_judge(monkeypatch):
+    from injection_scanner import intercept, judge
 
-
-def test_lakera_clean_never_calls_judge(monkeypatch):
-    from injection_scanner import intercept, judge, lakera
-    from injection_scanner.vendor_http import VendorResult
-    monkeypatch.setattr(
-        lakera, "check", lambda _t, **_kw: VendorResult(ok=True, reason="pass")
-    )
+    _panel(monkeypatch, "pass", "pass")
     monkeypatch.setattr(intercept, "honeypot_check", _hp_clean)
-    monkeypatch.setattr(judge, "check", lambda _t: (_ for _ in ()).throw(
-        AssertionError("judge must not run when lakera passes")))
-    v = intercept.scan_text("clean text", use_honeypot=True, use_lakera=True)
+    monkeypatch.setattr(judge, "check", _must_not_run("judge"))
+    v = intercept.scan_text("clean text", use_honeypot=True, use_l2=True)
     assert v.ok
     assert v.reason == "pass"
+    assert v.layers["l2"] == "pass verdicts=2/2 floor=2"
 
 
 def test_judge_crash_fails_closed(monkeypatch):
-    from injection_scanner import intercept, judge, lakera
-    monkeypatch.setattr(lakera, "check", _flagged)
+    from injection_scanner import intercept, judge
+
+    _panel(monkeypatch, "lakera:prompt_attack", "pass")
     monkeypatch.setattr(intercept, "honeypot_check", _hp_clean)
     monkeypatch.setattr(judge, "check", lambda _t: (_ for _ in ()).throw(
         RuntimeError("judge infra down")))
-    v = intercept.scan_text("x", use_honeypot=True, use_lakera=True)
+    v = intercept.scan_text("x", use_honeypot=True, use_l2=True)
     assert not v.ok
     assert v.reason == "judge_unavailable:unhandled:RuntimeError"
     assert "infra down" not in v.reason
 
 
-# ----- the batch wait budget reaches L2 (2026-09-05) -----
+def test_a_disabled_panel_calls_no_vendor(monkeypatch):
+    from injection_scanner import intercept, lakera, modelarmor
+
+    monkeypatch.setattr(lakera, "check", _must_not_run("lakera"))
+    monkeypatch.setattr(modelarmor, "check", _must_not_run("model_armor"))
+    v = intercept.scan_text("clean text", use_honeypot=False, use_l2=False)
+    assert v.ok
+    assert v.layers["l2"] == "disabled (test-only)"
+    assert "lakera" not in v.layers and "model_armor" not in v.layers
+
+
+def test_a_crash_in_the_panel_itself_fails_closed(monkeypatch):
+    """Invariant 3 for the panel's own machinery (thread pool, floor
+    parsing): the type name only, never the message."""
+    from injection_scanner import intercept, l2
+
+    def _boom(*_a, **_kw):
+        raise RuntimeError("SECRET_MESSAGE_MARKER")
+
+    monkeypatch.setattr(l2, "run", _boom)
+    v = intercept.scan_text("clean text", use_honeypot=False)
+    assert v.ok is False
+    assert v.reason == "l2_unavailable:unhandled:RuntimeError"
+    assert v.layers["l2"] == "unhandled:RuntimeError"
+    assert "SECRET_MESSAGE_MARKER" not in repr(v)
+
+
+# ----- the batch wait budget reaches every L2 vendor (2026-09-05) -----
 #
 # `eval` is always a batch caller: it would rather queue behind the fleet's
 # budget than be refused. That preference is the caller's, so it travels as a
-# keyword from the caller to `lakera.check` and nothing in between interprets
-# it.
+# keyword from the caller to each adapter `check` and nothing in between
+# interprets it.
 
 # The spy's default is a SENTINEL, not None: `None` is a value intercept is
 # required to forward, so a default of None would make "keyword omitted" and
-# "keyword passed as None" record identically, and a conditional call site
-# (`check(t)` when the budget is unset, `check(t, max_wait_s=v)` otherwise)
-# would still satisfy `seen == [900.0, None]`. With the sentinel, an omitted
-# keyword records `_UNSET` and the assertion fails — which is exactly the
-# mutant D12 in the plan rules out.
+# "keyword passed as None" record identically.
 _UNSET = object()
 
 
-def _wait_spy():
-    """Return `(spy, seen)`: a `lakera.check` stand-in recording `max_wait_s`."""
+def _wait_spies(monkeypatch):
+    """Install recording stand-ins for both adapters; return what they saw."""
+    from injection_scanner import lakera, modelarmor
     from injection_scanner.vendor_http import VendorResult
 
-    seen: list[object] = []
+    seen: dict[str, list[object]] = {"lakera": [], "model_armor": []}
 
-    def _spy(text, *, max_wait_s=_UNSET):
-        seen.append(max_wait_s)
-        return VendorResult(ok=True, reason="pass")
+    def _spy(name):
+        def check(text, *, max_wait_s=_UNSET):
+            seen[name].append(max_wait_s)
+            return VendorResult(ok=True, reason="pass")
+        return check
 
-    return _spy, seen
+    monkeypatch.setattr(lakera, "check", _spy("lakera"))
+    monkeypatch.setattr(modelarmor, "check", _spy("model_armor"))
+    return seen
 
 
-def test_lakera_max_wait_s_reaches_the_lakera_layer(monkeypatch):
-    from injection_scanner import intercept, lakera
+def test_l2_max_wait_s_reaches_every_vendor(monkeypatch):
+    from injection_scanner import intercept
 
-    _spy, seen = _wait_spy()
-    monkeypatch.setattr(lakera, "check", _spy)
+    seen = _wait_spies(monkeypatch)
 
     v = intercept.scan_text(
-        "clean prose", use_honeypot=False, use_lakera=True, lakera_max_wait_s=900.0
+        "clean prose", use_honeypot=False, use_l2=True, l2_max_wait_s=900.0
     )
     assert v.ok
-    assert seen == [900.0]
+    assert seen == {"lakera": [900.0], "model_armor": [900.0]}
 
-    # Absent means absent: `lakera.check` resolves the default from the
-    # environment, so intercept must not substitute a number of its own — and
-    # must not drop the keyword either, which the sentinel default catches.
-    intercept.scan_text("clean prose", use_honeypot=False, use_lakera=True)
-    assert seen == [900.0, None]
+    # Absent means absent: each adapter resolves its own default from the
+    # environment, so intercept must not substitute a number of its own.
+    intercept.scan_text("clean prose", use_honeypot=False, use_l2=True)
+    assert seen == {"lakera": [900.0, None], "model_armor": [900.0, None]}
 
 
-def test_scan_forwards_lakera_max_wait_s_from_the_disk_entry_point(monkeypatch, tmp_path):
-    from injection_scanner import intercept, lakera
+def test_scan_forwards_l2_max_wait_s_from_the_disk_entry_point(monkeypatch, tmp_path):
+    from injection_scanner import intercept
 
-    _spy, seen = _wait_spy()
-    monkeypatch.setattr(lakera, "check", _spy)
+    seen = _wait_spies(monkeypatch)
     report = tmp_path / "report.md"
     report.write_text("# Report\n\nClean prose.\n", encoding="utf-8")
 
     v = intercept.scan(
-        report, use_honeypot=False, use_lakera=True, lakera_max_wait_s=120.0
+        report, use_honeypot=False, use_l2=True, l2_max_wait_s=120.0
     )
     assert v.ok
-    assert seen == [120.0]
+    assert seen == {"lakera": [120.0], "model_armor": [120.0]}
 
 
 # ----- L1a-decode fails closed like every other layer (2026-09-06) -----
@@ -555,7 +583,7 @@ def test_a_decode_crash_fails_closed_and_does_not_escape(monkeypatch):
     monkeypatch.setattr(
         decode, "find_encoded_blobs", _raise(RuntimeError("secret sauce"))
     )
-    v = intercept.scan_text("clean text", use_honeypot=False, use_lakera=False)
+    v = intercept.scan_text("clean text", use_honeypot=False, use_l2=False)
     assert v.ok is False
     assert v.reason == "decode_unavailable:unhandled:RuntimeError"
     assert v.layers["decode"] == "unhandled:RuntimeError"
@@ -572,7 +600,7 @@ def test_a_crash_scanning_a_decoded_blob_also_fails_closed(monkeypatch):
     monkeypatch.setattr(ss, "scan", _raise(ValueError("secret sauce")))
     blob = base64.b64encode(b"x" * 90).decode("ascii")
     v = intercept.scan_text(
-        f"report body\n\n{blob}\n", use_honeypot=False, use_lakera=False
+        f"report body\n\n{blob}\n", use_honeypot=False, use_l2=False
     )
     assert v.ok is False
     assert v.reason == "decode_unavailable:unhandled:ValueError"
@@ -585,7 +613,7 @@ def test_the_decode_outage_reason_carries_no_exception_text(monkeypatch):
     monkeypatch.setattr(
         decode, "find_encoded_blobs", _raise(RuntimeError("secret sauce"))
     )
-    v = intercept.scan_text("clean text", use_honeypot=False, use_lakera=False)
+    v = intercept.scan_text("clean text", use_honeypot=False, use_l2=False)
     rendered = repr(v) + "|".join([v.reason, *v.layers.values()])
     assert "secret sauce" not in rendered
     assert "secret sauce" not in repr(v.to_audit())
@@ -618,4 +646,4 @@ def test_an_ordinary_decode_run_is_unchanged():
 
 def intercept_scan_text(text: str):
     from injection_scanner import intercept
-    return intercept.scan_text(text, use_honeypot=False, use_lakera=False)
+    return intercept.scan_text(text, use_honeypot=False, use_l2=False)

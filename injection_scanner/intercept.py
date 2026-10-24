@@ -4,17 +4,20 @@ Intercept orchestrator: runs the layered shim and produces a single verdict.
 Order (each layer can short-circuit):
   L0  unicode_sanitize      — strip covert channels, NFKC normalize, flag anomaly
   L1b secret_shapes         — high-precision API-key / JWT / PEM patterns
-  L2  lakera                — hosted Lakera Guard prompt-injection classifier.
-                              GATE, fail-CLOSED: a missing key or ANY error
-                              (network/HTTP/JSON/timeout/broken config) rejects
-                              loudly, exactly like the honeypot. Never silently
-                              degrades to "pass".
+  L2  l2 panel              — hosted prompt-injection classifiers (Lakera
+                              Guard, Google Model Armor), run concurrently;
+                              see l2.py. GATE, fail-CLOSED: below the verdict
+                              floor for any non-quota reason (missing key,
+                              network/HTTP/JSON/timeout, broken config) the
+                              report is rejected. Never silently degrades to
+                              "pass".
   L3  honeypot              — fan the report out to a 3-model judge ensemble
                               (claude-haiku-4-5, gpt-4o-mini, gpt-4.1-mini)
                               across 6 canary scenarios; if any judge gets
                               coerced into a bait-tool call or canary echo, fail
-  L4  judge                 — arbitration, ONLY for the disagreement case
-                              (lakera:prompt_attack OR exact quota pressure) +
+  L4  judge                 — arbitration, ONLY when the panel is FLAGGED
+                              (some vendor said prompt_attack) or
+                              DEGRADED_QUOTA (exact quota pressure) +
                               honeypot fully clean:
                               a cross-family panel must unanimously rule the
                               text "describes, not directs" to overturn the
@@ -48,7 +51,7 @@ from __future__ import annotations
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 
-from injection_scanner import decode, judge, lakera, secret_shapes, unicode_sanitize
+from injection_scanner import decode, judge, l2, secret_shapes, unicode_sanitize
 from injection_scanner.containment import QuarantineFieldsCoerced, QuarantineOnly
 from injection_scanner.honeypot import check as honeypot_check
 
@@ -62,27 +65,20 @@ from injection_scanner.honeypot import check as honeypot_check
 __all__ = [
     "QuarantineOnly",
     "Verdict",
-    "is_lakera_quota_degraded",
+    "l2_outcome",
     "scan",
     "scan_text",
 ]
 
 
-_LAKERA_QUOTA_REASONS = frozenset(
-    {
-        "lakera_unavailable:HTTPError:429",
-        "lakera_unavailable:throttled",
-    }
-)
+def l2_outcome(verdict: "Verdict") -> l2.Outcome | None:
+    """The L2 panel outcome recorded on `verdict`, or None.
 
-
-def is_lakera_quota_degraded(reason: object) -> bool:
-    """True only for the fixed Lakera quota-pressure vocabulary.
-
-    Exact membership is deliberate. No prefix matching, status parsing, or
-    provider text can turn another outage into the narrower degraded path.
+    None when the panel did not run (disabled, or an earlier layer rejected)
+    or the recorded summary is not one this package writes. Reads only the
+    closed `layers["l2"]` summary.
     """
-    return isinstance(reason, str) and reason in _LAKERA_QUOTA_REASONS
+    return l2.outcome_of(verdict.layers.get("l2"))
 
 
 # ---------- to_audit() allow-lists ----------
@@ -212,35 +208,36 @@ class Verdict(QuarantineFieldsCoerced):
 def scan(
     path: Path,
     use_honeypot: bool = True,
-    use_lakera: bool = True,
-    lakera_max_wait_s: float | None = None,
+    use_l2: bool = True,
+    l2_max_wait_s: float | None = None,
 ) -> Verdict:
     """Run all layers on the file at `path`. Returns a Verdict.
 
-    `use_honeypot` and `use_lakera` default to True and are kept only so
-    tests can force them off for unit runs that must not hit an external
-    API. In production call paths, callers should NOT pass these — the
-    honeypot and the Lakera gate are always on.
+    `use_honeypot` and `use_l2` default to True and are kept only so tests
+    can force them off for unit runs that must not hit an external API. In
+    production call paths, callers should NOT pass these — the honeypot and
+    the L2 panel are always on.
 
-    `lakera_max_wait_s` is how long the L2 call may wait for its turn in the
-    fleet-wide Lakera budget. `None` (the default) means "whatever
-    INJECTION_SCANNER_LAKERA_MAX_WAIT_S says", which is 0 — an interactive
-    scan refuses immediately rather than parking a report. Batch callers pass
-    a real budget so they queue instead of failing.
+    `l2_max_wait_s` is how long EACH L2 vendor may wait for its turn in that
+    vendor's fleet-wide budget; the vendors wait concurrently. `None` (the
+    default) means each vendor's `INJECTION_SCANNER_<VENDOR>_MAX_WAIT_S`,
+    which defaults to 0 — an interactive scan refuses immediately rather than
+    parking a report. Batch callers pass a real budget so they queue instead
+    of failing.
     """
     return scan_text(
         path.read_text(encoding="utf-8", errors="replace"),
         use_honeypot=use_honeypot,
-        use_lakera=use_lakera,
-        lakera_max_wait_s=lakera_max_wait_s,
+        use_l2=use_l2,
+        l2_max_wait_s=l2_max_wait_s,
     )
 
 
 def scan_text(
     raw: str,
     use_honeypot: bool = True,
-    use_lakera: bool = True,
-    lakera_max_wait_s: float | None = None,
+    use_l2: bool = True,
+    l2_max_wait_s: float | None = None,
 ) -> Verdict:
     """Run all layers on pre-read `raw` text. Returns a Verdict.
 
@@ -254,7 +251,7 @@ def scan_text(
     propagate. The exception *type name* lands in the reason — never
     `str(e)`, which can echo input bytes back to the caller.
 
-    `lakera_max_wait_s` is passed straight to `lakera.check`; nothing here
+    `l2_max_wait_s` is passed straight to every L2 vendor; nothing here
     interprets it. See `scan` for what it means.
     """
     layers: dict[str, str] = {}
@@ -392,57 +389,57 @@ def scan_text(
             sanitized_text=san.text,
         )
 
-    # L2 lakera — hosted Lakera Guard classifier, wired as a fail-CLOSED GATE.
+    # L2 panel — hosted classifiers, wired as a fail-CLOSED GATE (l2.py).
     #
-    # Unlike an additive skip, this layer REJECTS on anything that isn't a
-    # clean pass: a flagged classification, a missing key, a broken `*_FILE`
-    # mount, or any network/HTTP/JSON/timeout error. lakera.check already
-    # collapses every one of those to ok=False with a flat reason (detector
-    # name / category label / exception type / bounded HTTP status only —
-    # never input bytes; see vendor_http.transport_reason), so
-    # the `if not res.ok` branch below quarantines both real detections and
-    # degraded-coverage outages. Silent degradation of a detection layer is
-    # exactly the failure operators must hear about.
+    # Every vendor's result lands in `layers` under its own name, plus the
+    # closed panel summary under `l2`. Reasons are closed vocabulary (fixed
+    # labels, exception TYPE names, bounded HTTP status — never input bytes;
+    # see vendor_http.transport_reason).
     #
-    # The `use_lakera=False` path is used by unit tests / deterministic
-    # measurement runs that must not depend on a live key or hit the network.
-    lakera_deferred = False
-    if use_lakera:
-        res = lakera.check(san.text, max_wait_s=lakera_max_wait_s)
-        layers["lakera"] = res.reason
-        if not res.ok:
-            if (
-                res.reason == "lakera:prompt_attack"
-                or is_lakera_quota_degraded(res.reason)
-            ) and use_honeypot:
-                # DEFER, don't deliver: a definite prompt_attack or an exact
-                # quota-pressure result with the behavioral honeypot available
-                # enters L4 arbitration instead of rejecting unilaterally.
-                # Measured 2026-07-28: the unilateral prompt-attack gate
-                # false-positived on benign research prose ABOUT agent
-                # tooling and injection attacks (4/9 fp_* corpus cases,
-                # honeypot clean on all 9), quarantining legitimate
-                # research-agent reports. The report is still rejected
-                # unless the honeypot comes back fully clean AND the
-                # cross-family judge panel unanimously rules "describes,
-                # not directs" (see judge.py).
-                #
-                # Everything else stays a hard reject: service failures,
-                # malformed/incomplete responses, credential/config errors,
-                # and limiter errors. With the honeypot off there is no
-                # corroborating signal, so both prompt-attack and quota
-                # outcomes stay hard rejects.
-                lakera_deferred = True
-            else:
-                return Verdict(
-                    ok=False,
-                    reason=res.reason,
-                    layers=layers,
-                    sanitize_stats=asdict(san),
-                    sanitized_text=san.text,
-                )
+    # FLAGGED or DEGRADED_QUOTA with the honeypot on DEFERS to L3 + L4 rather
+    # than rejecting unilaterally. Measured 2026-07-28: a unilateral
+    # prompt-attack gate false-positived on benign research prose ABOUT agent
+    # tooling and injection attacks (4/9 fp_* corpus cases, honeypot clean on
+    # all 9). The report is still rejected unless the honeypot comes back
+    # fully clean AND the cross-family judges unanimously rule "describes,
+    # not directs" (judge.py). With the honeypot off there is no
+    # corroborating signal, so both stay hard rejects with the panel reason.
+    # UNAVAILABLE (a non-quota shortfall below the floor) always rejects.
+    #
+    # The panel catches adapter exceptions itself (Invariant 3); this guard
+    # covers the panel's own machinery (thread pool, floor parsing).
+    #
+    # `use_l2=False` is for unit tests / deterministic measurement runs that
+    # must not depend on live keys or hit the network.
+    l2_deferred = False
+    if use_l2:
+        try:
+            panel = l2.run(san.text, max_wait_s=l2_max_wait_s)
+        except Exception as e:
+            layers["l2"] = f"unhandled:{type(e).__name__}"
+            return Verdict(
+                ok=False,
+                reason=f"l2_unavailable:unhandled:{type(e).__name__}",
+                layers=layers,
+                sanitize_stats=asdict(san),
+                sanitized_text=san.text,
+            )
+        for vendor, result in panel.results.items():
+            layers[vendor] = result.reason
+        layers["l2"] = panel.summary
+        arbitrable = (l2.Outcome.FLAGGED, l2.Outcome.DEGRADED_QUOTA)
+        if panel.outcome in arbitrable and use_honeypot:
+            l2_deferred = True
+        elif panel.outcome is not l2.Outcome.PASS:
+            return Verdict(
+                ok=False,
+                reason=panel.reason,
+                layers=layers,
+                sanitize_stats=asdict(san),
+                sanitized_text=san.text,
+            )
     else:
-        layers["lakera"] = "disabled (test-only)"
+        layers["l2"] = "disabled (test-only)"
 
     # L3 honeypot. Always runs in production.
     #
@@ -503,11 +500,11 @@ def scan_text(
                 honeypot_api_errors=hp_api_errors,
             )
 
-        # L4 judge — arbitration after a Lakera prompt-attack flag or exact
+        # L4 judge — arbitration after an L2 prompt-attack flag or exact
         # quota pressure, with a fully clean honeypot. Fail-closed like every
         # other layer: a judge outage, malformed verdict, or one "attack" vote
         # rejects. Only a unanimous cross-family "benign" verdict proceeds.
-        if lakera_deferred:
+        if l2_deferred:
             try:
                 jr = judge.check(san.text)
             except Exception as e:
@@ -526,7 +523,7 @@ def scan_text(
             if not (jr.ok and jr.reason == "benign-unanimous"):
                 return Verdict(
                     ok=False,
-                    reason=f"lakera_arbitration:{jr.reason}",
+                    reason=f"l2_arbitration:{jr.reason}",
                     layers=layers,
                     sanitize_stats=asdict(san),
                     sanitized_text=san.text,

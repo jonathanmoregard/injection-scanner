@@ -8,9 +8,9 @@ Layered prompt-injection / secret-exfil scanner. Extracted from `research-agent`
 |------|-------|---------|
 | L0 | `unicode_sanitize` | Strip covert channels (zero-width, bidi, tag-block), NFKC normalize, flag anomalous density. |
 | L1b | `secret_shapes` | High-precision API key / JWT / PEM patterns. |
-| L2 | `lakera` | Hosted Lakera Guard prompt-injection classifier, wired fail-closed. Exact quota pressure may defer to L3/L4; every other failure rejects. Paced fleet-wide — see [Lakera rate limiting](#lakera-rate-limiting). |
+| L2 | `l2` panel: `lakera`, `model_armor` | Hosted prompt-injection classifiers (Lakera Guard, Google Model Armor), run concurrently, wired fail-closed against a verdict floor — see [L2 panel](#l2-panel). Each vendor is paced fleet-wide — see [Lakera rate limiting](#lakera-rate-limiting). |
 | L3 | `honeypot` | Run the report past a 3-model judge ensemble (`claude-haiku-4-5`, `gpt-4o-mini`, `gpt-4.1-mini`) across six canary scenarios — two scenarios per model. If any judge gets coerced into calling a bait tool, echoing a canary via a legitimate tool argument, or surfacing one in freeform text, the report is rejected. |
-| L4 | `judge` | Arbitration when Lakera says `prompt_attack` or reports exact quota pressure and the honeypot is fully clean: a cross-family panel must unanimously rule the text "describes, not directs" before delivery. |
+| L4 | `judge` | Arbitration when the L2 panel is `flagged` or `degraded-quota` and the honeypot is fully clean: a cross-family panel must unanimously rule the text "describes, not directs" before delivery. |
 
 L1a (regex) was retired (legit research output false-positived); wrap-escape protection moved to the consumer's delivery boundary.
 
@@ -27,6 +27,28 @@ L3 honeypot environment requirements (fail-closed if any are missing):
 
 A missing key surfaces as `honeypot_unavailable:<scenario>:unavailable:no-<provider>-api-key+skipped=N/6` in the Verdict. Per the fail-closed contract, that quarantines every report until the key is restored. Keys may live in env OR in the local secret store under `app=research-agent, key={anthropic,openai}-api-key`.
 
+## L2 panel
+
+`l2.run()` sends the text to every vendor in the registry, in fixed order `lakera`, `model_armor`, **concurrently**: wall time is the slowest vendor's wait, not the sum. Each vendor answers a verdict (`pass`, `<vendor>:prompt_attack`) or a shortfall (`<vendor>_unavailable:<condition>`). The floor is `INJECTION_SCANNER_L2_MIN_VERDICTS` (default `2`, clamped to `[1, number of vendors]`).
+
+| Outcome (`layers["l2"]`) | When | What `scan_text` does |
+|---|---|---|
+| `pass` | verdicts ≥ floor, none flagged | continue to L3 |
+| `flagged` | verdicts ≥ floor, any `prompt_attack` | honeypot on: L3 + strict L4 arbitration; off: reject with the first flag |
+| `degraded-quota` | verdicts < floor, every shortfall quota-class | honeypot on: L3 + strict L4 arbitration; off: reject with the first shortfall |
+| `unavailable` | verdicts < floor, any other shortfall | reject with the first non-quota shortfall (registry order) |
+
+Quota-class is exact membership in `<vendor>_unavailable:HTTPError:429` and `<vendor>_unavailable:throttled` for that vendor — no prefix matching. Unparseable or unexpected results are shortfalls, never passes. `layers["lakera"]` and `layers["model_armor"]` carry each vendor's reason; `layers["l2"]` is the closed summary, e.g. `pass verdicts=2/2 floor=2` or `degraded-quota verdicts=1/2 floor=2`, readable with `intercept.l2_outcome(verdict)`. An exception inside an adapter becomes `<vendor>_unavailable:unhandled:<ExcType>`; a result outside the vendor's own vocabulary becomes `<vendor>_unavailable:bad-result`. `l2_max_wait_s` applies to each vendor, concurrently.
+
+| Reason | Meaning |
+|---|---|
+| `model_armor:prompt_attack` | Model Armor flagged the text. |
+| `model_armor_unavailable:no-key` | `MODEL_ARMOR_CREDENTIALS_FILE` unset. |
+| `model_armor_unavailable:not-implemented` | A credential is set, but the adapter's transport is not implemented yet. |
+| `<vendor>_unavailable:bad-result` | An adapter returned something outside its closed vocabulary. |
+| `l2_unavailable:unhandled:<ExcType>` | The panel machinery itself failed. |
+| `l2_arbitration:<judge reason>` | L4 arbitration after `flagged` / `degraded-quota` did not return `benign-unanimous`. |
+
 ## Lakera rate limiting
 
 Lakera Guard is called from one function, `lakera.check()`, by several independent processes that share ONE Lakera account. Measured 2026-09-05: from ~15:00 local, Lakera answered HTTP 429 to roughly three of every four calls — about one success per 4–5 minutes fleet-wide, regardless of how many attempts were made — because every caller retried on its own schedule and no process could see what any other had done.
@@ -39,9 +61,9 @@ Lakera Guard is called from one function, `lakera.check()`, by several independe
 | research-agent degraded recheck | same as a boot smoke — it calls `run_smoke()` too | same |
 | research-agent per-report scan | 1 per `research()` / `retry_research()` | the shared limiter; refuses immediately unless the caller passes a wait budget |
 | CI `smoke` job (`live-eval.yml`) | 1 per run — nightly, or on dispatch | runner-local limiter at 60 s / burst 2, inside the `lakera-live` concurrency group |
-| CI `eval` job (`live-eval.yml`) | 16, plus up to 2 re-scans per disagreeing case | same, plus `--lakera-max-wait 1800` and `needs: smoke` |
+| CI `eval` job (`live-eval.yml`) | 16, plus up to 2 re-scans per disagreeing case | same, plus `--l2-max-wait 1800` and `needs: smoke` |
 | per-push CI (`ci.yml`) | 0 | hermetic — no vendor call, no secret |
-| ad-hoc local `eval` runs | 16+ | the shared limiter, `--lakera-max-wait` default 900 |
+| ad-hoc local `eval` runs | 16+ | the shared limiter, `--l2-max-wait` default 900 |
 
 `injection_scanner/throttle.py` is the shared memory they were missing: one token bucket plus one circuit breaker in a JSON file under the cache directory, every operation a read-modify-write under an exclusive `flock`. With N processes sharing the file, at most `burst + elapsed / min_interval_s` calls reach Lakera in any window of length `elapsed`, and zero while the breaker is open. **N does not appear in the bound**, so adding a pane or a CI runner cannot raise the ceiling.
 
@@ -63,7 +85,9 @@ Every limit is an input. There is no on/off switch: "off" is `MIN_INTERVAL_S=0` 
 
 **What the defaults rest on (measured 2026-09-06).** Lakera publishes exactly one limit: the Community plan's **10,000 requests per month** — 13.9 per hour, one every 4.3 minutes. That equals the trickle measured through the 2026-09-05 throttle (one success per 4–5 minutes fleet-wide, regardless of how many attempts were made), which is what identifies the monthly quota rather than some unpublished QPS ceiling as the thing the fleet was hitting. Overnight, 25 calls in 30 minutes were accepted before ~40 minutes of 429s, so Lakera's own bucket is roughly 25–50 deep with a slow refill. The defaults sit under that: 12 calls/hour sustained, a burst of 10 so one multi-pane session restore passes, and a breaker that waits minutes rather than seconds because recovery was observed to take tens of them. The plan tier is visible only on the Lakera dashboard; on a paid tier every knob loosens via environment, and the algorithm does not change.
 
-Batch callers pass a wait budget instead of being refused: `scan(..., lakera_max_wait_s=900)`, `scan_text(..., lakera_max_wait_s=900)`, or `python -m injection_scanner.eval ... --lakera-max-wait 900` (which is already the eval default, because eval is always a batch caller).
+Every vendor has the same knobs under its own prefix — `INJECTION_SCANNER_MODEL_ARMOR_MIN_INTERVAL_S` and so on, plus `_TIMEOUT` — with the same defaults and clamps, and its own state file (`model_armor-throttle.json`). One vendor's 429 opens only that vendor's breaker.
+
+Batch callers pass a wait budget instead of being refused: `scan(..., l2_max_wait_s=900)`, `scan_text(..., l2_max_wait_s=900)`, or `python -m injection_scanner.eval ... --l2-max-wait 900` (which is already the eval default, because eval is always a batch caller). The budget applies to each vendor.
 
 **The cache directory is a shared, single-uid resource.** `INJECTION_SCANNER_CACHE_DIR` must name an ABSOLUTE path — `~` is shell syntax, and a relative path resolves per process, so every process would find its own full bucket and pace itself against nobody. A value that is not absolute after expansion falls back to the default, the same way an out-of-range number falls back to its clamp. If `HOME` cannot be resolved at all (a scratch container, `docker run --user 1234`, some CI runners), the fallback is `<tempdir>/injection-scanner-<uid>` — absolute and per-uid, not durable across reboots, which costs one reset bucket.
 
@@ -100,7 +124,7 @@ What a stale cached pass can hide is an outage that began within the TTL. The se
 
 ### Quota fallback and fixed reasons
 
-These are fixed literals from a closed vocabulary and carry no data. `HTTPError:429` and local `throttled` are the only outcomes eligible for degraded arbitration: they still reject unless all strict honeypot scenarios pass and the cross-family judge returns `benign-unanimous`. Disabling the honeypot keeps them as hard rejections. Every other `lakera_unavailable:*` remains a hard rejection.
+These are fixed literals from a closed vocabulary and carry no data. `HTTPError:429` and local `throttled` are the only quota-class shortfalls: a panel short of its floor only through them is `degraded-quota` (see [L2 panel](#l2-panel)), which still rejects unless all strict honeypot scenarios pass and the cross-family judge returns `benign-unanimous`. Disabling the honeypot keeps it a hard rejection. Every other `lakera_unavailable:*` below the floor is a hard rejection. The same conditions exist for every vendor under its own prefix.
 
 | Reason | Meaning |
 |---|---|
@@ -117,7 +141,7 @@ The key can be sent only to the canonical Guard destination, `https://api.lakera
 
 ### CI: a hermetic merge gate, live checks on a schedule
 
-Per-push CI calls no external service. `.github/workflows/ci.yml` runs only the deterministic suite on Python 3.12 and 3.13 — no Lakera, no Anthropic, no OpenAI, no secrets — so a pull request cannot go red because a vendor is down or throttled, and it works unchanged on a fork. Pytest installs a project-wide socket embargo before collection and keeps it through fixture finalizers: IPv4 and IPv6 sockets are forbidden, Unix sockets remain available, and command-line, marker and fixture escape hatches are rejected. Offline coverage does not shrink: `tests/test_judge.py` drives the real Anthropic/OpenAI SDKs over a stub transport (which is what caught the 1.x `temperature` signature break), while `tests/test_lakera.py` exercises request construction, proxy/redirect policy, bounded reads, JSON decoding and the strict response contract using only in-process `_post`, transport and `OpenerDirector` doubles — never loopback or a real endpoint.
+Per-push CI calls no external service. `.github/workflows/ci.yml` runs only the deterministic suite on Python 3.12 and 3.13 — no Lakera, no Anthropic, no OpenAI, no secrets — so a pull request cannot go red because a vendor is down or throttled, and it works unchanged on a fork. Pytest installs a project-wide socket embargo before collection and keeps it through fixture finalizers: IPv4 and IPv6 sockets are forbidden, Unix sockets remain available, and command-line, marker and fixture escape hatches are rejected. Offline coverage does not shrink: `tests/test_judge.py` drives the real Anthropic/OpenAI SDKs over a stub transport (which is what caught the 1.x `temperature` signature break), while `tests/test_lakera.py` exercises request construction, proxy/redirect policy, bounded reads, JSON decoding and the strict response contract using only in-process `vendor_http._post`, transport and `OpenerDirector` doubles — never loopback or a real endpoint.
 
 The live evaluation is an operational/scheduled workflow, not part of pytest or the merge gate. It lives in `.github/workflows/live-eval.yml` and runs **nightly at 03:17 UTC and on demand**:
 
@@ -132,7 +156,7 @@ The relations inside `live-eval.yml` are asserted by `tests/test_ci_relations.py
 
 - One workflow-level concurrency group, `lakera-live`, with `cancel-in-progress: false` — at most one live run at a time, queued rather than dropped. Deliberately **not** keyed on the ref: a branch dispatch and the nightly on `main` draw on the same Lakera account, so they must queue rather than overlap.
 - `eval` needs `smoke`. The 1-call smoke is the canary for the 16-call eval: a Lakera outage costs one call, not seventeen.
-- Both jobs set `INJECTION_SCANNER_LAKERA_MIN_INTERVAL_S=60` **and** `INJECTION_SCANNER_LAKERA_BURST=2`. A runner's cache directory is fresh every run, so its limiter is a separate domain drawing on the same account: it has to pace itself, and it must never be allowed the fleet's burst of 10 — a bucket that starts full looks paced until ten calls leave at once. `eval` also passes `--lakera-max-wait 1800`, so it queues for its turn instead of being refused mid-corpus.
+- Both jobs set `INJECTION_SCANNER_LAKERA_MIN_INTERVAL_S=60` **and** `INJECTION_SCANNER_LAKERA_BURST=2`. A runner's cache directory is fresh every run, so its limiter is a separate domain drawing on the same account: it has to pace itself, and it must never be allowed the fleet's burst of 10 — a bucket that starts full looks paced until ten calls leave at once. `eval` also passes `--l2-max-wait 1800`, so it queues for its turn instead of being refused mid-corpus.
 - Both are time-bounded (10 and 45 minutes): 16 cases at 60 s pacing is ~15 minutes of waiting before any confirmation re-scans, and a hanging job would hold `lakera-live` and block the next night's run.
 - The guard test also asserts that `ci.yml` contains no `secrets.` reference anywhere — a negative over the whole file, so a job nobody anticipated cannot put a vendor call back on the merge gate.
 

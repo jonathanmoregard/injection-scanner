@@ -190,8 +190,8 @@ def test_every_live_job_paces_itself() -> None:
 
 def test_the_eval_job_waits_for_its_turn_instead_of_being_refused() -> None:
     """Without a wait budget, a paced eval is REFUSED mid-corpus rather than
-    queued, and `--lakera-max-wait` is what turns each refusal into a wait."""
-    assert "--lakera-max-wait" in _run_commands(_load(LIVE)["jobs"]["eval"])
+    queued, and `--l2-max-wait` is what turns each refusal into a wait."""
+    assert "--l2-max-wait" in _run_commands(_load(LIVE)["jobs"]["eval"])
 
 
 def test_both_live_jobs_are_time_bounded() -> None:

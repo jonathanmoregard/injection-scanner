@@ -29,17 +29,30 @@ _SKIPPED = re.compile(r"\+skipped=([0-9]{1,2})/([0-9]{1,2})\Z")
 _SCENARIO_MODEL = {s["name"]: (s["provider"], s["model"]) for s in ALL_SCENARIOS}
 _JUDGE_MODEL = {j["id"]: (j["provider"], j["model"]) for j in _JUDGES}
 
-# Lakera conditions with a fixed meaning (see lakera.check and the README's
-# reason table). Anything else after `lakera_unavailable:` is a transport
-# exception type, optionally followed by an HTTP status.
-_LAKERA_FIXED = {
-    "no-key": "no API key (set LAKERA_API_KEY or LAKERA_API_KEY_FILE)",
-    "key-config-error": "API key configuration error (LAKERA_API_KEY_FILE unreadable or malformed)",
-    "url-config-error": "endpoint configuration error (only https://api.lakera.ai/v2/guard is allowed)",
+# L2 vendor conditions with a fixed meaning (see vendor_http.paced_post, l2.py,
+# each adapter's `check`, and the README's reason table). Anything else after
+# `<vendor>_unavailable:` is a transport exception type, optionally followed
+# by an HTTP status.
+_PANEL_FIXED = {
     "throttled": "local fleet budget exhausted or quota breaker open (throttled)",
     "service-unavailable": "service breaker open after HTTP 503",
     "limiter-error": "shared limiter unusable (cache directory, lock or IO error)",
-    "bad-response": "unreadable or malformed Guard response",
+    "bad-result": "adapter result outside its closed vocabulary",
+}
+_VENDOR_FIXED = {
+    "lakera": {
+        **_PANEL_FIXED,
+        "no-key": "no API key (set LAKERA_API_KEY or LAKERA_API_KEY_FILE)",
+        "key-config-error": "API key configuration error (LAKERA_API_KEY_FILE unreadable or malformed)",
+        "url-config-error": "endpoint configuration error (only https://api.lakera.ai/v2/guard is allowed)",
+        "bad-response": "unreadable or malformed Guard response",
+    },
+    "model_armor": {
+        **_PANEL_FIXED,
+        "no-key": "no credential (set MODEL_ARMOR_CREDENTIALS_FILE)",
+        "not-implemented": "adapter not implemented yet",
+        "bad-response": "unreadable or malformed Model Armor response",
+    },
 }
 
 
@@ -116,14 +129,17 @@ def _judge(rest: str) -> str:
     return f"judge: {_seg(parts[0])}"
 
 
-def _lakera(rest: str) -> str:
-    if rest in _LAKERA_FIXED:
-        return f"lakera: {_LAKERA_FIXED[rest]}"
+def _vendor(vendor: str, rest: str) -> str:
+    fixed = _VENDOR_FIXED[vendor]
+    if rest in fixed:
+        return f"{vendor}: {fixed[rest]}"
     parts = rest.split(":")
+    if parts[0] == "unhandled":
+        return f"{vendor}: {_provider_signal(parts)}"
     exc = _seg(parts[0])
     if len(parts) > 1:
-        return f"lakera: {_status_text(parts[1])} ({exc})"
-    return f"lakera: transport error ({exc})"
+        return f"{vendor}: {_status_text(parts[1])} ({exc})"
+    return f"{vendor}: transport error ({exc})"
 
 
 def describe(reason: str) -> str:
@@ -131,11 +147,13 @@ def describe(reason: str) -> str:
     if not isinstance(reason, str) or not reason:
         return "unknown failure"
     head, _, rest = reason.partition(":")
-    if head == "lakera_unavailable":
-        return _lakera(rest)
-    if head == "lakera":
-        return f"lakera: flagged the benign probe ({_seg(rest)})"
-    if head == "lakera_arbitration":
+    for vendor in _VENDOR_FIXED:
+        if head == f"{vendor}_unavailable":
+            return _vendor(vendor, rest)
+        if head == vendor:
+            label = rest if rest == "prompt_attack" else "other"
+            return f"{vendor}: flagged the benign probe ({label})"
+    if head == "l2_arbitration":
         return _judge(rest)
     if head == "judge_unavailable":
         return f"judge: {_provider_signal(rest.split(':'))}"

@@ -67,18 +67,19 @@ _VALID = {BLOCK, PASS}
 # ---------------------------------------------------------------------------
 
 # The head segment of every layer outage reason: `lakera_unavailable`,
+# `model_armor_unavailable`, `l2_unavailable`,
 # `honeypot_unavailable`, `judge_unavailable`, `unicode_sanitize_unavailable`,
 # `secret_shapes_unavailable`.
 _INFRA_REASON_HEAD_SUFFIX = "_unavailable"
 
 # Reason prefixes that WRAP another layer's reason. `intercept.py` re-emits
 # the honeypot's own result reason under `honeypot:` and the L4 judge's under
-# `lakera_arbitration:`, so a genuine outage arrives one segment deeper than
+# `l2_arbitration:`, so a genuine outage arrives one segment deeper than
 # it was raised. An explicit set rather than "look at segment 1 too", so that
 # `secret_shape:thing_unavailable` — a rule NAME that merely ends in the
 # suffix — cannot be mistaken for an outage. Pinned by
 # `tests/test_eval.py::test_a_detection_that_merely_ends_in_the_suffix_still_scores`.
-_INFRA_WRAPPER_PREFIXES = frozenset({"honeypot", "lakera_arbitration"})
+_INFRA_WRAPPER_PREFIXES = frozenset({"honeypot", "l2_arbitration"})
 
 # Standalone setup codes. Today they only appear as the tail of
 # `lakera_unavailable:<code>`; listed so a future call site emitting one bare
@@ -421,9 +422,9 @@ def evaluate(
     cases: list[EvalCase],
     *,
     use_honeypot: bool = False,
-    use_lakera: bool = False,
+    use_l2: bool = False,
     confirm_disagreements: int = 0,
-    lakera_max_wait_s: float | None = None,
+    l2_max_wait_s: float | None = None,
 ) -> Scorecard:
     """Run scan_text over each case and score against expected labels.
 
@@ -433,9 +434,9 @@ def evaluate(
       FP = expected pass  & blocked (a false alarm)
       TN = expected pass  & passed
 
-    `use_lakera` defaults to False: the Lakera gate fails CLOSED without a
-    live key, so leaving it on would block every case in a keyless CI run.
-    Deterministic-layer measurement runs it off; pass True (with a key set)
+    `use_l2` defaults to False: the L2 panel fails CLOSED without live
+    vendor keys, so leaving it on would block every case in a keyless run.
+    Deterministic-layer measurement runs it off; pass True (with keys set)
     to score the hosted layer end-to-end.
 
     `confirm_disagreements=N` re-scans a case whose verdict disagrees with
@@ -455,8 +456,8 @@ def evaluate(
     single-shot numbers, because one scan per report is what production
     gets: the weakness is surfaced, not absorbed.
 
-    `lakera_max_wait_s` is how long each L2 call may queue for its turn in the
-    fleet-wide Lakera budget. A batch run would rather wait than be refused,
+    `l2_max_wait_s` is how long each L2 vendor call may queue for its turn in
+    that vendor's fleet-wide budget. A batch run would rather wait than be refused,
     which is the opposite of what an interactive scan wants — hence a
     parameter rather than a global.
 
@@ -480,8 +481,8 @@ def evaluate(
             verdict = scan_text(
                 case.text,
                 use_honeypot=use_honeypot,
-                use_lakera=use_lakera,
-                lakera_max_wait_s=lakera_max_wait_s,
+                use_l2=use_l2,
+                l2_max_wait_s=l2_max_wait_s,
             )
             if _is_infra_reason(verdict.reason):
                 # Stop the whole run, here, before this verdict is turned into
@@ -629,10 +630,10 @@ def _main(argv: list[str] | None = None) -> int:
         help="enable the honeypot layer (costs an API call per case)",
     )
     parser.add_argument(
-        "--use-lakera",
+        "--use-l2",
         action="store_true",
-        help="enable the Lakera Guard gate (requires LAKERA_API_KEY; fails "
-        "closed without one, blocking every case)",
+        help="enable the L2 vendor panel (requires every vendor's key; fails "
+        "closed without them, blocking every case)",
     )
     parser.add_argument(
         "--min-recall",
@@ -662,11 +663,11 @@ def _main(argv: list[str] | None = None) -> int:
         "reports the first-attempt numbers alongside. Default 0: single shot.",
     )
     parser.add_argument(
-        "--lakera-max-wait",
+        "--l2-max-wait",
         type=float,
         default=900.0,
         metavar="SECONDS",
-        help="how long each Lakera call may WAIT for its turn in the "
+        help="how long each L2 vendor call may WAIT for its turn in the "
         "fleet-wide budget before it is refused. An eval run is always a "
         "batch caller, so it queues rather than failing; the default is 900 "
         "(15 minutes). 0 refuses immediately, which is what an interactive "
@@ -674,7 +675,7 @@ def _main(argv: list[str] | None = None) -> int:
         "correct by default beats depending on the operator remembering.",
     )
     args = parser.parse_args(argv)
-    if not math.isfinite(args.lakera_max_wait) or args.lakera_max_wait < 0:
+    if not math.isfinite(args.l2_max_wait) or args.l2_max_wait < 0:
         # A typo must not be able to disguise itself as an outage. The limiter
         # clamps a negative or non-finite budget to 0.0 — refuse immediately —
         # so under fleet contention the first case would come back
@@ -683,15 +684,15 @@ def _main(argv: list[str] | None = None) -> int:
         # rejects `confirm_disagreements < 0`; this is the same treatment, and
         # exit 2 keeps a usage error out of the outage channel.
         parser.error(
-            f"--lakera-max-wait must be a finite number of seconds >= 0, got "
-            f"{args.lakera_max_wait!r}"
+            f"--l2-max-wait must be a finite number of seconds >= 0, got "
+            f"{args.l2_max_wait!r}"
         )
     if args.confirm_disagreements < 0:
         # `evaluate` raises ValueError on this, and that exception escaped
         # `_main` uncaught — which Python renders as exit 1, the code the
         # epilog reserves for "a threshold failed". A mistyped budget therefore
         # reported a recall regression. Rejected here at parse time instead,
-        # the same treatment `--lakera-max-wait` gets one branch up, so the
+        # the same treatment `--l2-max-wait` gets one branch up, so the
         # usage error leaves through the usage exit and costs no scan.
         parser.error(
             f"--confirm-disagreements must be an integer >= 0, got "
@@ -729,9 +730,9 @@ def _main(argv: list[str] | None = None) -> int:
         card = evaluate(
             cases,
             use_honeypot=args.use_honeypot,
-            use_lakera=args.use_lakera,
+            use_l2=args.use_l2,
             confirm_disagreements=args.confirm_disagreements,
-            lakera_max_wait_s=args.lakera_max_wait,
+            l2_max_wait_s=args.l2_max_wait,
         )
     except EvalInfraError as e:
         # Exit 3, distinct from 1 (a threshold failed) and 2 (argparse usage),

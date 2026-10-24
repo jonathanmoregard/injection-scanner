@@ -3,7 +3,7 @@
 Key-free and deterministic. `_scan_via_path` is replaced by a stub that COUNTS
 Phase 2 probes and answers them with a Verdict of the test's choosing, while
 DELEGATING the Phase 1 canary calls to the real function — those touch no
-network (`use_honeypot=False, use_lakera=False`) and are the thing several
+network (`use_honeypot=False, use_l2=False`) and are the thing several
 tests here assert still runs. The TTL clock is injected through
 `run_smoke(..., clock=...)`, so no test sleeps and no test waits.
 
@@ -82,7 +82,12 @@ def _verdict(ok: bool) -> Verdict:
         return Verdict(
             ok=True,
             reason="pass",
-            layers={"lakera": "pass", "honeypot": "pass"},
+            layers={
+            "lakera": "pass",
+            "model_armor": "pass",
+            "l2": "pass verdicts=2/2 floor=2",
+            "honeypot": "pass",
+        },
             sanitize_stats={},
             sanitized_text=smoke._BENIGN_PROBE,
         )
@@ -101,6 +106,8 @@ def _quota_fallback_verdict() -> Verdict:
         reason="pass",
         layers={
             "lakera": "lakera_unavailable:throttled",
+            "model_armor": "pass",
+            "l2": "degraded-quota verdicts=1/2 floor=2",
             "honeypot": "pass",
             "judge": "benign-unanimous",
         },
@@ -126,11 +133,11 @@ class _Probe:
         self.probes = 0
         self.canaries = 0
 
-    def __call__(self, payload, *, use_honeypot, use_lakera=True):
+    def __call__(self, payload, *, use_honeypot, use_l2=True):
         if not use_honeypot:
             self.canaries += 1
             return self._real(
-                payload, use_honeypot=use_honeypot, use_lakera=use_lakera
+                payload, use_honeypot=use_honeypot, use_l2=use_l2
             )
         self.probes += 1
         return self.verdict
@@ -300,7 +307,12 @@ def test_a_degraded_layer_is_not_cached_either(probe, cache_file, ttl):
     probe.verdict = Verdict(
         ok=True,
         reason="pass",
-        layers={"lakera": "skipped", "honeypot": "pass"},
+        layers={
+            "lakera": "lakera:prompt_attack",
+            "model_armor": "pass",
+            "l2": "flagged verdicts=2/2 floor=2",
+            "honeypot": "pass",
+        },
         sanitize_stats={},
         sanitized_text=smoke._BENIGN_PROBE,
     )
@@ -308,7 +320,8 @@ def test_a_degraded_layer_is_not_cached_either(probe, cache_file, ttl):
 
     with pytest.raises(smoke.SmokeFailure) as excinfo:
         _run(fake, log)
-    assert "lakera layer not 'pass'" in excinfo.value.reason
+    assert "l2 panel not 'pass'" in excinfo.value.reason
+    assert "lakera: flagged" in excinfo.value.reason
     assert not cache_file.exists()
 
 
@@ -329,15 +342,21 @@ def test_strict_quota_fallback_is_healthy_and_cached(probe, cache_file, ttl):
     [
         {
             "lakera": "lakera_unavailable:throttled",
+            "model_armor": "pass",
+            "l2": "degraded-quota verdicts=1/2 floor=2",
             "honeypot": "pass",
         },
         {
             "lakera": "lakera_unavailable:throttled",
+            "model_armor": "pass",
+            "l2": "degraded-quota verdicts=1/2 floor=2",
             "honeypot": "pass",
             "judge": "attack:openai_4o_mini",
         },
         {
             "lakera": "lakera_unavailable:service-unavailable",
+            "model_armor": "pass",
+            "l2": "unavailable verdicts=1/2 floor=2",
             "honeypot": "pass",
             "judge": "benign-unanimous",
         },
@@ -525,7 +544,12 @@ def test_the_cache_entry_carries_only_a_boolean_and_a_timestamp(
     probe.verdict = Verdict(
         ok=True,
         reason="pass",
-        layers={"lakera": "pass", "honeypot": "pass"},
+        layers={
+            "lakera": "pass",
+            "model_armor": "pass",
+            "l2": "pass verdicts=2/2 floor=2",
+            "honeypot": "pass",
+        },
         sanitize_stats={"stripped": "SENTINEL-DO-NOT-PERSIST"},
         sanitized_text="SENTINEL-DO-NOT-PERSIST",
     )
