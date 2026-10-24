@@ -442,10 +442,28 @@ def _load(name: str, data: bytes):
     return json.loads(text, object_pairs_hook=_unique_keys)
 
 
-def _strings(doc):
-    """Every string in a parsed document, mapping keys included. A container
-    reached twice is a YAML alias: lockfiles never use them, and expanding
-    them can explode, so that does not parse."""
+# Package-entry metadata that no npm-family package manager fetches from:
+# npm's `funding` (string, {type, url}, or a list of those), `deprecated`
+# messages (npm, pnpm) and `license`. Exempt only inside a package entry
+# (a mapping with `version` or `resolution`) and only in that shape, so a
+# package or dependency NAMED "funding" is still checked.
+_METADATA_KEYS = frozenset({"funding", "deprecated", "license"})
+
+
+def _metadata(entry: dict, key) -> bool:
+    if key not in _METADATA_KEYS or not ("version" in entry or "resolution" in entry):
+        return False
+    v = entry[key]
+    return all(isinstance(i, str) or (isinstance(i, dict) and set(i) <= {"type", "url"}
+                                      and all(isinstance(x, str) for x in i.values()))
+               for i in (v if isinstance(v, list) else [v]))
+
+
+def _strings(doc, skip_metadata: bool = False):
+    """Every string in a parsed document, mapping keys included (minus
+    npm-family package metadata if asked). A container reached twice is a
+    YAML alias: lockfiles never use them, and expanding them can explode,
+    so that does not parse."""
     seen: set[int] = set()
     stack = [doc]
     while stack:
@@ -456,7 +474,8 @@ def _strings(doc):
             seen.add(id(v))
             if isinstance(v, dict):
                 stack.extend(v.keys())
-                stack.extend(v.values())
+                stack.extend(x for k, x in v.items()
+                             if not (skip_metadata and _metadata(v, k)))
             else:
                 stack.extend(v)
         elif isinstance(v, bytes):  # YAML !!binary: a JS consumer stringifies it
@@ -617,7 +636,7 @@ def _findings(name: str, data: bytes, allowed: frozenset[str]) -> Counter:
     doc = _load(name, data)
     npm = name in _NPM_LOCKS
     bad: Counter = Counter()
-    for s in _strings(doc):
+    for s in _strings(doc, skip_metadata=npm):
         if _CONTROL.search(s):
             bad[MULTI_LINE] += 1
         # Berry percent-encodes locators inside locators

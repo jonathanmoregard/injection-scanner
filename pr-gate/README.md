@@ -71,6 +71,9 @@ the base branch). In order, failing closed at every step:
      and every fetch slot (npm `resolved`, pnpm `resolution`, bun and yarn
      Berry `name@spec` entries, yarn v1 `resolved`) must be an https URL
      or a local relative path, so a bare `owner/repo#sha` there is a hit.
+     A package entry's `funding`, `deprecated` and `license` fields are
+     metadata nothing fetches from (sponsor links, deprecation messages)
+     and are not checked.
      **Never overridable.**
    - a file git treats as binary (so no model and no other check can see
      it) that is not a known binary type: a text file with a NUL byte (`.js`,

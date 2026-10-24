@@ -3,6 +3,8 @@ from __future__ import annotations
 
 import _prgate  # noqa: F401
 
+import json
+
 import pytest
 
 from prgate import checks
@@ -1056,6 +1058,54 @@ def test_workspace_catalog_and_local_entries_are_not_hits(path, text):
 def test_a_bun_registry_entry_must_name_an_https_tarball():
     text = _BUN_LOCK.replace('"ws@8.17.0", ""', '"ws@8.17.0", "atk/ws#0123abc"')
     assert lock_hits("bun.lock", text) != []
+
+
+_DEPRECATED = ("Please upgrade to version 7 or higher. Older versions may use Math.random() "
+               "in certain circumstances. See https://v8.dev/blog/math-random for details.")
+
+
+def _npm_entry(**extra):
+    entry = {"version": "1.0.0", "resolved": "https://registry.npmjs.org/a/-/a-1.0.0.tgz",
+             "integrity": "sha512-AbC=", "license": "MIT", **extra}
+    return json.dumps({"lockfileVersion": 3, "packages": {"node_modules/a": entry}})
+
+
+@pytest.mark.parametrize("extra", [
+    {"funding": {"url": "https://github.com/sponsors/ljharb"}},
+    {"funding": {"type": "opencollective", "url": "https://opencollective.com/x"}},
+    {"funding": [{"type": "github", "url": "https://github.com/sponsors/x"},
+                 "https://tidelift.com/funding/x"]},
+    {"funding": "https://patreon.com/x"},
+    {"deprecated": _DEPRECATED},
+    {"license": "SEE LICENSE IN https://example.com/license"},
+])
+def test_npm_metadata_urls_are_not_fetched_so_not_hits(extra):
+    assert lock_hits("package-lock.json", _npm_entry(**extra)) == []
+
+
+def test_pnpm_deprecated_message_urls_are_not_hits():
+    text = _PNPM_LOCK.replace("    engines: {node: '>=10.0.0'}\n",
+                              f"    engines: {{node: '>=10.0.0'}}\n    deprecated: '{_DEPRECATED}'\n")
+    assert "deprecated:" in text and lock_hits("pnpm-lock.yaml", text) == []
+
+
+@pytest.mark.parametrize("text", [
+    _npm_entry(resolved="https://github.com/sponsors/ljharb"),
+    _npm_entry(homepage="https://github.com/sponsors/ljharb"),     # not a metadata key
+    # "funding" as a package NAME (lockfile v1) is a package entry, not metadata.
+    json.dumps({"lockfileVersion": 1, "dependencies": {"funding": {
+        "version": "1.0.0", "resolved": "https://evil.example/funding.tgz"}}}),
+    # A dependency map holding a dep named "deprecated" is not a package entry.
+    json.dumps({"packages": {"": {"dependencies": {"deprecated": "https://evil.example/d.tgz"}}}}),
+])
+def test_the_same_urls_elsewhere_are_still_hits(text):
+    [hit] = lock_hits("package-lock.json", text)
+    assert (hit.rule, hit.overridable) == ("lockfile-host", False)
+
+
+def test_metadata_keys_are_exempt_only_in_npm_lockfiles():
+    text = '{"_meta": {"sources": []}, "default": {"a": {"version": "==1", "funding": "https://evil.example/"}}}'
+    assert lock_hits("Pipfile.lock", text) != []
 
 
 def test_a_hosted_git_spec_already_in_the_base_is_not_a_hit():

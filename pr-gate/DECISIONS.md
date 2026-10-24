@@ -319,6 +319,19 @@ it, each with the reason. Design: `docs/superpowers/specs/2026-10-24-pr-gate-des
     a local tarball dependency (`"resolved": "file:../x.tgz"`). `patch:`
     is safe because its inner (percent-encoded) locator is resolved as its
     own lockfile entry; the decoded form is checked as well.
+    **Metadata exempt from every string check** (npm family only): a
+    package entry's `funding` (a string, `{type, url}`, or a list of
+    those), `deprecated` (npm, pnpm) and `license`. No package manager
+    fetches from them, and npm 7+ writes sponsor URLs (github.com/sponsors,
+    opencollective, tidelift) and deprecation messages with links into
+    `package-lock.json`, so checking them made every dependency bump that
+    pulled in such a package an un-overridable hit. A small denylist of
+    keys, not a narrowing of the URL check to fetch slots: every other
+    string stays checked. The exemption needs both the place (a mapping
+    with `version` or `resolution`, i.e. a package entry) and the shape,
+    so a package or dependency NAMED `funding` or `deprecated` (a v1
+    `dependencies` entry, a dependency-map value) is still checked. Fetch
+    slots are checked structurally as well (below), unaffected.
     **Cost:** a legitimate git dependency in an npm-family lockfile is a
     non-overridable hit (it already was whenever a URL to github.com
     appeared, which npm usually writes). **Residual:** a fetch slot this
