@@ -155,18 +155,54 @@ def is_hidden(cp: int, profile: str = "prose") -> bool:
     return _classify(cp, profile == "code") is not None
 
 
+# Characters that take an emoji presentation selector in ordinary text
+# ("⚠️", "❤️", "✔️", "1️⃣"). Deliberately coarse: a lone selector after one of
+# these carries at most a bit, while GlassWorm-style payloads need long runs.
+_EMOJI_BASE_RANGES = (
+    (0x0023, 0x0023), (0x002A, 0x002A), (0x0030, 0x0039),  # keycap bases
+    (0x00A9, 0x00A9), (0x00AE, 0x00AE),
+    (0x203C, 0x203C), (0x2049, 0x2049), (0x2122, 0x2122), (0x2139, 0x2139),
+    (0x2194, 0x21AA), (0x231A, 0x23FF), (0x24C2, 0x24C2), (0x25AA, 0x25FE),
+    (0x2600, 0x27BF), (0x2934, 0x2935), (0x2B05, 0x2B55),
+    (0x3030, 0x3030), (0x303D, 0x303D), (0x3297, 0x3297), (0x3299, 0x3299),
+    (0x1F000, 0x1FAFF),
+)
+
+
+def _is_emoji_base(cp: int) -> bool:
+    return any(lo <= cp <= hi for lo, hi in _EMOJI_BASE_RANGES)
+
+
+def _is_variation_selector(cp: int) -> bool:
+    return 0xFE00 <= cp <= 0xFE0F or 0xE0100 <= cp <= 0xE01EF
+
+
+def _is_emoji_presentation(text: str, i: int) -> bool:
+    """True for a single U+FE0E/U+FE0F directly after an emoji base and not
+    followed by another variation selector — the normal way "⚠️" is spelled."""
+    if ord(text[i]) not in (0xFE0E, 0xFE0F) or i == 0:
+        return False
+    if not _is_emoji_base(ord(text[i - 1])):
+        return False
+    return i + 1 >= len(text) or not _is_variation_selector(ord(text[i + 1]))
+
+
 def find_hidden(text: str, profile: str = "code") -> list[tuple[int, int]]:
     """(index, code point) of every hidden code point in `text`.
 
     For callers that must BLOCK on any hit (the pr-gate) rather than strip:
     no density test and no minimum count, so a two-character payload is
-    reported.
+    reported. One exception under the code profile: a single emoji
+    presentation selector after an emoji base ("⚠️") is ordinary text, not a
+    covert channel, and blocking it would make every agent-written doc with
+    an emoji unmergeable.
     """
     _check_profile(profile)
     code = profile == "code"
     return [
         (i, ord(ch)) for i, ch in enumerate(text)
         if _classify(ord(ch), code) is not None
+        and not (code and _is_emoji_presentation(text, i))
     ]
 
 

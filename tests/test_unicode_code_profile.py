@@ -111,6 +111,29 @@ def test_find_hidden_reports_index_and_code_point_of_a_two_char_payload():
     assert us.find_hidden(line, "code") == [(11, 0xFE01), (12, 0xE0101)]
 
 
+@pytest.mark.parametrize("text", [
+    "\u26a0\ufe0f careful",          # warning sign
+    "done \u2714\ufe0f",            # heavy check mark at end of line
+    "\u2764\ufe0f",                 # heart, whole line
+    "1\ufe0f\u20e3 first",          # keycap
+    "\U0001f600\ufe0e text style",  # text presentation selector
+])
+def test_find_hidden_allows_a_single_emoji_presentation_selector(text):
+    assert us.find_hidden(text, "code") == []
+
+
+@pytest.mark.parametrize("text", [
+    "\u26a0\ufe0f\ufe0f",            # a second selector after the emoji
+    "\u26a0\ufe0f\U000e0101",        # selector followed by a supplement selector
+    "x\ufe0f",                      # selector after a non-emoji base
+    "\ufe0f",                       # selector with no base at all
+    'const s = "\ufe0f";',          # inside a string literal
+    "\u26a0" + "".join(chr(0xFE00 + i % 16) for i in range(40)),  # GlassWorm-style run
+])
+def test_find_hidden_still_reports_selectors_outside_a_lone_emoji_presentation(text):
+    assert us.find_hidden(text, "code") != []
+
+
 def test_find_hidden_with_prose_profile_misses_the_emoji_selector():
     line = 'const s = "\ufe01\U000e0101";'
     assert us.find_hidden(line, "prose") == [(12, 0xE0101)]
