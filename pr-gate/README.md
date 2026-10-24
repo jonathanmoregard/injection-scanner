@@ -25,8 +25,11 @@ the base branch). In order, failing closed at every step:
    with no model call, unless the gate's latest verdict on this PR is a pass
    of identical own changes (a pure "Update branch" merge from the base, or a
    reopen with nothing changed). Then the pass carries over.
-3. **Reroll guard.** If the gate already blocked this exact head, the model is
-   not asked again: the run passes only if `owner` approved that head commit.
+3. **Reroll guard.** If the gate already blocked this head, or the same own
+   changes at another head, the model is not asked again: the run passes only
+   if `owner` approved this head commit. A `github-actions[bot]`
+   REQUEST_CHANGES on the head without a valid gate marker must be dismissed
+   instead; an approval never clears it.
 4. **Deterministic checks** (any hit blocks):
    - hidden Unicode in added lines or file paths (`unicode_sanitize` strict
      `profile="code"`: invisible, bidi, tag, variation-selector, private-use,
@@ -84,7 +87,9 @@ Org repos need their own secret and ruleset.
   blocked head commit**, then **re-run** the failed `ai-gate` check. The
   re-run sees the approval and passes without a model call. Hidden-Unicode
   and lockfile-host hits cannot be cleared this way: fix the change. An
-  approval of an older commit does not count.
+  approval of an older commit does not count. If the check says a bot review
+  "without a valid gate marker requests changes", dismiss that review and
+  re-run: the gate then does a full model review.
 - **Pushes:** any push while auto-merge is on fails the gate. Disable and
   re-enable auto-merge to request a fresh review. Exception: "Update branch"
   (merging the base into the PR) passes on its own as long as the PR's own
