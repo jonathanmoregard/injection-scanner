@@ -70,6 +70,28 @@ def test_requirements_are_all_pinned_with_hashes():
     assert "anthropic" in names
 
 
+# Import name -> distribution name, where they differ.
+_DISTS = {"yaml": "pyyaml"}
+
+
+def test_every_third_party_import_of_the_gate_is_pinned():
+    # The tests run on the dev environment; only requirements.txt reaches
+    # the runner, so an unpinned import would fail only in the action.
+    import ast
+    import sys
+    text = (ROOT / "requirements.txt").read_text(encoding="utf-8")
+    pinned = {m.group(1).lower() for m in re.finditer(r"^([A-Za-z0-9_.-]+)==", text, re.M)}
+    imported = set()
+    for path in (ROOT / "prgate").glob("*.py"):
+        for node in ast.walk(ast.parse(path.read_text(encoding="utf-8"))):
+            if isinstance(node, ast.Import):
+                imported |= {a.name.split(".")[0] for a in node.names}
+            elif isinstance(node, ast.ImportFrom) and node.level == 0:
+                imported.add(node.module.split(".")[0])
+    third_party = imported - set(sys.stdlib_module_names) - {"injection_scanner", "__future__"}
+    assert {_DISTS.get(m, m) for m in third_party} <= pinned
+
+
 def test_caller_template_shape():
     wf = load("caller-example.yml")
     on = wf.get("on", wf.get(True))

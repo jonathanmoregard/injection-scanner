@@ -38,7 +38,7 @@ ACTIONS = ("auto_merge_enabled", "synchronize", "reopened")
 DIFF_LLM_CAP = 400_000        # bytes of diff the model passes may read
 DIFF_HARD_CAP = 5_000_000     # bytes of diff the deterministic checks will read
 CONTENTS_BUDGET = 400_000     # bytes of post-change file contents for Monitor B
-FILE_FETCH_CAP = 25_000_000   # per binary file (magic bytes + content hash)
+FILE_FETCH_CAP = 25_000_000   # per binary file (magic bytes + content hash) or lockfile
 _LOGIN = re.compile(r"^[A-Za-z0-9](?:[A-Za-z0-9-]{0,38})$")
 _SHA = re.compile(r"^[0-9a-f]{40}$")
 
@@ -93,6 +93,7 @@ class Gathered:
     files: list[FileChange]
     binaries: dict[str, bytes]
     own_hash: str
+    lockfiles: dict[str, checks.Lockfile]
 
 
 def gather(gh, base_oid: str, ev: Event) -> Gathered:
@@ -100,26 +101,49 @@ def gather(gh, base_oid: str, ev: Event) -> Gathered:
 
     Binary contents are fetched here because the hash needs them: the diff
     shows only "Binary files differ", which would let a binary change ride
-    a carried-over pass.
+    a carried-over pass. Parsed lockfiles are fetched whole, head and live
+    base, for the always-on lockfile check that every path runs.
     """
     diff_bytes = gh.diff(base_oid, ev.head_sha, DIFF_HARD_CAP)
-    return gather_from(diff_bytes, lambda path: gh.file_content(path, ev.head_sha, FILE_FETCH_CAP))
+    return gather_from(diff_bytes,
+                       lambda path: gh.file_content(path, ev.head_sha, FILE_FETCH_CAP),
+                       lambda f: _lockfile(gh, f, base_oid, ev.head_sha))
 
 
-def gather_from(diff_bytes: bytes, fetch_binary: Callable[[str], bytes]) -> Gathered:
+def _lockfile(gh, f: FileChange, base_oid: str, head: str) -> checks.Lockfile:
+    """Head and base contents; None where over the cap or (base) absent."""
+    try:
+        head_data = gh.file_content(f.path, head, FILE_FETCH_CAP)
+    except TooLarge:
+        head_data = None
+    try:
+        base_data = gh.file_content(f.old_path or f.path, base_oid, FILE_FETCH_CAP)
+    except TooLarge:
+        base_data = None
+    except GitHubError as e:
+        if e.status != 404:
+            raise
+        base_data = None
+    return checks.Lockfile(head_data, base_data)
+
+
+def gather_from(diff_bytes: bytes, fetch_binary: Callable[[str], bytes],
+                fetch_lockfile: Callable[[FileChange], checks.Lockfile]) -> Gathered:
     if len(diff_bytes) > DIFF_HARD_CAP:
         raise TooLarge("diff")
     diff_text = diff_bytes.decode("utf-8", errors="replace")
     files = parse(diff_text)
     binaries = {f.path: fetch_binary(f.path) for f in files if f.binary and f.status != "deleted"}
     digests = {p: hashlib.sha256(b).hexdigest() for p, b in binaries.items()}
-    return Gathered(diff_bytes, diff_text, files, binaries, own_changes_hash(files, digests))
+    lockfiles = {f.path: fetch_lockfile(f) for f in files if checks.parsed_lockfile(f)}
+    return Gathered(diff_bytes, diff_text, files, binaries, own_changes_hash(files, digests),
+                    lockfiles)
 
 
 def full_review(g: Gathered, cfg: Config, review_fn: ReviewFn,
                 fetch_contents: Callable[[], tuple[dict[str, str], list[str]]]) -> verdict.Result:
     """Step 6: every deterministic check, then the model passes."""
-    hits, scrutiny = checks.run_all(g.files, g.binaries, cfg.exceptions)
+    hits, scrutiny = checks.run_all(g.files, g.binaries, cfg.exceptions, g.lockfiles)
     passes: list[PassResult] = []
     if len(g.diff_bytes) > DIFF_LLM_CAP:
         hits.append(checks.Hit("too-large", "(whole diff)",
@@ -182,7 +206,8 @@ def _owner_dismissed(gh, ev: Event, owner: str, review_ids: list[int]) -> bool:
 
 
 def _always_on(g: Gathered, cfg: Config) -> verdict.Result:
-    hits, scrutiny = checks.run_all(g.files, g.binaries, cfg.exceptions, always_on_only=True)
+    hits, scrutiny = checks.run_all(g.files, g.binaries, cfg.exceptions, g.lockfiles,
+                                    always_on_only=True)
     return verdict.decide(hits, scrutiny, [], cfg.threshold)
 
 

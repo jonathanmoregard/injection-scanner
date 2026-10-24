@@ -6,15 +6,20 @@ override nor the `exceptions` input can turn them off. The other binary and
 path rules are owner-overridable, and the path rule can be downgraded per
 repo to "extra scrutiny".
 
-Everything here is pure: diff in, hits out. Fetching lives in core.py.
+Everything here is pure: diff (and fetched contents) in, hits out.
+Fetching lives in core.py.
 """
 from __future__ import annotations
 
 import fnmatch
+import json
 import re
+import tomllib
+from collections import Counter
 from dataclasses import dataclass
 from pathlib import PurePosixPath
 
+import yaml
 from injection_scanner.unicode_sanitize import find_hidden
 
 from .diffparse import FileChange
@@ -202,6 +207,12 @@ def sensitive_paths(files: list[FileChange], exceptions: list[str]) -> tuple[lis
 
 
 # ----- lockfile hosts --------------------------------------------------------
+#
+# JSON, TOML and YAML lockfiles are PARSED, head and base, and every string
+# in them is checked: re-implementing their string folding line by line
+# (block scalars, blank lines, continuations) kept losing. Formats without
+# multi-line strings (requirements*.txt, Gemfile.lock, yarn v1) are checked
+# one added line at a time.
 
 _NPM = frozenset({"registry.npmjs.org", "registry.yarnpkg.com"})
 _PY = frozenset({"pypi.org", "files.pythonhosted.org"})
@@ -213,7 +224,13 @@ _LOCKFILES = {
     "flake.lock": frozenset({"github.com", "channels.nixos.org", "releases.nixos.org"}),
     "gemfile.lock": frozenset({"rubygems.org"}),
 }
+_JSON_LOCKS = frozenset({"package-lock.json", "npm-shrinkwrap.json", "pipfile.lock",
+                         "flake.lock", "bun.lock"})
+_TOML_LOCKS = frozenset({"cargo.lock", "uv.lock", "poetry.lock", "pdm.lock"})
+_YAML_LOCKS = frozenset({"pnpm-lock.yaml", "yarn.lock"})
 _REQUIREMENTS = re.compile(r"^(requirements|constraints)[\w.-]*\.txt$")
+# yarn's own test for its v1 format (Berry's LEGACY_REGEXP).
+_YARN_V1 = re.compile(r"(?:#.*\r?\n)*?#\s+yarn\s+lockfile\s+v1\r?\n", re.I)
 _OK_SCHEMES = frozenset({"https", "git+https", "registry+https", "sparse+https",
                          "git+ssh", "ssh"})
 # A URL is a scheme from a fixed set (http, https, ftp, ws, wss, git, ssh,
@@ -224,9 +241,19 @@ _OK_SCHEMES = frozenset({"https", "git+https", "registry+https", "sparse+https",
 _SCHEME = re.compile(r"(?<![A-Za-z0-9+.-])([A-Za-z][A-Za-z0-9+.-]*):")
 _KNOWN_SCHEME = re.compile(r"(?:\w+\+)?(?:https?|ftp|wss?|git|ssh)", re.I)
 _AUTHORITY = re.compile(r"(/*)([^/?#\s\"'`]*)")
-_FLAKE_TYPE = re.compile(r'"type"\s*:\s*"([^"]*)"')
-_FLAKE_HOST = re.compile(r'"host"\s*:\s*"([^"]*)"')
 _FLAKE_TYPES_OK = frozenset({"github", "git", "tarball", "file", "path", "indirect"})
+# No legitimate lockfile string holds a line break, a tab or another control
+# character; a URL with one is a different URL to WHATWG/rust-url.
+_CONTROL = re.compile(r"[\x00-\x1f\x7f-\x9f\u2028\u2029]")
+MULTI_LINE = "multi-line or control-character string"
+
+
+@dataclass(frozen=True)
+class Lockfile:
+    """Whole contents of a changed JSON/TOML/YAML lockfile, fetched by core.
+    head None: over the fetch cap. base None: not in the base (or too big)."""
+    head: bytes | None
+    base: bytes | None = None
 
 
 def _allowlist(path: str) -> frozenset[str] | None:
@@ -238,8 +265,15 @@ def _allowlist(path: str) -> frozenset[str] | None:
     return None
 
 
-# JSON / TOML / YAML double-quoted string escapes. Package managers decode
-# these before resolving a URL, so `https:\/\/evil` is a URL to them.
+def parsed_lockfile(f: FileChange) -> bool:
+    """A lockfile the check parses whole: core fetches its contents."""
+    return f.status != "deleted" and (PurePosixPath(f.path).name.casefold()
+                                      in _JSON_LOCKS | _TOML_LOCKS | _YAML_LOCKS)
+
+
+# JSON / TOML / YAML double-quoted string escapes, for the line-checked
+# formats: yarn v1 quotes JSON-style, and decoding is conservative for the
+# others. Package managers decode these before resolving a URL.
 _ESCAPE = re.compile(r"\\(u[0-9A-Fa-f]{4}|U[0-9A-Fa-f]{8}|x[0-9A-Fa-f]{2}|.)")
 _SIMPLE_ESCAPES = {"/": "/", "\\": "\\", '"': '"', "'": "'", "b": "\b", "f": "\f",
                    "n": "\n", "r": "\r", "t": "\t"}
@@ -290,12 +324,12 @@ def _odd_userinfo(scheme: str, netloc: str) -> bool:
 
 def _continues(line: str, pip: bool) -> bool:
     """The line ends in a backslash-newline continuation that can glue the
-    next line onto a URL ("https://registry.npmjs.org\\" + ".evil.x/p.tgz").
+    next line onto a URL ("https://pypi.org\\" + ".evil.x/simple").
 
-    YAML/TOML: an odd trailing backslash run (an even one is escaped
-    backslashes); TOML allows whitespace after it. pip joins on ANY trailing
-    backslash run, so parity does not matter there, but pip-compile's own
-    "pkg==1.0 \\" puts whitespace before it, which cannot glue a URL.
+    An odd trailing backslash run (an even one is escaped backslashes);
+    whitespace after it is ignored. pip joins on ANY trailing backslash run,
+    so parity does not matter there, but pip-compile's own "pkg==1.0 \\"
+    puts whitespace before it, which cannot glue a URL.
     """
     body = line.rstrip()
     n = len(body) - len(body.rstrip("\\"))
@@ -305,77 +339,165 @@ def _continues(line: str, pip: bool) -> bool:
     return n > 0 and prev != "" and not prev.isspace()
 
 
-def _bad_urls(text: str, allowed: frozenset[str], flake: bool) -> list[str]:
+def _bad_urls(text: str, allowed: frozenset[str]) -> list[str]:
+    # Parse the way npm/Node (WHATWG URL) does: tab/newline are stripped
+    # anywhere and a backslash is a path separator, so
+    # "https://evil\@registry.npmjs.org" goes to evil.
+    text = re.sub(r"[\t\n\r]", "", text).replace("\\", "/")
     bad = []
     for scheme, netloc in _urls(text):
         host = _host(netloc)
         if scheme.lower() not in _OK_SCHEMES or host not in allowed or _odd_userinfo(scheme, netloc):
             bad.append(f"{scheme.lower()}://{host}")
-    if flake:
-        for kind in _FLAKE_TYPE.findall(text):
-            if kind not in _FLAKE_TYPES_OK:
-                bad.append(f"flake input type {kind}")
-        for host in _FLAKE_HOST.findall(text):
-            if host.lower() not in allowed:
-                bad.append(f"flake host {host}")
     return bad
 
 
-def _indent(text: str) -> int:
-    return len(text) - len(text.lstrip(" "))
+def _line_hits(f: FileChange, allowed: frozenset[str]) -> list[Hit]:
+    pip = bool(_REQUIREMENTS.match(PurePosixPath(f.path).name.casefold()))
+    hits = []
+    for line_no, original in f.added:
+        text, undecoded = _decode_escapes(original)
+        bad = []
+        if _continues(original, pip):
+            bad.append("line continuation")
+        if undecoded and _SCHEMEISH.search(text):
+            bad.append("undecodable escape near a URL")
+        bad += _bad_urls(text, allowed)
+        if bad:
+            hits.append(Hit("lockfile-host", f.path,
+                            f"line {line_no}: not allowlisted: {', '.join(bad[:4])}", False))
+    return hits
 
 
-def lockfile_hosts(files: list[FileChange]) -> list[Hit]:
+def _unique_keys(pairs):
+    """JSON object without duplicate keys: parsers disagree on which wins."""
+    out = dict(pairs)
+    if len(out) != len(pairs):
+        raise ValueError("duplicate key")
+    return out
+
+
+class _YamlLoader(getattr(yaml, "CSafeLoader", yaml.SafeLoader)):
+    """safe_load, minus duplicate keys (parsers disagree on which wins)."""
+
+    def construct_mapping(self, node, deep=False):
+        out = super().construct_mapping(node, deep=deep)
+        if len(out) != len(node.value):
+            raise yaml.YAMLError("duplicate key")
+        return out
+
+
+# bun.lock is JSON with trailing commas. Strings are skipped whole, so a
+# comma inside one stays; anything else non-JSON (a comment) fails to parse.
+_TRAILING_COMMA = re.compile(r'"(?:[^"\\\n]|\\.)*"|,(?=[ \t\r\n]*[\]}])')
+
+
+def _load(name: str, data: bytes):
+    """The parsed document. Raises ValueError, RecursionError or YAMLError."""
+    text = data.decode("utf-8-sig")
+    if name in _TOML_LOCKS:
+        return tomllib.loads(text)
+    if name in _YAML_LOCKS:
+        return yaml.load(text, Loader=_YamlLoader)  # noqa: S506 - a SafeLoader
+    if name == "bun.lock":
+        text = _TRAILING_COMMA.sub(lambda m: "" if m.group(0) == "," else m.group(0), text)
+    return json.loads(text, object_pairs_hook=_unique_keys)
+
+
+def _strings(doc):
+    """Every string in a parsed document, mapping keys included. A container
+    reached twice is a YAML alias: lockfiles never use them, and expanding
+    them can explode, so that does not parse."""
+    seen: set[int] = set()
+    stack = [doc]
+    while stack:
+        v = stack.pop()
+        if isinstance(v, (dict, list, tuple)):
+            if id(v) in seen:
+                raise ValueError("alias")
+            seen.add(id(v))
+            if isinstance(v, dict):
+                stack.extend(v.keys())
+                stack.extend(v.values())
+            else:
+                stack.extend(v)
+        elif isinstance(v, bytes):  # YAML !!binary: a JS consumer stringifies it
+            yield v.decode("utf-8", errors="replace")
+        elif isinstance(v, str):
+            yield v
+
+
+def _flake_bad(doc, allowed: frozenset[str]):
+    nodes = doc.get("nodes") if isinstance(doc, dict) else None
+    for node in nodes.values() if isinstance(nodes, dict) else ():
+        for ref in (node.get("locked"), node.get("original")) if isinstance(node, dict) else ():
+            if not isinstance(ref, dict):
+                continue
+            kind = ref.get("type")
+            if not isinstance(kind, str) or kind not in _FLAKE_TYPES_OK:
+                yield f"flake input type {kind}"
+            host = ref.get("host")
+            if host is not None and str(host).lower() not in allowed:
+                yield f"flake host {host}"
+
+
+def _findings(name: str, data: bytes, allowed: frozenset[str]) -> Counter:
+    """Bad values in a parsed lockfile, counted. Raises if it does not parse."""
+    doc = _load(name, data)
+    bad: Counter = Counter()
+    for s in _strings(doc):
+        if _CONTROL.search(s):
+            bad[MULTI_LINE] += 1
+        bad.update(_bad_urls(s, allowed))
+    if name == "flake.lock":
+        bad.update(_flake_bad(doc, allowed))
+    return bad
+
+
+_UNPARSED = (ValueError, RecursionError, yaml.YAMLError)
+
+
+def _parsed_hits(f: FileChange, name: str, allowed: frozenset[str],
+                 lf: Lockfile | None, yarn_v1: bool) -> list[Hit]:
+    """Only values NEW relative to the base: one already on the default
+    branch must not block every later change to the file."""
+    if lf is None or lf.head is None:
+        return [Hit("lockfile-host", f.path, "lockfile too large to check", False)]
+    try:
+        head = _findings(name, lf.head, allowed)
+    except _UNPARSED:
+        # Classic yarn's own format is not YAML; it is checked line by line.
+        return [] if yarn_v1 else [Hit("lockfile-host", f.path, "lockfile does not parse", False)]
+    base: Counter = Counter()
+    if lf.base is not None:
+        try:
+            base = _findings(name, lf.base, allowed)
+        except _UNPARSED:
+            base = Counter()  # a base that does not parse has no findings
+    new = sorted(head - base)
+    if not new:
+        return []
+    return [Hit("lockfile-host", f.path, f"not allowlisted: {', '.join(new[:4])}", False)]
+
+
+def lockfile_hosts(files: list[FileChange], lockfiles: dict[str, Lockfile]) -> list[Hit]:
     hits = []
     for f in files:
         allowed = _allowlist(f.path)
-        if allowed is None:
+        if allowed is None or f.status == "deleted":
             continue
-        flake = PurePosixPath(f.path).name == "flake.lock"
-        pip = bool(_REQUIREMENTS.match(PurePosixPath(f.path).name.casefold()))
-        runs: list[list[tuple[int, str, list[str]]]] = []  # consecutive added lines
-        for line_no, original in f.added:
-            text, undecoded = _decode_escapes(original)
-            bad = []
-            if _continues(original, pip):
-                bad.append("line continuation")
-            if undecoded and _SCHEMEISH.search(text):
-                bad.append("undecodable escape near a URL")
-            # Parse the way npm/Node (WHATWG URL) does: tab/newline are
-            # stripped anywhere and a backslash is a path separator, so
-            # "https://evil\@registry.npmjs.org" goes to evil.
-            text = re.sub(r"[\t\n\r]", "", text).replace("\\", "/")
-            urls = _bad_urls(text, allowed, flake)
-            bad += urls
-            if bad:
-                hits.append(Hit("lockfile-host", f.path,
-                                f"line {line_no}: not allowlisted: {', '.join(bad[:4])}", False))
-            if runs and runs[-1][-1][0] == line_no - 1:
-                runs[-1].append((line_no, text, urls))
-            else:
-                runs.append([(line_no, text, urls)])
-        if pip:  # pip reads one line at a time; a continuation is caught above
+        name = PurePosixPath(f.path).name.casefold()
+        if not parsed_lockfile(f):
+            hits += _line_hits(f, allowed)
             continue
-        # A TOML multi-line string or a YAML block scalar keeps a literal
-        # newline inside a URL, and WHATWG/rust-url strip it: "https://pypi.org"
-        # + ".evil.x/a.whl" is pypi.org.evil.x to the package manager. Join
-        # each run of added lines with no separator and check again. YAML
-        # also strips a block's indentation, so a line indented like the one
-        # before it is joined without that indentation.
-        for run in runs:
-            joined, prev = "", None
-            for _, text, _ in run:
-                if prev is not None and _indent(text) == _indent(prev):
-                    joined += text.lstrip(" ")
-                else:
-                    joined += text
-                prev = text
-            seen = {b for _, _, urls in run for b in urls}
-            bad = [b for b in dict.fromkeys(_bad_urls(joined, allowed, flake)) if b not in seen]
-            if bad:
-                hits.append(Hit("lockfile-host", f.path,
-                                f"line {run[0][0]}: URL split across lines, not allowlisted: "
-                                f"{', '.join(bad[:4])}", False))
+        lf = lockfiles.get(f.path)
+        # yarn.lock with the v1 header is classic yarn's line format, which
+        # classic yarn falls back to reading as YAML: check both readings.
+        yarn_v1 = (name == "yarn.lock" and lf is not None and lf.head is not None
+                   and bool(_YARN_V1.match(lf.head.decode("utf-8", errors="replace"))))
+        hits += _parsed_hits(f, name, allowed, lf, yarn_v1)
+        if yarn_v1:
+            hits += _line_hits(f, allowed)
     return hits
 
 
@@ -420,7 +542,8 @@ def scrutiny(files: list[FileChange]) -> list[Scrutiny]:
 
 
 def run_all(files: list[FileChange], contents: dict[str, bytes | None],
-            exceptions: list[str], *, always_on_only: bool = False
+            exceptions: list[str], lockfiles: dict[str, Lockfile], *,
+            always_on_only: bool = False
             ) -> tuple[list[Hit], list[Scrutiny]]:
     """All deterministic hits and the extra-scrutiny list.
 
@@ -428,7 +551,8 @@ def run_all(files: list[FileChange], contents: dict[str, bytes | None],
     override can clear.
     """
     path_hits, exempted = sensitive_paths(files, exceptions)
-    hits = hidden_unicode(files) + lockfile_hosts(files) + binaries(files, contents) + path_hits
+    hits = (hidden_unicode(files) + lockfile_hosts(files, lockfiles)
+            + binaries(files, contents) + path_hits)
     if always_on_only:
         hits = [h for h in hits if not h.overridable]
     return hits, exempted + scrutiny(files)

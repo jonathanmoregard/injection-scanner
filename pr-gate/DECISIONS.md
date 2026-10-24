@@ -188,43 +188,61 @@ it, each with the reason. Design: `docs/superpowers/specs/2026-10-24-pr-gate-des
     `scheme://` counts too. Scheme candidates are scanned one `word:` at a
     time, so a junk prefix (`x:https://evil.x`) can't hide the URL after it.
     Bracketed IPv6 hosts reach the host check (never allowlisted).
-    Each added line is checked after decoding JSON/TOML/YAML string escapes
-    (`\/`, `\uXXXX`, `\UXXXXXXXX`, `\xXX`, the one-letter ones), because
-    package managers decode them before resolving the URL. An escape the
-    decoder does not know, on a line with a scheme-like token, is a hit
-    (fail closed). Lines are checked one at a time, so a backslash-newline
-    continuation (YAML double-quoted, TOML multi-line strings, pip) could
-    split a URL across two lines (`"https://registry.npmjs.org\` +
-    `.evil.x/p.tgz"`). An added lockfile line ending in such a
-    continuation is therefore a hit on its own: an odd trailing backslash
-    run (trailing whitespace ignored; an even run is escaped backslashes).
-    In `requirements*.txt` pip joins on any trailing run, so parity does not
-    count there; instead a run preceded by whitespace is fine, which is how
-    pip-compile writes its `pkg==1.0 \` / `--hash=... \` lines and which
-    cannot glue a URL together. For continuations a per-line rule is
-    simpler than joining, and lockfiles have no legitimate need for one.
-22a. **URLs split by a literal newline.** A TOML multi-line string
-    (`'''...'''`, `"""..."""`) or a YAML block scalar (`|`) keeps a raw
-    newline inside a URL, and WHATWG/rust-url strip it, so
-    `'''https://files.pythonhosted.org` + `.evil.x/a.whl'''` is host
-    `files.pythonhosted.org.evil.x` to uv (likewise `https://` + `evil.x`,
-    `https:/` + `/evil.x`, `https` + `://evil.x`). Each run of consecutive
-    added lines (consecutive post-image line numbers) is therefore also
-    joined with no separator, each line decoded and normalised as above,
-    and the URL/host/userinfo and flake checks run again over the joined
-    text. A finding no single line produced is a non-overridable hit "URL
-    split across lines" at the run's first line; findings a single line
-    already produced are not repeated. YAML strips a block scalar's
-    indentation, so a line indented exactly like the line before it is
-    joined without that indentation. A line at a different indentation (a
-    header like `tarball: |-` and its content; a key and its nested
-    mapping, such as pnpm's `ws:` + `  specifier: ...`) keeps its leading
-    spaces, which end any authority. `requirements*.txt` is not joined: pip
-    reads one line at a time, and its only joiner, the continuation, is
-    caught above. **Residual:** a split whose pieces sit on both sides of
-    an unchanged context line is not joined. It needs the base file to
-    hold the other piece; catching it would mean fetching and parsing
-    whole lockfiles.
+    Per-line formats (below) decode JSON/TOML/YAML string escapes (`\/`,
+    `\uXXXX`, `\UXXXXXXXX`, `\xXX`, the one-letter ones) before the check;
+    an escape the decoder does not know, on a line with a scheme-like
+    token, is a hit (fail closed). An added per-line lockfile line ending in
+    a backslash-newline continuation is a hit on its own: an odd trailing
+    backslash run (trailing whitespace ignored; an even run is escaped
+    backslashes). In `requirements*.txt` pip joins on any trailing run, so
+    parity does not count there; instead a run preceded by whitespace is
+    fine, which is how pip-compile writes its `pkg==1.0 \` / `--hash=... \`
+    lines and which cannot glue a URL together.
+22a. **Lockfiles are parsed, not read line by line** (replaces the round-6
+    rule that joined consecutive added lines). Re-implementing YAML/TOML
+    string folding line by line kept losing: a blank line inside a YAML
+    block scalar, or a double-quoted scalar folding across a blank line,
+    rebuilt `https://registry.npmjs.org` + `.evil.x` past it. So, as
+    lockfile-lint does, the gate parses the file and checks parsed values.
+    For each added, modified or renamed JSON lockfile (`package-lock.json`,
+    `npm-shrinkwrap.json`, `Pipfile.lock`, `flake.lock`, and `bun.lock`
+    after dropping trailing commas outside strings, its only JSONC feature
+    in practice; a comment does not parse), TOML lockfile (`Cargo.lock`,
+    `uv.lock`, `poetry.lock`, `pdm.lock`; `tomllib`) or YAML lockfile
+    (`pnpm-lock.yaml`, `yarn.lock`; PyYAML's safe loader, libyaml when
+    present), core fetches the whole file at the head and at the live base
+    oid (the old path for a rename; a 404 there means "not in the base";
+    any other error is infra). Every string, mapping keys included, gets
+    the URL/host/userinfo/scheme checks above after WHATWG normalisation
+    (tab/CR/LF stripped, backslash to slash). A string holding a line break
+    (U+0085/2028/2029 included), a tab or another control character is a
+    finding on its own: generated lockfiles have none, and a URL with one
+    is a different URL to WHATWG/rust-url. `flake.lock` input `type`/`host`
+    are read from the parsed `nodes.*.locked` / `nodes.*.original`, not by
+    regex. Findings are counted (a multiset) and only those NEW relative to
+    the base are hits, so a value already on the default branch does not
+    block every later lockfile change, while one more package pointing at
+    that same host does. All are non-overridable `lockfile-host` hits,
+    including "lockfile does not parse" (head only; a base that does not
+    parse counts as having no findings) and "lockfile too large to check"
+    (over the 25 MB fetch cap; no lockfile in this repo or its fixtures
+    comes near it). To close parser differentials, duplicate keys (JSON,
+    YAML) do not parse, since parsers disagree on which one wins, and
+    neither does a YAML alias (a container reached twice; that also stops
+    alias bombs); YAML `!!binary` values are checked as UTF-8 text, since a
+    JS consumer stringifies them. Escape decoding is the parser's job.
+    `requirements*.txt` (pip reads per line) and `Gemfile.lock` (no
+    multi-line strings) stay on the per-line check. `yarn.lock` with the
+    `# yarn lockfile v1` header (yarn's own test for the format) is checked
+    per line AND, where PyYAML parses it, as YAML: classic yarn falls back
+    to reading a lockfile as YAML when its own parser fails, so the header
+    alone does not decide which reading applies. Without the header it is
+    Berry's YAML and must parse. **Residual:** a construct Python's parser
+    and the package manager's read differently (beyond the ones closed
+    above) is a gap, and so is yarn's YAML reading of a v1 yarn.lock that
+    PyYAML cannot parse. Owner-override and carry-over runs check the same
+    contents, fetched in `gather` like binaries; the check itself stays a
+    pure function over them.
 23. **Binary magic** table covers common images, fonts, archives, PDF, and
     executables (ELF, PE, Mach-O, wasm, `#!` scripts); executables are
     labelled. Every binary blocks either way (design option (a)). A binary

@@ -122,8 +122,10 @@ def _dry_run(args, env) -> int:
         print("ANTHROPIC_API_KEY is not set (or pass --no-llm)", file=sys.stderr)
         return 2
     files_dir = Path(args.files_dir).resolve() if args.files_dir else None
+    # No base checkout: every lockfile value counts as new.
     g = core.gather_from(Path(args.diff).read_bytes(),
-                         lambda p: _read_local(files_dir, p) or b"")
+                         lambda p: _read_local(files_dir, p) or b"",
+                         lambda f: checks.Lockfile(_read_local(files_dir, f.path), None))
 
     def local_contents():
         contents, omitted, left = {}, [], core.CONTENTS_BUDGET

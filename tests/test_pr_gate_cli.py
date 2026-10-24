@@ -218,3 +218,26 @@ def test_missing_key_surfaces_as_infra_not_a_verdict(tmp_path):
 
 def test_workflow_command_escaping():
     assert cli.escape_command("a%b\nc\rd") == "a%25b%0Ac%0Dd"
+
+
+LOCK = """\
+diff --git a/uv.lock b/uv.lock
+--- a/uv.lock
++++ b/uv.lock
+@@ -1 +1 @@
+-x = 1
++x = 2
+"""
+
+
+@pytest.mark.parametrize("content,verdict", [
+    (b"x = 2\n", "pass"),
+    (b"x = '''https://files.pythonhosted.org\n.evil.example/a.whl'''\n", "block"),
+])
+def test_dry_run_parses_lockfiles_from_the_files_dir(tmp_path, capsys, content, verdict):
+    files = tmp_path / "files"
+    files.mkdir()
+    (files / "uv.lock").write_bytes(content)
+    cli.main(["--dry-run", "--no-llm", "--diff", write(tmp_path, "d.diff", LOCK),
+              "--files-dir", str(files)], env={})
+    assert json.loads(capsys.readouterr().out)["verdict"] == verdict

