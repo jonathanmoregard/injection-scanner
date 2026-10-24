@@ -322,7 +322,10 @@ it, each with the reason. Design: `docs/superpowers/specs/2026-10-24-pr-gate-des
     YAML) do not parse, since parsers disagree on which one wins, and
     neither does a YAML alias (a container reached twice; that also stops
     alias bombs); YAML `!!binary` values are checked as UTF-8 text, since a
-    JS consumer stringifies them. Escape decoding is the parser's job.
+    JS consumer stringifies them. Any other value that is not a mapping,
+    list, string or a string-free scalar (number, bool, null, date or
+    time), such as a YAML `!!set`, does not parse either: the string walk
+    would not look inside it. Escape decoding is the parser's job.
     pip requirement files (pip reads per line) and `Gemfile.lock` (no
     multi-line strings) stay on the per-line check. `yarn.lock` with the
     `# yarn lockfile v1` header (yarn's own test for the format) is checked

@@ -11,6 +11,7 @@ Fetching lives in core.py.
 """
 from __future__ import annotations
 
+import datetime
 import fnmatch
 import json
 import re
@@ -526,6 +527,11 @@ def _package_entries(name: str, doc) -> set[int]:
     return out
 
 
+# Scalars the parsers produce that hold no string (TOML and YAML dates
+# and times included). bool is an int.
+_SCALARS = (int, float, type(None), datetime.date, datetime.time)
+
+
 def _strings(doc, entries: set[int] = frozenset()):
     """(string, is metadata) for every string in a parsed document, mapping
     keys included; metadata = a value under a metadata key of a package
@@ -551,6 +557,9 @@ def _strings(doc, entries: set[int] = frozenset()):
             yield v.decode("utf-8", errors="replace"), meta
         elif isinstance(v, str):
             yield v, meta
+        elif not isinstance(v, _SCALARS):
+            # Anything else (YAML !!set, ...) would hide the strings in it.
+            raise ValueError("unrecognised value")
 
 
 # npm-family lockfiles also name packages by SPEC, with no URL in sight:

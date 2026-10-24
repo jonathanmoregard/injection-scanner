@@ -558,6 +558,9 @@ def test_a_multi_line_string_in_a_parsed_lockfile_is_a_hit(path, text):
     ("pnpm-lock.yaml", "a: https://registry.npmjs.org/a.tgz\na: https://evil.example/a.tgz\n"),
     ("pnpm-lock.yaml", "x: &r {tarball: https://registry.npmjs.org/a.tgz}\ny: *r\n"),
     ("pnpm-lock.yaml", "x: !!python/name:os.system\n"),
+    # A container _strings does not walk would hide its strings.
+    ("pnpm-lock.yaml", "packages:\n  a@1.0.0:\n    resolution: !!set {https://evil.example/a.tgz}\n"),
+    ("yarn.lock", "x: !!set {https://evil.example/a.tgz: null}\n"),
     ("yarn.lock", "__metadata:\n  version: 8\n x: [\n"),  # Berry (no v1 header)
     ("bun.lock", '{"packages": {"a": ["a@1.0.0", "", {}, "sha512-x"],} // note\n}'),
     ("package-lock.json", "\xff"),
