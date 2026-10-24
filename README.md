@@ -6,7 +6,7 @@ Layered prompt-injection / secret-exfil scanner. Extracted from `research-agent`
 
 | Order | Layer | Purpose |
 |------|-------|---------|
-| L0 | `unicode_sanitize` | Strip covert channels (zero-width, bidi, tag-block), NFKC normalize, flag anomalous density. |
+| L0 | `unicode_sanitize` | Strip covert channels (zero-width, bidi, tag-block), NFKC normalize, flag anomalous density. `profile="code"` is the strict variant for source diffs (used by pr-gate). |
 | L1b | `secret_shapes` | High-precision API key / JWT / PEM patterns. |
 | L2 | `lakera` | Hosted Lakera Guard prompt-injection classifier, wired fail-closed. Exact quota pressure may defer to L3/L4; every other failure rejects. Paced fleet-wide — see [Lakera rate limiting](#lakera-rate-limiting). |
 | L3 | `honeypot` | Run the report past a 3-model judge ensemble (`claude-haiku-4-5`, `gpt-4o-mini`, `gpt-4.1-mini`) across six canary scenarios — two scenarios per model. If any judge gets coerced into calling a bait tool, echoing a canary via a legitimate tool argument, or surfacing one in freeform text, the report is rejected. |
@@ -147,6 +147,13 @@ else:
 ```bash
 pytest tests/
 ```
+
+## pr-gate
+
+[`pr-gate/`](pr-gate/README.md) is a GitHub composite action published from this repo: a required
+`ai-gate` check that reviews PR diffs for sabotage by prompt-injected coding agents (deterministic
+checks plus hostile-author Claude passes) and blocks until the owner looks. Setup checklist,
+clearing a block, model choice, cost and limitations: [`pr-gate/README.md`](pr-gate/README.md).
 
 ## Consumers
 
