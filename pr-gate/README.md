@@ -21,9 +21,10 @@ the base branch). In order, failing closed at every step:
 
 1. **Owner intent.** Auto-merge must be on and enabled by `owner`; the head must
    not have moved since the event. Otherwise the check fails (no review posted).
-2. **Pushes after auto-merge** (`synchronize`) fail, with no model call, unless
-   the PR's own changes are identical to a head the gate already passed (a pure
-   "Update branch" merge from the base). Then the pass carries over.
+2. **Pushes or a reopen after auto-merge** (`synchronize`, `reopened`) fail,
+   with no model call, unless the gate's latest verdict on this PR is a pass
+   of identical own changes (a pure "Update branch" merge from the base, or a
+   reopen with nothing changed). Then the pass carries over.
 3. **Reroll guard.** If the gate already blocked this exact head, the model is
    not asked again: the run passes only if `owner` approved that head commit.
 4. **Deterministic checks** (any hit blocks):
@@ -86,7 +87,7 @@ Org repos need their own secret and ruleset.
   re-enable auto-merge to request a fresh review. Exception: "Update branch"
   (merging the base into the PR) passes on its own as long as the PR's own
   changes are unchanged; a conflict resolution or any extra edit needs the
-  re-click.
+  re-click. Closing and reopening the PR is treated like a push.
 - **"enable auto-merge to request the AI gate"** on a new PR is expected:
   that is the gate waiting for you.
 

@@ -97,9 +97,9 @@ _MODE_LINE = {
     "owner-override": "Cleared by the owner's approval of this head commit after an "
                       "earlier block; the model layers were not re-run. Only the "
                       "always-on checks ran.",
-    "carry-over": "This head only merged the base branch: its own changes are identical to "
-                  "a head the gate already passed, so that pass was carried over. Only the "
-                  "always-on checks ran.",
+    "carry-over": "The PR's own changes are identical to those of the gate's latest verdict, "
+                  "a pass (a base-branch merge or a reopen), so that pass was carried over. "
+                  "Only the always-on checks ran.",
 }
 
 

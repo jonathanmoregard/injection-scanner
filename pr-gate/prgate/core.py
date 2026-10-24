@@ -136,9 +136,11 @@ def _owner_approved(reviews: list[Review], owner: str, head: str) -> bool:
     return bool(states) and states[-1] == "APPROVED"
 
 
-def _last_pass_hash(reviews: list[Review]) -> str | None:
-    passes = [m[2] for _, m in _gate_reviews(reviews) if m[0] == "pass"]
-    return passes[-1] if passes else None
+def _carries_over(reviews: list[Review], own_hash: str) -> bool:
+    """The NEWEST gate marker (pass or block) is a pass of these exact own
+    changes. An older pass never outlives a later block."""
+    markers = [m for _, m in _gate_reviews(reviews)]
+    return bool(markers) and markers[-1][0] == "pass" and markers[-1][2] == own_hash
 
 
 def _text_contents(gh, ev: Event, files: list[FileChange]) -> tuple[dict[str, str], list[str]]:
@@ -212,10 +214,12 @@ def _run(ev: Event, cfg: Config, gh, review_fn: ReviewFn) -> Outcome:
     reviews = gh.reviews(ev.number)
     g = gather(gh, ev)
 
-    if ev.action == "synchronize":
-        if _last_pass_hash(reviews) != g.own_hash:
-            return Outcome(1, "head changed after auto-merge was enabled; disable and "
-                              "re-enable auto-merge to re-request review")
+    # A push or a close/reopen while auto-merge stays on is not an owner
+    # click: no model roll, only a carry-over of identical own changes.
+    if ev.action in ("synchronize", "reopened"):
+        if not _carries_over(reviews, g.own_hash):
+            return Outcome(1, "the PR was pushed to or reopened after auto-merge was "
+                              "enabled; disable and re-enable auto-merge to re-request review")
         hits, scrutiny = checks.run_all(g.files, g.binaries, cfg.exceptions, always_on_only=True)
         result = verdict.decide(hits, scrutiny, [], cfg.threshold)
         return _report(gh, ev, cfg, result, g.own_hash, "carry-over", reviews)

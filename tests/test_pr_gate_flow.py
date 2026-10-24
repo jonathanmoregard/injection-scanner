@@ -325,6 +325,32 @@ def test_synchronize_uses_the_latest_gate_pass():
     assert out.exit_code == 1
 
 
+def test_synchronize_does_not_carry_a_pass_over_a_later_block_of_the_same_changes():
+    # Owner re-requested review at an unchanged head, that roll blocked; a
+    # base merge must not resurrect the older pass.
+    h = own_hash_of(DIFF)
+    reviews = [gate_review("pass", OLD, h, rid=5), gate_review("block", OLD, h, rid=6)]
+    gh = FakeGitHub(diff=shifted(DIFF), reviews=reviews)
+    out, model = run(gh, action="synchronize")
+    assert out.exit_code == 1 and "re-enable auto-merge" in out.message
+    assert model.calls == [] and gh.posted == []
+
+
+def test_reopened_without_a_pass_fails_without_a_model_call():
+    # Close/reopen must not be a free reroll while auto-merge stays on.
+    gh = FakeGitHub()
+    out, model = run(gh, action="reopened")
+    assert out.exit_code == 1 and "re-enable auto-merge" in out.message
+    assert model.calls == [] and gh.posted == []
+
+
+def test_reopened_after_a_pass_of_the_same_changes_carries_over():
+    gh = FakeGitHub(reviews=[gate_review("pass", HEAD, own_hash_of(DIFF), rid=5)])
+    out, model = run(gh, action="reopened")
+    assert out.exit_code == 0 and model.calls == []
+    assert "carried over" in gh.posted[0][2]
+
+
 def test_carry_over_still_runs_the_always_on_checks():
     # Same own changes can't newly contain hidden Unicode, but the check
     # must not depend on that reasoning.

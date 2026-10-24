@@ -63,9 +63,15 @@ it, each with the reason. Design: `docs/superpowers/specs/2026-10-24-pr-gate-des
     COMMENT-fallback included).
 11. **Owner approval** = the owner's latest APPROVED / CHANGES_REQUESTED /
     DISMISSED review on this head commit is APPROVED.
-12. **Carry-over** compares against the most recent gate pass marker. Owner
-    override and carry-over passes also record their hash, so an
-    "Update branch" after an override carries over too.
+12. **Carry-over** looks only at the NEWEST gate marker, pass or block: it
+    carries over only if that marker is a pass with an identical own-changes
+    hash. An older pass never outlives a later block of the same changes
+    (owner re-requests review, that roll blocks, a pure base merge must not
+    resurrect the pass). Owner override and carry-over passes also record
+    their hash, so an "Update branch" after an override carries over too.
+    `reopened` is handled exactly like `synchronize`: auto-merge can survive
+    a close/reopen, and a reopen is not an owner click, so it must not buy a
+    fresh model roll.
 13. **Always-on checks run on carry-over and override runs.**
 14. The diff is `compare/<base branch>...<head SHA>`: the base branch's
     current tip (what "Update branch" merged), the head pinned by SHA.
