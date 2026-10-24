@@ -199,7 +199,8 @@ Org repos need their own secret and ruleset.
   re-click. Closing and reopening the PR is treated like a push.
 - **Key rotation:** a new `AI_GATE_ANTHROPIC_KEY` invalidates the gate's
   earlier verdicts (their markers no longer verify). Open PRs need a
-  re-click of auto-merge.
+  re-click of auto-merge. So does a gate update that changes the marker
+  version (v2 to v3: the signature now covers the whole review text).
 - **"enable auto-merge to request the AI gate"** on a new PR is expected:
   that is the gate waiting for you.
 - **PRs must target the default branch.** Into any other branch the check
@@ -301,18 +302,25 @@ their maximum suspicion.
   permission; a host PAT with that scope defeats it.
 - Any workflow in the repo can post reviews as `github-actions[bot]`, so the
   gate signs its review markers with an HMAC keyed by the Anthropic API key,
-  which only the gate step receives. A marker that does not verify counts as
-  no marker. Another workflow with a write token (e.g. CI that builds PR
-  code) therefore cannot mint a pass or a block. It can still copy, edit or
-  dismiss the gate's own reviews (same bot identity). A re-posted real pass
-  only re-asserts content that was passed, and only the owner's dismissal
-  clears a block. But an edited block no longer verifies, so it stops
-  guarding its commit: a re-run still never asks the model, yet the owner's
+  which only the gate step receives. The signature covers the whole review
+  text, not just the marker line, so any edit to a review (or the marker
+  copied onto other text) voids it, and a marker that does not verify
+  counts as no marker. Another workflow with a write token (e.g. CI that
+  builds PR code) therefore cannot mint a pass or a block, nor dress a
+  block up as benign for you to dismiss. It can still copy, edit or
+  dismiss the gate's own reviews (same bot identity). A byte-identical copy
+  shows the gate's own findings, a re-posted real pass only re-asserts
+  content that was passed, and only the owner's dismissal clears a block.
+  But an edited block no longer verifies, so it stops guarding its commit: a re-run still never asks the model, yet the owner's
   next auto-merge toggle gets a fresh model review, a second roll at the
   same change. Only the owner's toggle triggers it, so it costs the owner a
   click, not nothing. When a re-run reports "no verified gate block" on a
   commit you expected to be blocked, look at the PR before toggling. Keep
   `pull-requests: write` away from workflows that run PR code.
+- Reviews and the PR timeline are read 100 per page, at most 30 pages
+  (3 000 entries each). Past that the gate fails as infra on every run,
+  since it cannot see every review or dismissal; the way out is a new PR
+  with the same changes.
 - Anyone acting as `owner` (including an agent with the owner's token) can
   enable auto-merge and dismiss the gate's review, so the gate is only as
   strong as the custody of that identity.

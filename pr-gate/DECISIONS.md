@@ -518,13 +518,28 @@ it, each with the reason. Design: `docs/superpowers/specs/2026-10-24-pr-gate-des
     characters, HTML-escaped, `://` and `www.` defanged, `GH-<n>` broken,
     bounded length. Body capped at 60 000 characters.
 27. The review body starts with a machine marker
-    `<!-- pr-gate:v2 verdict=... head=... hash=... mac=... -->` used by the
+    `<!-- pr-gate:v3 verdict=... head=... hash=... mac=... -->` used by the
     override check, carry-over and the dismissal of the gate's own blocks.
     Any workflow in the repo can post as `github-actions[bot]`, so the marker
     carries an HMAC-SHA256 keyed by the Anthropic API key (only the gate step
-    gets that secret) over the JSON array `["pr-gate-marker", "v2", verdict,
-    repo (casefolded), PR number, head SHA, own-changes hash]`, checked with
-    `hmac.compare_digest`. Only reviews by `github-actions[bot]` whose marker
+    gets that secret) over the JSON array `["pr-gate-marker", "v3", verdict,
+    repo (casefolded), PR number, head SHA, own-changes hash, body digest]`,
+    checked with `hmac.compare_digest`. The body digest is the SHA-256 of
+    everything after the marker line, with line endings read as `\n` and
+    trailing whitespace at the end dropped (so GitHub's storage cannot void
+    it), computed by the verifier from the review's CURRENT body. It is
+    signed last, over the final text (after truncation, and over the
+    re-rendered text when a block falls back to a COMMENT). Why: v2 signed
+    the fields only, so another workflow could rewrite a real block's
+    findings under the intact marker line, or post a new review with a
+    copied marker over benign text; the owner's dismissal of that
+    benign-looking review was a valid override, and the pass then
+    bot-dismissed the real block as superseded. Under v3 any edit voids the
+    marker, and a copied marker verifies only on a byte-identical body,
+    which shows the owner exactly the gate's findings: dismissing such a
+    duplicate is an informed override of the same change (tested), so
+    `_blocks_on_head` and `_owner_dismissed` need no change. v2 markers no
+    longer parse (v1 never shipped): open PRs need an auto-merge re-click. Only reviews by `github-actions[bot]` whose marker
     verifies count; anything else is treated as no marker everywhere, and
     only verified blocks are dismissed. An empty key fails the run as a
     config error before anything is read or posted. Key rotation invalidates
@@ -532,7 +547,8 @@ it, each with the reason. Design: `docs/superpowers/specs/2026-10-24-pr-gate-des
     never parses. v1 markers (unsigned) are ignored. A workflow with a write
     token can still copy, edit or dismiss the gate's own reviews (same bot
     identity). A replayed pass re-asserts passed content and only the
-    owner's dismissal overrides (items 11-13), but an edited block is just
+    owner's dismissal overrides (items 11-13); a block edited in any way
+    (findings, an appended line, the marker) no longer verifies and is just
     no block: a re-run still never reaches the model, yet the owner's next
     auto-merge toggle is a fresh model roll at the same change. Accepted:
     each roll costs an owner click, and the step-5 re-run message tells the
