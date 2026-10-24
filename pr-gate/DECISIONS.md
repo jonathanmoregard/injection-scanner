@@ -33,6 +33,10 @@ it, each with the reason. Design: `docs/superpowers/specs/2026-10-24-pr-gate-des
    model and the checks get the `replace`-decoded text, where any invalid
    byte is U+FFFD and a swap of one for another would look identical.
    Valid UTF-8 decodes the same both ways, so existing hashes are unchanged.
+   The `\ No newline at end of file` marker is part of the hunk body in
+   the hash (never an added or removed line), so a push that only adds or
+   drops a file's final newline does not carry a pass over. Diffs without
+   the marker hash exactly as before.
 3. **A declined pass blocks.** The server-side refusal fallback is enabled
    (`fallbacks: "default"`), but if the configured model declines and a
    fallback model answers, the run blocks ("reviewer declined (policy)").

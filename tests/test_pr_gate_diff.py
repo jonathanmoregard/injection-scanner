@@ -264,6 +264,31 @@ def test_hash_changes_with_mode():
     assert a != b
 
 
+_EOF = "diff --git a/f b/f\n--- a/f\n+++ b/f\n@@ -1,2 +1,2 @@\n x\n-a\n+b\n"
+_NO_EOL = "\\ No newline at end of file\n"
+
+
+@pytest.mark.parametrize("other", [
+    _EOF + _NO_EOL,                                                 # drops the final newline
+    _EOF.replace("-a\n", "-a\n" + _NO_EOL),                         # adds one
+])
+def test_hash_changes_when_only_the_final_newline_changes(other):
+    # A push that only adds or drops the file's last newline must not
+    # carry a pass over.
+    assert dp.own_changes_hash(dp.parse(_EOF), {}) != dp.own_changes_hash(dp.parse(other), {})
+
+
+def test_the_no_newline_marker_is_not_an_added_or_removed_line():
+    [f] = dp.parse(_EOF.replace("-a\n", "-a\n" + _NO_EOL) + _NO_EOL)
+    assert (f.removed, f.added) == (["a"], [(2, "b")])
+
+
+def test_diffs_without_the_no_newline_marker_hash_as_before():
+    # Pinned before the marker entered the hash: existing passes carry over.
+    assert dp.own_changes_hash(dp.parse(MODIFY + ADD + DELETE), {}) == (
+        "a533a091a0cbe0cd1c19a82df7e85688138a3e128a2c8a4cf9c7c464b57a3cbe")
+
+
 def test_hash_is_hex_sha256():
     h = dp.own_changes_hash(dp.parse(MODIFY), {})
     assert len(h) == 64 and all(c in "0123456789abcdef" for c in h)

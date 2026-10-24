@@ -120,7 +120,11 @@ def parse(diff: str) -> list[FileChange]:
         lines.pop()
     for line in lines:
         if cur is not None and line.startswith("\\"):
-            continue  # "\ No newline at end of file"
+            # "\ No newline at end of file": not a line of the file, but in
+            # the hash, or a push that only adds or drops the last newline
+            # would carry a pass over.
+            cur.body.append(line)
+            continue
         if cur is not None and (old_left > 0 or new_left > 0):
             tag, text = line[:1], line[1:]
             if tag == "+":
@@ -202,8 +206,8 @@ def own_changes_hash(files: list[FileChange], binary_sha256: dict[str, str]) -> 
     """Hash of what the PR itself changes, stable across base merges.
 
     Per file: paths, status, modes, binary content digest, and the hunk
-    bodies (context, added and removed lines in order) with the `@@` hunk
-    headers dropped, so line offsets that shift when the base gains lines
+    bodies (context, added and removed lines and "\\ No newline at end of
+    file" markers, in order) with the `@@` hunk headers dropped, so line offsets that shift when the base gains lines
     elsewhere do not matter. Context lines are kept on purpose: without
     them, moving an added line into a different function leaves the
     added/removed lists identical (see pr-gate/DECISIONS.md).
