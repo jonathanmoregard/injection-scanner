@@ -166,28 +166,20 @@ The key can be sent only to the canonical Guard destination, `https://api.lakera
 
 `python -m injection_scanner.eval` aborts on the first outage rather than scoring it — `INFRA <case_id> <reason>` on stderr, exit code `3` (distinct from `1` for a failed threshold and `2` for usage). `scan_text` fails closed, so a degraded layer agrees with every injection-labelled case; scoring it would report recall earned by an outage.
 
-### CI: a hermetic merge gate, live checks on a schedule
+### CI: hermetic, and no workflow calls a vendor
 
-Per-push CI calls no external service. `.github/workflows/ci.yml` runs only the deterministic suite on Python 3.12 and 3.13 — no Lakera, no Anthropic, no OpenAI, no secrets — so a pull request cannot go red because a vendor is down or throttled, and it works unchanged on a fork. Pytest installs a project-wide socket embargo before collection and keeps it through fixture finalizers: IPv4 and IPv6 sockets are forbidden, Unix sockets remain available, and command-line, marker and fixture escape hatches are rejected. Offline coverage does not shrink: `tests/test_judge.py` drives the real Anthropic/OpenAI SDKs over a stub transport (which is what caught the 1.x `temperature` signature break), while `tests/test_lakera.py` exercises request construction, proxy/redirect policy, bounded reads, JSON decoding and the strict response contract using only in-process `vendor_http._post`, transport and `OpenerDirector` doubles — never loopback or a real endpoint.
+GitHub Actions makes no external call. `.github/workflows/ci.yml` runs only the deterministic suite on Python 3.12 and 3.13 — no Lakera, no Model Armor, no Anthropic, no OpenAI, no secrets — so a pull request cannot go red because a vendor is down or throttled, and it works unchanged on a fork. Pytest installs a project-wide socket embargo before collection and keeps it through fixture finalizers: IPv4 and IPv6 sockets are forbidden, Unix sockets remain available, and command-line, marker and fixture escape hatches are rejected. Offline coverage does not shrink: `tests/test_judge.py` drives the real Anthropic/OpenAI SDKs over a stub transport (which is what caught the 1.x `temperature` signature break), while `tests/test_lakera.py` exercises request construction, proxy/redirect policy, bounded reads, JSON decoding and the strict response contract using only in-process `vendor_http._post`, transport and `OpenerDirector` doubles — never loopback or a real endpoint.
 
-The live evaluation is an operational/scheduled workflow, not part of pytest or the merge gate. It lives in `.github/workflows/live-eval.yml` and runs **nightly at 03:17 UTC and on demand**:
+There is no scheduled or dispatched live workflow. The nightly `live-eval.yml` was deleted on 2026-10-24 ("gha shouldn't ddos third party"): it drew on the same vendor quota as the production fleet. `tests/test_ci_relations.py` asserts, as a negative over every file in `.github/workflows/`, that none references `secrets.` or names a vendor credential (`LAKERA`, `ANTHROPIC`, `OPENAI`, `MODEL_ARMOR`); without a credential every adapter fails closed before opening a connection, so a new workflow cannot put load on a vendor either.
+
+The corpus eval — recall and FP rate over the labelled corpus, which was never deterministic — is an operator command, run locally, by hand, paced by the shared limiter (`--l2-max-wait` defaults to 900 s), when a detection-quality-sensitive change needs it:
 
 ```bash
-# check a detection-quality-sensitive PR before merging
-gh workflow run live-eval.yml --ref <branch>
+python -m injection_scanner.eval tests/payloads/labels.jsonl --use-l2 --use-honeypot \
+  --min-recall 1.0 --max-fp-rate 0.0 --confirm-disagreements 2
 ```
 
-That dispatch is deliberately a human gesture, like the merge click. What moved off the gate is the sampled-model *benchmark* — recall and FP rate over the labelled corpus — which was never deterministic; **production's boot smoke — a live vendor probe at most once per liveness TTL, plus every real report scan — remains the day-to-day canary for vendor drift, and CI's nightly is the benchmark**. Both are agent-readable, and production is where such drift actually bites.
-
-The relations inside `live-eval.yml` are asserted by `tests/test_ci_relations.py`, so a later edit cannot quietly undo them:
-
-- One workflow-level concurrency group, `lakera-live`, with `cancel-in-progress: false` — at most one live run at a time, queued rather than dropped. Deliberately **not** keyed on the ref: a branch dispatch and the nightly on `main` draw on the same Lakera account, so they must queue rather than overlap.
-- `eval` needs `smoke`. The 1-call smoke is the canary for the 16-call eval: a Lakera outage costs one call, not seventeen.
-- Both jobs set `INJECTION_SCANNER_LAKERA_MIN_INTERVAL_S=60` **and** `INJECTION_SCANNER_LAKERA_BURST=2`. A runner's cache directory is fresh every run, so its limiter is a separate domain drawing on the same account: it has to pace itself, and it must never be allowed the fleet's burst of 10 — a bucket that starts full looks paced until ten calls leave at once. `eval` also passes `--l2-max-wait 1800`, so it queues for its turn instead of being refused mid-corpus.
-- Both are time-bounded (10 and 45 minutes): 16 cases at 60 s pacing is ~15 minutes of waiting before any confirmation re-scans, and a hanging job would hold `lakera-live` and block the next night's run.
-- The guard test also asserts that `ci.yml` contains no `secrets.` reference anywhere — a negative over the whole file, so a job nobody anticipated cannot put a vendor call back on the merge gate.
-
-Daily Lakera cost from CI falls from roughly 17 calls per push to 17 calls per day.
+Day to day, vendor drift surfaces at the first real scan in production, fail-closed and agent-readable.
 
 ## Use
 
