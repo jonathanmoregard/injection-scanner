@@ -91,6 +91,7 @@ consuming repo                                      injection-scanner (public)
 2. Allow auto-merge. Turn off "Allow rebase merging": the gate reviews the tree a merge or squash lands (step 3); a rebase-merge can land a different one.
 3. Secret: `AI_GATE_ANTHROPIC_KEY` (dedicated, capped Console workspace).
 4. **The agents' GitHub App/token must not have the `workflows` permission.** Otherwise a PR can add a second workflow whose job is also named `ai-gate` and reports a fake pass (pinning the check source to GitHub Actions does not stop this — every workflow reports as GitHub Actions). This is a `.claude#156` item requiring Jonathan's click in the App settings.
+5. **Default workflow token read-only** (repo or org Actions settings), no other workflow granting `checks: write` or `statuses: write`, and no write scope in any workflow that runs PR code. A token with `checks: write` can POST a check run named `ai-gate` with conclusion success on the head from the same GitHub Actions app; one with `pull-requests: write` can re-post a byte-identical older gate pass, which as the newest verified marker carries over across a base merge past a later block of the same change. The gate's guarantees assume this setting (README Limitations).
 
 ## Must be verified empirically before relying on it
 

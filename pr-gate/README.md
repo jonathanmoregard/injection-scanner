@@ -159,6 +159,15 @@ the check says what failed.
 5. The agents' GitHub App or token must **not** have the `workflows`
    permission. Otherwise a PR can add a second workflow whose job is also
    named `ai-gate` and reports a fake pass.
+6. Settings → Actions → General → Workflow permissions: **read repository
+   contents** (read-only default token), for the repo or the org. No other
+   workflow may grant itself `checks: write` or `statuses: write`, and no
+   workflow that runs PR code (builds, tests, `pull_request_target` with a
+   checkout) may hold any write scope. A token with `checks: write` can
+   create a check run named `ai-gate` with conclusion success on the head,
+   from the same GitHub Actions app the ruleset trusts, so the required
+   check passes without the gate; one with `pull-requests: write` posts
+   reviews as `github-actions[bot]` (see Limitations).
 
 Org repos need their own secret and ruleset.
 
@@ -301,6 +310,13 @@ their maximum suspicion.
   merge result nobody reviewed.
 - The fake-check defence rests on no agent credential having the `workflows`
   permission; a host PAT with that scope defeats it.
+- The gate's guarantees assume setup step 6: a read-only default workflow
+  token, no other workflow with `checks: write` or `statuses: write`, and
+  no write scope in any workflow that runs PR code. A workflow that breaks
+  this can report a fake `ai-gate` success (same GitHub Actions app), and
+  with `pull-requests: write` it can also re-post a byte-identical older
+  gate pass: that is the newest verified marker, so it carries over across
+  a later "Update branch" even past a later block of the same change.
 - Any workflow in the repo can post reviews as `github-actions[bot]`, so the
   gate signs its review markers with an HMAC keyed by the Anthropic API key,
   which only the gate step receives. The signature covers the whole review
