@@ -190,6 +190,14 @@ it, each with the reason. Design: `docs/superpowers/specs/2026-10-24-pr-gate-des
     (Hangul fillers U+115F/1160/3164/FFA0, U+034F, U+180B-180F). File paths
     are checked too. Counts land in the existing `SanitizeResult` counters,
     so the audit record keys are unchanged.
+21a. **Control characters** (category Cc) are not in the shared code
+    profile, whose other callers keep its behaviour; pr-gate's
+    hidden-Unicode check adds them for added lines: any C0/C1 control or
+    DEL except TAB, form feed (U+000C, page breaks) and a CR ending the
+    line (CRLF files). An ESC erase-line or conceal sequence, backspaces or
+    a mid-line CR hide or overwrite the line in a terminal review; NUL and
+    U+0085 have no use in source. Same non-overridable hit, with the code
+    points listed.
 22. **Lockfile allowlists:** npm-family locks: `registry.npmjs.org`,
     `registry.yarnpkg.com`. Python locks and `requirements*.txt` /
     `constraints*.txt`: `pypi.org`, `files.pythonhosted.org`. `Cargo.lock`:

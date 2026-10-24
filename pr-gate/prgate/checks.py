@@ -47,6 +47,13 @@ def _u(cps) -> str:
 
 # ----- hidden Unicode ------------------------------------------------------
 
+# Control characters (category Cc) in an added line: a terminal acts on
+# them, and an ESC sequence can erase or conceal the line under review. The
+# shared "code" profile keeps them for its other callers. Allowed: TAB, form
+# feed (page breaks) and a trailing CR (CRLF files).
+_CONTROLS = re.compile(r"[\x00-\x08\x0a\x0b\x0d-\x1f\x7f-\x9f]")
+
+
 def hidden_unicode(files: list[FileChange]) -> list[Hit]:
     hits = []
     for f in files:
@@ -56,10 +63,10 @@ def hidden_unicode(files: list[FileChange]) -> list[Hit]:
                 hits.append(Hit("hidden-unicode", f.path,
                                 f"in the file path: {_u(cp for _, cp in found)}", False))
         for line_no, text in f.added:
-            found = find_hidden(text, "code")
-            if found:
-                hits.append(Hit("hidden-unicode", f.path,
-                                f"line {line_no}: {_u(cp for _, cp in found)}", False))
+            cps = [cp for _, cp in find_hidden(text, "code")]
+            cps += [ord(c) for c in _CONTROLS.findall(text.removesuffix("\r"))]
+            if cps:
+                hits.append(Hit("hidden-unicode", f.path, f"line {line_no}: {_u(cps)}", False))
     return hits
 
 

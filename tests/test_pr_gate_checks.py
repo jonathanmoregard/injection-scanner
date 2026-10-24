@@ -49,6 +49,28 @@ def test_clean_lines_pass():
     assert checks.hidden_unicode([fc("a.md", ["café 中 ✅ tab\there"])]) == []
 
 
+@pytest.mark.parametrize("text,cp", [
+    # ESC erase-line + cursor-up: the line vanishes from a terminal review.
+    ('x = 1  # \x1b[2K\x1b[1A', "U+001B"),
+    ("evil()\x1b[8m concealed", "U+001B"),
+    ("a = 1\x00", "U+0000"),
+    ("ok\x08\x08\x08", "U+0008"),
+    ("x\x7f", "U+007F"),
+    ("next\x85line", "U+0085"),
+    ("csi\x9b2K", "U+009B"),
+    ("overwrite\rshown", "U+000D"),  # a CR mid-line rewrites the terminal line
+])
+def test_control_characters_in_an_added_line_block(text, cp):
+    [hit] = checks.hidden_unicode([fc("a.py", [text])])
+    assert (hit.rule, hit.overridable) == ("hidden-unicode", False)
+    assert "line 1" in hit.detail and cp in hit.detail
+
+
+@pytest.mark.parametrize("text", ["a\tb", "crlf line\r", "page\x0cbreak", "\x0c"])
+def test_tab_trailing_cr_and_form_feed_pass(text):
+    assert checks.hidden_unicode([fc("a.c", [text])]) == []
+
+
 def test_removed_lines_are_not_checked():
     f = fc("a.md")
     f.removed = ["bad\u200b"]

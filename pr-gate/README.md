@@ -37,7 +37,10 @@ the base branch). In order, failing closed at every step:
 6. **Deterministic checks** (any hit blocks):
    - hidden Unicode in added lines or file paths (`unicode_sanitize` strict
      `profile="code"`: invisible, bidi, tag, variation-selector, private-use,
-     soft-hyphen, line-separator characters). **Never overridable.**
+     soft-hyphen, line-separator characters), and control characters in
+     added lines (ESC sequences that erase or conceal a line in a terminal,
+     NUL, backspace, DEL, C1 such as U+0085; TAB, form feed and a trailing CR
+     are fine). **Never overridable.**
    - lockfile entries resolving to a host outside the per-ecosystem allowlist
      (npm/yarn registries, crates.io, PyPI, github.com and NixOS release hosts
      for flakes, rubygems). JSON, TOML and YAML lockfiles (`package-lock.json`,
