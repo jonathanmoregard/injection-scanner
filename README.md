@@ -108,7 +108,7 @@ The key can be sent only to the canonical Guard destination, `https://api.lakera
 
 Per-push CI calls no external service. `.github/workflows/ci.yml` runs only the deterministic suite on Python 3.12 and 3.13 — no Lakera, no Anthropic, no OpenAI, no secrets — so a pull request cannot go red because a vendor is down or throttled, and it works unchanged on a fork. Pytest installs a project-wide socket embargo before collection and keeps it through fixture finalizers: IPv4 and IPv6 sockets are forbidden, Unix sockets remain available, and command-line, marker and fixture escape hatches are rejected. Offline coverage does not shrink: `tests/test_judge.py` drives the real Anthropic/OpenAI SDKs over a stub transport (which is what caught the 1.x `temperature` signature break), while `tests/test_lakera.py` exercises request construction, proxy/redirect policy, bounded reads, JSON decoding and the strict response contract using only in-process `_post`, transport and `OpenerDirector` doubles — never loopback or a real endpoint.
 
-The live evaluation is an operational/scheduled workflow, not part of pytest or the merge gate. It lives in `.github/workflows/live-eval.yml` and runs **nightly at 03:17 UTC and on demand**:
+The live evaluation is an operational workflow, not part of pytest or the merge gate. It lives in `.github/workflows/live-eval.yml` and runs **on demand only** — the nightly schedule was removed 2026-10-24 so CI puts no recurring load on vendor quotas:
 
 ```bash
 # check a detection-quality-sensitive PR before merging

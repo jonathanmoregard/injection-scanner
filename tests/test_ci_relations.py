@@ -21,8 +21,8 @@ green, renames a group, or drops a `needs` while fixing something else. So:
 
   1. `ci.yml` triggers on pull_request and push, has no job but `test`, and
      the raw file contains no `secrets.` reference anywhere.
-  2. `live-eval.yml` triggers on exactly schedule and workflow_dispatch — it
-     is not a merge gate and must not become one by accident.
+  2. `live-eval.yml` triggers on workflow_dispatch only — it is not a merge
+     gate, and puts no recurring (scheduled) load on vendors.
   3. Its workflow-level concurrency group is `lakera-live` with
      `cancel-in-progress: false`: at most one live run at a time, queued
      rather than dropped, because cancelling would hide a real failure.
@@ -126,9 +126,10 @@ def test_ci_cancels_superseded_pull_request_runs() -> None:
 # ---------- live-eval.yml: off the gate, serialised, paced ----------
 
 def test_the_live_pipeline_is_never_a_merge_gate() -> None:
-    assert set(_load(LIVE)[_ON_KEY]) == {"schedule", "workflow_dispatch"}, (
+    assert set(_load(LIVE)[_ON_KEY]) == {"workflow_dispatch"}, (
         "adding pull_request or push here would put a vendor call back on "
-        "the merge gate"
+        "the merge gate; adding schedule would put recurring load on the "
+        "vendors' free quotas"
     )
 
 
