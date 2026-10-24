@@ -1,11 +1,11 @@
 """Tests for the Lakera Guard L2 layer (injection_scanner.lakera).
 
-FULLY MOCKED — no network. Tests replace either `lakera._post` or its
-`lakera._OPENER` transport seam and control the key source via env vars + the
-keyloader keyring lookup. Asserts the FAIL-CLOSED contract: a flagged
+FULLY MOCKED — no network. Tests replace either `vendor_http._post` or its
+`vendor_http._OPENER` transport seam and control the key source via env vars +
+the keyloader keyring lookup. Asserts the FAIL-CLOSED contract: a flagged
 classification, a missing key, a broken `*_FILE` mount, and any transport
-error ALL collapse to ok=False, and the input text never leaks into the reason
-/ categories strings.
+error ALL collapse to ok=False, and the input text never leaks into the
+reason. The shared transport is exercised end to end through this adapter.
 """
 from __future__ import annotations
 
@@ -17,7 +17,7 @@ from urllib.error import HTTPError, URLError
 
 import pytest
 
-from injection_scanner import keyloader, lakera, throttle
+from injection_scanner import keyloader, lakera, throttle, vendor_http
 from injection_scanner.intercept import scan_text
 from injection_scanner.throttle import CrossProcessLimiter, Decision, LimiterConfig
 
@@ -53,7 +53,7 @@ def _with_key(monkeypatch, value: str = "lk-test-key"):
 def test_flagged_true_rejects_with_lakera_reason(monkeypatch):
     _with_key(monkeypatch)
     monkeypatch.setattr(
-        lakera, "_post",
+        vendor_http, "_post",
         lambda *a, **k: {
             "flagged": True,
             "breakdown": [
@@ -66,7 +66,6 @@ def test_flagged_true_rejects_with_lakera_reason(monkeypatch):
     assert res.ok is False
     assert res.flagged is True
     assert res.reason == "lakera:prompt_attack"
-    assert res.categories == ["prompt_attack"]
     assert "HOSTILE_DETECTOR_MARKER" not in res.reason
 
 
@@ -78,7 +77,7 @@ def test_moderation_only_does_not_reject(monkeypatch):
     rejected on moderation alone."""
     _with_key(monkeypatch)
     monkeypatch.setattr(
-        lakera, "_post",
+        vendor_http, "_post",
         lambda *a, **k: {
             "flagged": True,
             "breakdown": [
@@ -91,7 +90,6 @@ def test_moderation_only_does_not_reject(monkeypatch):
     assert res.ok is True
     assert res.reason == "pass"
     assert res.flagged is False
-    assert res.categories == []
 
 
 # ----- (b) clean breakdown -> pass -----
@@ -99,7 +97,7 @@ def test_moderation_only_does_not_reject(monkeypatch):
 def test_flagged_false_passes(monkeypatch):
     _with_key(monkeypatch)
     monkeypatch.setattr(
-        lakera, "_post",
+        vendor_http, "_post",
         lambda *a, **k: {
             "flagged": False,
             "breakdown": [{"detector_type": "prompt_attack", "detected": False}],
@@ -115,7 +113,7 @@ def test_flagged_false_passes(monkeypatch):
 
 def test_flagged_true_without_breakdown_is_a_bad_response(monkeypatch):
     _with_key(monkeypatch)
-    monkeypatch.setattr(lakera, "_post", lambda *a, **k: {"flagged": True})
+    monkeypatch.setattr(vendor_http, "_post", lambda *a, **k: {"flagged": True})
     res = lakera.check("something")
     assert res.ok is False
     assert res.flagged is False
@@ -126,7 +124,7 @@ def test_flagged_true_without_breakdown_is_a_bad_response(monkeypatch):
 
 def test_bad_response_shape_fails_closed(monkeypatch):
     _with_key(monkeypatch)
-    monkeypatch.setattr(lakera, "_post", lambda *a, **k: {"weird": 1})
+    monkeypatch.setattr(vendor_http, "_post", lambda *a, **k: {"weird": 1})
     res = lakera.check("something")
     assert res.ok is False
     assert res.reason == "lakera_unavailable:bad-response"
@@ -243,11 +241,10 @@ def test_bad_response_shape_fails_closed(monkeypatch):
 )
 def test_malformed_or_contradictory_decisions_fail_closed(monkeypatch, data):
     _with_key(monkeypatch)
-    monkeypatch.setattr(lakera, "_post", lambda *_a, **_kw: data)
+    monkeypatch.setattr(vendor_http, "_post", lambda *_a, **_kw: data)
     result = lakera.check("anything")
     assert result.ok is False
     assert result.flagged is False
-    assert result.categories == []
     assert result.reason == "lakera_unavailable:bad-response"
 
 
@@ -255,7 +252,7 @@ def test_a_nonprompt_detector_never_exposes_upstream_strings(monkeypatch):
     _with_key(monkeypatch)
     marker = "HOSTILE_DETECTOR_MARKER_DO_NOT_EXPOSE"
     monkeypatch.setattr(
-        lakera,
+        vendor_http,
         "_post",
         lambda *_a, **_kw: {
             "flagged": True,
@@ -268,7 +265,6 @@ def test_a_nonprompt_detector_never_exposes_upstream_strings(monkeypatch):
     result = lakera.check("anything")
     assert result.ok is True
     assert result.reason == "pass"
-    assert result.categories == []
     assert marker not in result.reason
 
 
@@ -278,14 +274,14 @@ def test_request_body_contains_breakdown_and_text(monkeypatch):
     _with_key(monkeypatch)
     captured = {}
 
-    def _capture(url, body, headers, timeout):
+    def _capture(url, body, headers, *, timeout, max_bytes):
         captured["body"] = body
         return {
             "flagged": False,
             "breakdown": [{"detector_type": "prompt_attack", "detected": False}],
         }
 
-    monkeypatch.setattr(lakera, "_post", _capture)
+    monkeypatch.setattr(vendor_http, "_post", _capture)
     marker = "UNIQUE_UNTRUSTED_TEXT_MARKER_4242"
     res = lakera.check(marker)
     assert res.ok is True
@@ -304,7 +300,7 @@ def test_post_urlerror_fails_closed(monkeypatch):
     def _boom(*_a, **_kw):
         raise URLError("network down")
 
-    monkeypatch.setattr(lakera, "_post", _boom)
+    monkeypatch.setattr(vendor_http, "_post", _boom)
     res = lakera.check("anything")
     assert res.ok is False
     assert res.reason.startswith("lakera_unavailable:")
@@ -319,7 +315,7 @@ def test_no_key_rejects(monkeypatch):
     def _should_not_call(*_a, **_kw):
         raise AssertionError("_post called despite missing key")
 
-    monkeypatch.setattr(lakera, "_post", _should_not_call)
+    monkeypatch.setattr(vendor_http, "_post", _should_not_call)
     res = lakera.check("anything")
     assert res.ok is False
     assert res.reason == "lakera_unavailable:no-key"
@@ -334,22 +330,21 @@ def test_broken_file_mount_rejects(monkeypatch, tmp_path):
     def _should_not_call(*_a, **_kw):
         raise AssertionError("_post called despite broken key config")
 
-    monkeypatch.setattr(lakera, "_post", _should_not_call)
+    monkeypatch.setattr(vendor_http, "_post", _should_not_call)
     res = lakera.check("anything")
     assert res.ok is False
     assert res.reason == "lakera_unavailable:key-config-error"
 
 
-# ----- (f) input bytes never leak into reason / categories -----
+# ----- (f) input bytes never leak into the reason -----
 
 def test_input_text_never_leaks(monkeypatch):
     _with_key(monkeypatch)
     secret_marker = "RAW_SECRET_LIKE_VALUE_KEEPOUT_98765"
 
-    # Flagged path: categories come from Lakera, not the input; the input
-    # marker must not appear anywhere in the caller-visible strings.
+    # Flagged path: the input marker must not appear in the reason.
     monkeypatch.setattr(
-        lakera, "_post",
+        vendor_http, "_post",
         lambda *a, **k: {
             "flagged": True,
             "breakdown": [{"detector_type": "prompt_attack", "detected": True}],
@@ -358,15 +353,13 @@ def test_input_text_never_leaks(monkeypatch):
     res = lakera.check(f"attack payload {secret_marker}")
     assert res.ok is False
     assert secret_marker not in res.reason
-    for c in res.categories:
-        assert secret_marker not in c
 
     # Transport-error path: exception TYPE only, never a stringified message
     # (which could embed the sent body).
     def _boom(*_a, **_kw):
         raise URLError(secret_marker)
 
-    monkeypatch.setattr(lakera, "_post", _boom)
+    monkeypatch.setattr(vendor_http, "_post", _boom)
     res2 = lakera.check(f"attack payload {secret_marker}")
     assert res2.ok is False
     assert secret_marker not in res2.reason
@@ -398,7 +391,7 @@ def _headers(fields: dict[str, str]) -> HTTPMessage:
     """Response headers exactly as `urllib` builds them.
 
     NOT a plain dict, deliberately. A dict satisfies the `.get("Retry-After")`
-    in `lakera._retry_after` and would make these fixtures pass, but real
+    in `vendor_http.retry_after` and would make these fixtures pass, but real
     `HTTPError.headers` is an `http.client.HTTPMessage`, whose lookup is
     CASE-INSENSITIVE — as RFC 9110 requires and as real servers vary. A
     dict-based fixture therefore cannot tell a correct lookup from one that
@@ -432,7 +425,7 @@ def _reason_for(monkeypatch, exc: BaseException) -> str:
     def _boom(*_a, **_kw):
         raise exc
 
-    monkeypatch.setattr(lakera, "_post", _boom)
+    monkeypatch.setattr(vendor_http, "_post", _boom)
     res = lakera.check("anything")
     assert res.ok is False, "an HTTP error must still fail CLOSED"
     assert res.flagged is False
@@ -550,7 +543,7 @@ def test_no_server_supplied_text_reaches_the_reason(monkeypatch):
 def test_scan_text_passes_when_lakera_clean_and_key_present(monkeypatch):
     _with_key(monkeypatch)
     monkeypatch.setattr(
-        lakera, "_post",
+        vendor_http, "_post",
         lambda *a, **k: {
             "flagged": False,
             "breakdown": [{"detector_type": "prompt_attack", "detected": False}],
@@ -572,7 +565,7 @@ def test_scan_text_rejects_when_no_key(monkeypatch):
 def test_scan_text_rejects_when_lakera_flagged(monkeypatch):
     _with_key(monkeypatch)
     monkeypatch.setattr(
-        lakera, "_post",
+        vendor_http, "_post",
         lambda *a, **k: {
             "flagged": True,
             "breakdown": [{"detector_type": "prompt_attack", "detected": True}],
@@ -596,7 +589,7 @@ def test_scan_text_surfaces_the_http_status_without_server_text(monkeypatch):
     def _boom(*_a, **_kw):
         raise exc
 
-    monkeypatch.setattr(lakera, "_post", _boom)
+    monkeypatch.setattr(vendor_http, "_post", _boom)
     v = scan_text(_CLEAN, use_honeypot=False, use_lakera=True)
 
     assert v.ok is False  # an HTTP error still quarantines the report
@@ -666,7 +659,7 @@ def test_an_empty_bucket_rejects_without_calling_lakera(monkeypatch):
             "breakdown": [{"detector_type": "prompt_attack", "detected": False}],
         }
 
-    monkeypatch.setattr(lakera, "_post", _post)
+    monkeypatch.setattr(vendor_http, "_post", _post)
     assert lakera.check("first").ok is True
     res = lakera.check("second")
     assert res.ok is False
@@ -688,7 +681,7 @@ def test_a_broken_limiter_rejects_and_never_calls_lakera(monkeypatch, tmp_path):
     def _should_not_call(*_a, **_kw):
         raise AssertionError("_post called with a broken limiter")
 
-    monkeypatch.setattr(lakera, "_post", _should_not_call)
+    monkeypatch.setattr(vendor_http, "_post", _should_not_call)
     res = lakera.check("anything")
     assert res.ok is False
     assert res.reason == "lakera_unavailable:limiter-error"
@@ -713,7 +706,7 @@ def test_a_limiter_that_cannot_be_built_rejects_and_never_calls_lakera(monkeypat
     def _should_not_call(*_a, **_kw):
         raise AssertionError("_post called with an unbuildable limiter")
 
-    monkeypatch.setattr(lakera, "_post", _should_not_call)
+    monkeypatch.setattr(vendor_http, "_post", _should_not_call)
     res = lakera.check("anything")
     assert res.ok is False
     assert res.reason == "lakera_unavailable:limiter-error"
@@ -750,7 +743,7 @@ def test_a_call_that_cannot_happen_spends_no_token(
     def _should_not_call(*_a, **_kw):
         raise AssertionError("_post called without a usable key")
 
-    monkeypatch.setattr(lakera, "_post", _should_not_call)
+    monkeypatch.setattr(vendor_http, "_post", _should_not_call)
     res = lakera.check("anything")
     assert res.reason == expected
     assert not _state_file().exists(), "the limiter was never even opened"
@@ -776,7 +769,7 @@ def test_only_429_and_503_open_the_breaker(monkeypatch, code, second_reason):
     def _boom(*_a, **_kw):
         raise exc
 
-    monkeypatch.setattr(lakera, "_post", _boom)
+    monkeypatch.setattr(vendor_http, "_post", _boom)
     assert lakera.check("x").reason == f"lakera_unavailable:HTTPError:{code}"
     assert lakera.check("x").reason == second_reason
 
@@ -799,7 +792,7 @@ def test_a_hostile_retry_after_reaches_neither_the_reason_nor_the_state(monkeypa
     def _boom(*_a, **_kw):
         raise exc
 
-    monkeypatch.setattr(lakera, "_post", _boom)
+    monkeypatch.setattr(vendor_http, "_post", _boom)
     res = lakera.check("anything")
 
     assert res.ok is False
@@ -837,7 +830,7 @@ def test_a_flagged_two_hundred_still_closes_the_breaker(monkeypatch):
     assert json.loads(seed.state_path.read_text(encoding="utf-8"))["failures"] == 2
 
     monkeypatch.setattr(
-        lakera, "_post",
+        vendor_http, "_post",
         lambda *a, **k: {
             "flagged": True,
             "breakdown": [{"detector_type": "prompt_attack", "detected": True}],
@@ -854,7 +847,7 @@ def test_a_parsed_two_hundred_records_success_before_schema_validation(monkeypat
     _with_key(monkeypatch)
     spy = _SpyLimiter(Decision.ALLOWED)
     _install_spy(monkeypatch, spy)
-    monkeypatch.setattr(lakera, "_post", lambda *_a, **_kw: {"malformed": True})
+    monkeypatch.setattr(vendor_http, "_post", lambda *_a, **_kw: {"malformed": True})
     result = lakera.check("anything")
     assert result.reason == "lakera_unavailable:bad-response"
     assert len(spy.successes) == 1
@@ -891,7 +884,7 @@ def test_a_two_hundred_that_raced_a_trip_does_not_reopen_the_gate(monkeypatch):
             "breakdown": [{"detector_type": "prompt_attack", "detected": False}],
         }
 
-    monkeypatch.setattr(lakera, "_post", _post_that_races_a_peer)
+    monkeypatch.setattr(vendor_http, "_post", _post_that_races_a_peer)
     assert lakera.check("x").ok is True, "this call really did get a clean 200"
 
     st = json.loads(peer.state_path.read_text(encoding="utf-8"))
@@ -908,7 +901,7 @@ def test_the_max_wait_keyword_reaches_the_limiter(monkeypatch):
     def _should_not_call(*_a, **_kw):
         raise AssertionError("_post called after a THROTTLED decision")
 
-    monkeypatch.setattr(lakera, "_post", _should_not_call)
+    monkeypatch.setattr(vendor_http, "_post", _should_not_call)
     res = lakera.check("x", max_wait_s=12.5)
     assert res.reason == "lakera_unavailable:throttled"
     assert spy.acquired == [12.5]
@@ -921,7 +914,7 @@ def test_an_absent_max_wait_falls_back_to_the_environment(monkeypatch):
     monkeypatch.setenv("INJECTION_SCANNER_LAKERA_MAX_WAIT_S", "42")
     spy = _SpyLimiter(Decision.THROTTLED)
     _install_spy(monkeypatch, spy)
-    monkeypatch.setattr(lakera, "_post", lambda *a, **k: {"flagged": False})
+    monkeypatch.setattr(vendor_http, "_post", lambda *a, **k: {"flagged": False})
     lakera.check("x")
     assert spy.acquired == [42.0]
 
@@ -950,7 +943,7 @@ def test_the_raw_retry_after_header_is_handed_to_the_limiter_verbatim(
     def _boom(*_a, **_kw):
         raise exc
 
-    monkeypatch.setattr(lakera, "_post", _boom)
+    monkeypatch.setattr(vendor_http, "_post", _boom)
     assert lakera.check("x").reason == "lakera_unavailable:HTTPError:429"
     assert spy.throttled == ["17"]
     assert spy.successes == []
@@ -964,7 +957,7 @@ def test_a_missing_retry_after_header_is_none_not_a_crash(monkeypatch):
     def _boom(*_a, **_kw):
         raise _http_error(503, "Service Unavailable")
 
-    monkeypatch.setattr(lakera, "_post", _boom)
+    monkeypatch.setattr(vendor_http, "_post", _boom)
     assert lakera.check("x").reason == "lakera_unavailable:HTTPError:503"
     assert spy.throttled == [None]
     assert spy.throttle_causes == [throttle.BreakerCause.SERVICE]
@@ -978,7 +971,7 @@ def test_a_429_records_quota_as_the_breaker_cause(monkeypatch):
     def _boom(*_a, **_kw):
         raise _http_error(429, "Too Many Requests")
 
-    monkeypatch.setattr(lakera, "_post", _boom)
+    monkeypatch.setattr(vendor_http, "_post", _boom)
     assert lakera.check("x").reason == "lakera_unavailable:HTTPError:429"
     assert spy.throttle_causes == [throttle.BreakerCause.QUOTA]
 
@@ -988,7 +981,7 @@ def test_an_open_service_breaker_has_a_distinct_fixed_reason(monkeypatch):
     spy = _SpyLimiter(Decision.SERVICE_UNAVAILABLE)
     _install_spy(monkeypatch, spy)
     monkeypatch.setattr(
-        lakera,
+        vendor_http,
         "_post",
         lambda *_a, **_kw: pytest.fail("service breaker must suppress the call"),
     )
@@ -1006,7 +999,7 @@ def test_a_non_http_failure_leaves_the_breaker_alone(monkeypatch):
     def _boom(*_a, **_kw):
         raise URLError("network down")
 
-    monkeypatch.setattr(lakera, "_post", _boom)
+    monkeypatch.setattr(vendor_http, "_post", _boom)
     assert lakera.check("x").reason == "lakera_unavailable:URLError"
     assert spy.throttled == []
     assert spy.successes == []
@@ -1026,7 +1019,7 @@ def test_a_rebound_status_code_cannot_decide_to_stop_the_fleet(monkeypatch):
     def _boom(*_a, **_kw):
         raise exc
 
-    monkeypatch.setattr(lakera, "_post", _boom)
+    monkeypatch.setattr(vendor_http, "_post", _boom)
     assert lakera.check("x").reason == "lakera_unavailable:HTTPError"
     assert spy.throttled == []
 
@@ -1038,7 +1031,7 @@ def test_scan_text_surfaces_the_throttled_reason_and_fails_closed(monkeypatch):
     monkeypatch.setenv("INJECTION_SCANNER_LAKERA_MIN_INTERVAL_S", "3600")
     monkeypatch.setenv("INJECTION_SCANNER_LAKERA_BURST", "1")
     monkeypatch.setattr(
-        lakera, "_post",
+        vendor_http, "_post",
         lambda *a, **k: {
             "flagged": False,
             "breakdown": [{"detector_type": "prompt_attack", "detected": False}],
@@ -1072,7 +1065,7 @@ def _captured_timeout(monkeypatch) -> float:
     """Run one `check` and return the timeout `_post` actually received."""
     seen: dict = {}
 
-    def _spy(url, body, headers, timeout):
+    def _spy(url, body, headers, *, timeout, max_bytes):
         seen["timeout"] = timeout
         return {
             "flagged": False,
@@ -1081,14 +1074,14 @@ def _captured_timeout(monkeypatch) -> float:
             ],
         }
 
-    monkeypatch.setattr(lakera, "_post", _spy)
+    monkeypatch.setattr(vendor_http, "_post", _spy)
     assert lakera.check("benign").ok is True
     return seen["timeout"]
 
 
 def test_an_unset_timeout_is_the_documented_default(monkeypatch):
     _with_key(monkeypatch)
-    assert _captured_timeout(monkeypatch) == lakera.DEFAULT_TIMEOUT_S
+    assert _captured_timeout(monkeypatch) == vendor_http.DEFAULT_TIMEOUT_S
 
 
 def test_a_timeout_inside_the_range_is_used_as_written(monkeypatch):
@@ -1103,7 +1096,7 @@ def test_a_non_finite_timeout_degrades_to_the_default(monkeypatch, raw):
     `urlopen` then waited forever — a hang, not a fail-closed reject."""
     _with_key(monkeypatch)
     monkeypatch.setenv("INJECTION_SCANNER_LAKERA_TIMEOUT", raw)
-    assert _captured_timeout(monkeypatch) == lakera.DEFAULT_TIMEOUT_S
+    assert _captured_timeout(monkeypatch) == vendor_http.DEFAULT_TIMEOUT_S
 
 
 def test_an_absurd_timeout_is_clamped_to_the_ceiling(monkeypatch):
@@ -1111,7 +1104,7 @@ def test_an_absurd_timeout_is_clamped_to_the_ceiling(monkeypatch):
     unbounded in every way that matters."""
     _with_key(monkeypatch)
     monkeypatch.setenv("INJECTION_SCANNER_LAKERA_TIMEOUT", "1e9")
-    assert _captured_timeout(monkeypatch) == lakera.TIMEOUT_RANGE[1]
+    assert _captured_timeout(monkeypatch) == vendor_http.TIMEOUT_RANGE[1]
 
 
 def test_a_negative_timeout_is_clamped_to_the_floor(monkeypatch):
@@ -1120,13 +1113,13 @@ def test_a_negative_timeout_is_clamped_to_the_floor(monkeypatch):
     operator hunted a Lakera outage that did not exist."""
     _with_key(monkeypatch)
     monkeypatch.setenv("INJECTION_SCANNER_LAKERA_TIMEOUT", "-5")
-    assert _captured_timeout(monkeypatch) == lakera.TIMEOUT_RANGE[0]
+    assert _captured_timeout(monkeypatch) == vendor_http.TIMEOUT_RANGE[0]
 
 
 def test_a_malformed_timeout_degrades_to_the_default(monkeypatch):
     _with_key(monkeypatch)
     monkeypatch.setenv("INJECTION_SCANNER_LAKERA_TIMEOUT", "abc")
-    assert _captured_timeout(monkeypatch) == lakera.DEFAULT_TIMEOUT_S
+    assert _captured_timeout(monkeypatch) == vendor_http.DEFAULT_TIMEOUT_S
 
 
 # ---------- (i) a 3xx is an outage, never a second request ------------------
@@ -1199,18 +1192,19 @@ class _InProcessHTTPSHandler(urllib.request.HTTPSHandler):
 
 def _hermetic_post(monkeypatch, outcome, *, timeout: float = 5.0):
     opener = _Opener(outcome)
-    monkeypatch.setattr(lakera, "_OPENER", opener)
+    monkeypatch.setattr(vendor_http, "_OPENER", opener)
     result = None
     error = None
     try:
-        result = lakera._post(
+        result = vendor_http._post(
             "https://api.lakera.invalid/v2/guard",
             b"{}",
             {
                 "Authorization": f"Bearer {_KEY_MARKER}",
                 "Content-Type": "application/json",
             },
-            timeout,
+            timeout=timeout,
+            max_bytes=vendor_http.max_response_bytes("lakera"),
         )
     except BaseException as exc:  # returned to the assertion, never swallowed
         error = exc
@@ -1219,24 +1213,24 @@ def _hermetic_post(monkeypatch, outcome, *, timeout: float = 5.0):
 
 def test_the_production_opener_installs_the_no_redirect_handler():
     assert any(
-        isinstance(handler, lakera._NoRedirect)
-        for handler in lakera._OPENER.handlers
+        isinstance(handler, vendor_http._NoRedirect)
+        for handler in vendor_http._OPENER.handlers
     )
     assert not any(
         isinstance(handler, urllib.request.ProxyHandler)
-        for handler in lakera._OPENER.handlers
+        for handler in vendor_http._OPENER.handlers
     )
 
 
 def test_build_opener_ignores_ambient_proxies(monkeypatch):
     monkeypatch.setenv("HTTPS_PROXY", "http://proxy.invalid:8443")
     monkeypatch.setenv("ALL_PROXY", "http://proxy.invalid:8443")
-    opener = lakera._build_opener()
+    opener = vendor_http._build_opener()
     assert not any(
-        isinstance(handler, lakera.urllib.request.ProxyHandler)
+        isinstance(handler, urllib.request.ProxyHandler)
         for handler in opener.handlers
     )
-    assert any(isinstance(handler, lakera._NoRedirect) for handler in opener.handlers)
+    assert any(isinstance(handler, vendor_http._NoRedirect) for handler in opener.handlers)
 
 
 def test_post_uses_the_real_proxy_free_no_redirect_opener_chain(monkeypatch):
@@ -1253,20 +1247,21 @@ def test_post_uses_the_real_proxy_free_no_redirect_opener_chain(monkeypatch):
     transport = _InProcessHTTPSHandler(response)
     opener = urllib.request.build_opener(
         urllib.request.ProxyHandler({}),
-        lakera._NoRedirect(),
+        vendor_http._NoRedirect(),
         transport,
     )
-    monkeypatch.setattr(lakera, "_OPENER", opener)
+    monkeypatch.setattr(vendor_http, "_OPENER", opener)
 
     body = b'{"messages":[{"role":"user","content":"test"}]}'
-    result = lakera._post(
+    result = vendor_http._post(
         lakera._DEFAULT_URL,
         body,
         {
             "Authorization": f"Bearer {_KEY_MARKER}",
             "Content-Type": "application/json",
         },
-        6.25,
+        timeout=6.25,
+        max_bytes=vendor_http.DEFAULT_MAX_RESPONSE_BYTES,
     )
 
     assert result["flagged"] is False
@@ -1277,13 +1272,13 @@ def test_post_uses_the_real_proxy_free_no_redirect_opener_chain(monkeypatch):
     assert request.data == body
     assert request.get_header("Authorization") == f"Bearer {_KEY_MARKER}"
     assert request.timeout == 6.25
-    assert response.read_limits == [lakera.DEFAULT_MAX_RESPONSE_BYTES + 1]
+    assert response.read_limits == [vendor_http.DEFAULT_MAX_RESPONSE_BYTES + 1]
     assert response.exited is True
     assert not any(
         isinstance(handler, urllib.request.ProxyHandler)
         for handler in opener.handlers
     )
-    assert any(isinstance(handler, lakera._NoRedirect) for handler in opener.handlers)
+    assert any(isinstance(handler, vendor_http._NoRedirect) for handler in opener.handlers)
     assert transport in opener.handlers
 
 
@@ -1307,10 +1302,10 @@ def test_a_201_is_not_a_liveness_success(monkeypatch):
     transport = _InProcessHTTPSHandler(response)
     opener = urllib.request.build_opener(
         urllib.request.ProxyHandler({}),
-        lakera._NoRedirect(),
+        vendor_http._NoRedirect(),
         transport,
     )
-    monkeypatch.setattr(lakera, "_OPENER", opener)
+    monkeypatch.setattr(vendor_http, "_OPENER", opener)
 
     result = lakera.check("anything")
 
@@ -1333,14 +1328,14 @@ def test_a_redirect_is_an_outage_and_never_forwards_the_key(monkeypatch):
     result, raised, opener = _hermetic_post(monkeypatch, error)
     assert result is None
     assert raised is error
-    assert lakera._transport_reason(raised) == "lakera_unavailable:HTTPError:302"
+    assert vendor_http.transport_reason("lakera", raised) == "lakera_unavailable:HTTPError:302"
     assert len(opener.calls) == 1
     request, timeout = opener.calls[0]
     assert request.full_url == "https://api.lakera.invalid/v2/guard"
     assert request.get_method() == "POST"
     assert request.get_header("Authorization") == f"Bearer {_KEY_MARKER}"
     assert timeout == 5.0
-    assert lakera._NoRedirect().redirect_request(
+    assert vendor_http._NoRedirect().redirect_request(
         request, None, 302, "Found", {}, "https://attacker.invalid/elsewhere"
     ) is None
 
@@ -1357,7 +1352,7 @@ def test_a_two_hundred_still_parses_through_the_same_opener(monkeypatch):
     request, timeout = opener.calls[0]
     assert request.get_method() == "POST"
     assert timeout == 4.0
-    assert response.read_limits == [lakera.DEFAULT_MAX_RESPONSE_BYTES + 1]
+    assert response.read_limits == [vendor_http.DEFAULT_MAX_RESPONSE_BYTES + 1]
     assert response.exited is True
 
 
@@ -1377,7 +1372,7 @@ def test_a_two_hundred_still_parses_through_the_same_opener(monkeypatch):
 def test_post_rejects_duplicate_json_keys_at_every_depth(monkeypatch, raw):
     result, raised, opener = _hermetic_post(monkeypatch, _Response(raw))
     assert result is None
-    assert type(raised) is lakera.DuplicateJSONKey
+    assert type(raised) is vendor_http.DuplicateJSONKey
     assert str(raised) == ""
     assert len(opener.calls) == 1
 
@@ -1389,7 +1384,7 @@ def test_check_maps_duplicate_json_keys_to_fixed_bad_response(monkeypatch):
         b'{"flagged":false,"breakdown":[{"detector_type":"prompt_attack",'
         b'"detected":false,"' + marker + b'":1,"' + marker + b'":2}]}'
     )
-    monkeypatch.setattr(lakera, "_OPENER", _Opener(_Response(raw)))
+    monkeypatch.setattr(vendor_http, "_OPENER", _Opener(_Response(raw)))
     result = lakera.check("anything")
     assert result.ok is False
     assert result.reason == "lakera_unavailable:bad-response"
@@ -1398,7 +1393,7 @@ def test_check_maps_duplicate_json_keys_to_fixed_bad_response(monkeypatch):
 
 def test_check_keeps_malformed_json_as_a_typed_transport_outage(monkeypatch):
     _with_key(monkeypatch)
-    monkeypatch.setattr(lakera, "_OPENER", _Opener(_Response(b"not-json")))
+    monkeypatch.setattr(vendor_http, "_OPENER", _Opener(_Response(b"not-json")))
     result = lakera.check("anything")
     assert result.ok is False
     assert result.reason == "lakera_unavailable:JSONDecodeError"
@@ -1422,7 +1417,7 @@ def _post_must_not_run(monkeypatch):
     def _boom(*_a, **_kw):
         raise AssertionError("_post called with an untrusted endpoint")
 
-    monkeypatch.setattr(lakera, "_post", _boom)
+    monkeypatch.setattr(vendor_http, "_post", _boom)
 
 
 @pytest.mark.parametrize(
@@ -1499,7 +1494,7 @@ def test_only_the_canonical_lakera_endpoint_can_receive_the_key(monkeypatch, url
 def _captured_url(monkeypatch) -> str:
     seen: dict = {}
 
-    def _spy(url, body, headers, timeout):
+    def _spy(url, body, headers, *, timeout, max_bytes):
         seen["url"] = url
         return {
             "flagged": False,
@@ -1508,7 +1503,7 @@ def _captured_url(monkeypatch) -> str:
             ],
         }
 
-    monkeypatch.setattr(lakera, "_post", _spy)
+    monkeypatch.setattr(vendor_http, "_post", _spy)
     assert lakera.check("benign").ok is True
     return seen["url"]
 
@@ -1560,14 +1555,14 @@ def _json_body(size: int) -> bytes:
 
 
 def test_a_response_one_byte_over_the_cap_is_an_outage(monkeypatch):
-    cap = lakera.MAX_RESPONSE_BYTES_RANGE[0]
+    cap = vendor_http.MAX_RESPONSE_BYTES_RANGE[0]
     monkeypatch.setenv("INJECTION_SCANNER_LAKERA_MAX_RESPONSE_BYTES", str(cap))
     response = _Response(_json_body(cap + 1))
     result, raised, opener = _hermetic_post(monkeypatch, response)
     assert result is None
-    assert type(raised) is lakera.ResponseTooLarge
+    assert type(raised) is vendor_http.ResponseTooLarge
     assert (
-        lakera._transport_reason(raised)
+        vendor_http.transport_reason("lakera", raised)
         == "lakera_unavailable:ResponseTooLarge"
     )
     assert len(opener.calls) == 1
@@ -1577,7 +1572,7 @@ def test_a_response_one_byte_over_the_cap_is_an_outage(monkeypatch):
 
 def test_a_response_at_the_cap_still_parses(monkeypatch):
     """The control: the cap is a ceiling, not an off-by-one reject."""
-    cap = lakera.MAX_RESPONSE_BYTES_RANGE[0]
+    cap = vendor_http.MAX_RESPONSE_BYTES_RANGE[0]
     monkeypatch.setenv("INJECTION_SCANNER_LAKERA_MAX_RESPONSE_BYTES", str(cap))
     response = _Response(_json_body(cap))
     data, raised, opener = _hermetic_post(monkeypatch, response)
@@ -1608,10 +1603,10 @@ def test_the_response_cap_is_a_range_clamped_input(monkeypatch, raw, expected):
     silently restoring the unbounded read."""
     if raw is not None:
         monkeypatch.setenv("INJECTION_SCANNER_LAKERA_MAX_RESPONSE_BYTES", raw)
-    lo, hi = lakera.MAX_RESPONSE_BYTES_RANGE
+    lo, hi = vendor_http.MAX_RESPONSE_BYTES_RANGE
     want = {
-        "default": lakera.DEFAULT_MAX_RESPONSE_BYTES,
+        "default": vendor_http.DEFAULT_MAX_RESPONSE_BYTES,
         "floor": lo,
         "ceiling": hi,
     }.get(expected, expected)
-    assert lakera._max_response_bytes() == want
+    assert vendor_http.max_response_bytes("lakera") == want

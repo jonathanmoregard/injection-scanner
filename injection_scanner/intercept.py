@@ -399,7 +399,7 @@ def scan_text(
     # mount, or any network/HTTP/JSON/timeout error. lakera.check already
     # collapses every one of those to ok=False with a flat reason (detector
     # name / category label / exception type / bounded HTTP status only —
-    # never input bytes; see lakera._transport_reason), so
+    # never input bytes; see vendor_http.transport_reason), so
     # the `if not res.ok` branch below quarantines both real detections and
     # degraded-coverage outages. Silent degradation of a detection layer is
     # exactly the failure operators must hear about.

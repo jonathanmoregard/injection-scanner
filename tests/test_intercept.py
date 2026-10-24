@@ -211,8 +211,8 @@ def test_orchestrator_strips_but_passes_single_zw():
 # ----- L4 arbitration wiring (lakera flag + honeypot clean -> judge) -----
 
 def _flagged(_text, **_kw):
-    from injection_scanner.lakera import LakeraResult
-    return LakeraResult(ok=False, flagged=True, reason="lakera:prompt_attack")
+    from injection_scanner.vendor_http import VendorResult
+    return VendorResult(ok=False, flagged=True, reason="lakera:prompt_attack")
 
 
 def _hp_clean(_text):
@@ -232,12 +232,12 @@ def test_exact_quota_degradation_uses_strict_benign_arbitration(
 ):
     from injection_scanner import intercept, judge, lakera
     from injection_scanner.judge import JudgeResult, JudgeVote
-    from injection_scanner.lakera import LakeraResult
+    from injection_scanner.vendor_http import VendorResult
 
     monkeypatch.setattr(
         lakera,
         "check",
-        lambda _t, **_kw: LakeraResult(ok=False, reason=reason),
+        lambda _t, **_kw: VendorResult(ok=False, reason=reason),
     )
     monkeypatch.setattr(intercept, "honeypot_check", _hp_clean)
     monkeypatch.setattr(
@@ -272,12 +272,12 @@ def test_non_quota_lakera_failures_never_enter_degraded_arbitration(
     monkeypatch, reason
 ):
     from injection_scanner import intercept, judge, lakera
-    from injection_scanner.lakera import LakeraResult
+    from injection_scanner.vendor_http import VendorResult
 
     monkeypatch.setattr(
         lakera,
         "check",
-        lambda _t, **_kw: LakeraResult(ok=False, reason=reason),
+        lambda _t, **_kw: VendorResult(ok=False, reason=reason),
     )
     monkeypatch.setattr(
         intercept,
@@ -298,13 +298,13 @@ def test_non_quota_lakera_failures_never_enter_degraded_arbitration(
 
 def test_quota_degradation_without_honeypot_stays_fail_closed(monkeypatch):
     from injection_scanner import intercept, lakera
-    from injection_scanner.lakera import LakeraResult
+    from injection_scanner.vendor_http import VendorResult
 
     reason = "lakera_unavailable:HTTPError:429"
     monkeypatch.setattr(
         lakera,
         "check",
-        lambda _t, **_kw: LakeraResult(ok=False, reason=reason),
+        lambda _t, **_kw: VendorResult(ok=False, reason=reason),
     )
 
     verdict = intercept.scan_text("x", use_honeypot=False)
@@ -318,12 +318,12 @@ def test_quota_degradation_with_honeypot_trigger_rejects_without_judge(
 ):
     from injection_scanner import intercept, judge, lakera
     from injection_scanner.honeypot import HoneypotResult
-    from injection_scanner.lakera import LakeraResult
+    from injection_scanner.vendor_http import VendorResult
 
     monkeypatch.setattr(
         lakera,
         "check",
-        lambda _t, **_kw: LakeraResult(
+        lambda _t, **_kw: VendorResult(
             ok=False,
             reason="lakera_unavailable:throttled",
         ),
@@ -420,8 +420,8 @@ def test_lakera_flag_honeypot_triggered_rejects_without_judge(monkeypatch):
 
 def test_lakera_outage_hard_rejects_without_judge(monkeypatch):
     from injection_scanner import intercept, judge, lakera
-    from injection_scanner.lakera import LakeraResult
-    monkeypatch.setattr(lakera, "check", lambda _t, **_kw: LakeraResult(
+    from injection_scanner.vendor_http import VendorResult
+    monkeypatch.setattr(lakera, "check", lambda _t, **_kw: VendorResult(
         ok=False, reason="lakera_unavailable:no-key"))
     monkeypatch.setattr(judge, "check", lambda _t: (_ for _ in ()).throw(
         AssertionError("judge must not run on lakera outage")))
@@ -440,9 +440,9 @@ def test_lakera_flag_without_honeypot_hard_rejects(monkeypatch):
 
 def test_lakera_clean_never_calls_judge(monkeypatch):
     from injection_scanner import intercept, judge, lakera
-    from injection_scanner.lakera import LakeraResult
+    from injection_scanner.vendor_http import VendorResult
     monkeypatch.setattr(
-        lakera, "check", lambda _t, **_kw: LakeraResult(ok=True, reason="pass")
+        lakera, "check", lambda _t, **_kw: VendorResult(ok=True, reason="pass")
     )
     monkeypatch.setattr(intercept, "honeypot_check", _hp_clean)
     monkeypatch.setattr(judge, "check", lambda _t: (_ for _ in ()).throw(
@@ -483,13 +483,13 @@ _UNSET = object()
 
 def _wait_spy():
     """Return `(spy, seen)`: a `lakera.check` stand-in recording `max_wait_s`."""
-    from injection_scanner.lakera import LakeraResult
+    from injection_scanner.vendor_http import VendorResult
 
     seen: list[object] = []
 
     def _spy(text, *, max_wait_s=_UNSET):
         seen.append(max_wait_s)
-        return LakeraResult(ok=True, reason="pass")
+        return VendorResult(ok=True, reason="pass")
 
     return _spy, seen
 
