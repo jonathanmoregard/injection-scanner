@@ -52,7 +52,8 @@ the base branch). In order, failing closed at every step:
 5. **Re-runs never ask the model.** Any other re-run of the check fails with
    no model call. A fresh review takes an auto-merge toggle.
 6. **Deterministic checks** (any hit blocks):
-   - hidden Unicode in added lines or file paths (`unicode_sanitize` strict
+   - hidden Unicode in added lines or in file paths the merge leaves
+     (deleting or renaming away an existing one is fine) (`unicode_sanitize` strict
      `profile="code"`: invisible, bidi, tag, variation-selector, private-use,
      soft-hyphen, line-separator characters), and control characters in
      added lines (ESC sequences that erase or conceal a line in a terminal,

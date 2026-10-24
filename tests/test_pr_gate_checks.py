@@ -47,6 +47,30 @@ def test_hidden_character_in_a_file_path_blocks():
     assert "path" in hit.detail
 
 
+
+# Only paths that exist after the merge: a hidden-character path already on
+# the base must stay deletable and renamable through the gate.
+HIDDEN_PATH = "docs/read\u202eme.md"
+
+
+def test_deleting_a_hidden_character_path_is_no_hit():
+    diff = (f"diff --git a/{HIDDEN_PATH} b/{HIDDEN_PATH}\ndeleted file mode 100644\n"
+            f"--- a/{HIDDEN_PATH}\n+++ /dev/null\n@@ -1 +0,0 @@\n-ok\n")
+    [f] = parse(diff)
+    assert f.status == "deleted" and checks.hidden_unicode([f]) == []
+
+
+def test_renaming_a_hidden_character_path_to_a_clean_name_is_no_hit():
+    f = fc("docs/readme.md", status="renamed", old_path=HIDDEN_PATH)
+    assert checks.hidden_unicode([f]) == []
+
+
+@pytest.mark.parametrize("status,old_path", [("added", None), ("modified", None),
+                                             ("renamed", "docs/readme.md")])
+def test_a_hidden_character_path_that_will_exist_is_a_hit(status, old_path):
+    [hit] = checks.hidden_unicode([fc(HIDDEN_PATH, status=status, old_path=old_path)])
+    assert hit.rule == "hidden-unicode" and not hit.overridable and "path" in hit.detail
+
 def test_clean_lines_pass():
     assert checks.hidden_unicode([fc("a.md", ["café 中 ✅ tab\there"])]) == []
 

@@ -268,7 +268,11 @@ it, each with the reason. Design: `docs/superpowers/specs/2026-10-24-pr-gate-des
     (U+FE00-FE0F, all private use, U+00AD, U+200E/F, U+2028/9) + every other
     format character (category Cf) + code points that render as nothing
     (Hangul fillers U+115F/1160/3164/FFA0, U+034F, U+180B-180F). File paths
-    are checked too. Counts land in the existing `SanitizeResult` counters,
+    are checked too, but only paths that exist after the merge (the new
+    path of an add, modify, rename or copy): the hit is never overridable,
+    so checking a deletion or a rename's old path would make a
+    hidden-character path already on the base impossible to delete or
+    rename away through the gate. Counts land in the existing `SanitizeResult` counters,
     so the audit record keys are unchanged.
 21a. **Control characters** (category Cc) are not in the shared code
     profile, whose other callers keep its behaviour; pr-gate's

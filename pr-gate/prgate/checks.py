@@ -60,11 +60,12 @@ _CONTROLS = re.compile(r"[\x00-\x08\x0a\x0b\x0d-\x1f\x7f-\x9f]")
 def hidden_unicode(files: list[FileChange]) -> list[Hit]:
     hits = []
     for f in files:
-        for p in {f.path, f.old_path} - {None}:
-            found = find_hidden(p, "code")
-            if found:
-                hits.append(Hit("hidden-unicode", f.path,
-                                f"in the file path: {_u(cp for _, cp in found)}", False))
+        # Only a path that exists after the merge: one already on the base
+        # must stay deletable, and renamable to a clean name.
+        found = [] if f.status == "deleted" else find_hidden(f.path, "code")
+        if found:
+            hits.append(Hit("hidden-unicode", f.path,
+                            f"in the file path: {_u(cp for _, cp in found)}", False))
         for line_no, text in f.added:
             cps = [cp for _, cp in find_hidden(text, "code")]
             cps += [ord(c) for c in _CONTROLS.findall(text.removesuffix("\r"))]
