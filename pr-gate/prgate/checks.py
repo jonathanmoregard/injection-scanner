@@ -194,7 +194,13 @@ _LOCKFILES = {
 _REQUIREMENTS = re.compile(r"^(requirements|constraints)[\w.-]*\.txt$")
 _OK_SCHEMES = frozenset({"https", "git+https", "registry+https", "sparse+https",
                          "git+ssh", "ssh"})
-_URL = re.compile(r"([A-Za-z][A-Za-z0-9+.-]*)://([^/\s\"'<>()\[\],;#?]+)")
+# A URL is a scheme from a fixed set (http, https, ftp, ws, wss, git, ssh,
+# file, or `<word>+` one of those, like git+https or sparse+https) followed by
+# ":" and ANY run of slashes, even none: WHATWG/npm read "https:evil.x" and
+# "https:///evil.x" as host evil.x. Any other "scheme://" is a URL too.
+_SCHEME = re.compile(r"(?<![A-Za-z0-9+.-])([A-Za-z][A-Za-z0-9+.-]*):")
+_KNOWN_SCHEME = re.compile(r"(?:\w+\+)?(?:https?|ftp|wss?|git|ssh|file)", re.I)
+_AUTHORITY = re.compile(r"(/*)([^/?#\s\"'`]*)")
 _FLAKE_TYPE = re.compile(r'"type"\s*:\s*"([^"]*)"')
 _FLAKE_HOST = re.compile(r'"host"\s*:\s*"([^"]*)"')
 _FLAKE_TYPES_OK = frozenset({"github", "git", "tarball", "file", "path", "indirect"})
@@ -234,10 +240,20 @@ def _decode_escapes(text: str) -> tuple[str, bool]:
     return _ESCAPE.sub(one, text), unknown
 
 
+def _urls(text: str):
+    """(scheme, authority) pairs. Scheme matches are only "word:", so a junk
+    prefix like "x:https://evil.x" can't swallow the real URL after it."""
+    for m in _SCHEME.finditer(text):
+        slashes, netloc = _AUTHORITY.match(text, m.end()).groups()
+        if netloc and (_KNOWN_SCHEME.fullmatch(m.group(1)) or len(slashes) >= 2):
+            yield m.group(1), netloc
+
+
 def _host(netloc: str) -> str:
     host = netloc.rsplit("@", 1)[-1]
-    host = host.split(":", 1)[0] if not host.startswith("[") else host
-    return host.lower().rstrip(".")
+    if host.startswith("["):  # IPv6 literal: never in an allowlist
+        return host[:host.find("]") + 1].lower() if "]" in host else host.lower()
+    return host.split(":", 1)[0].lower().rstrip(".")
 
 
 def _odd_userinfo(scheme: str, netloc: str) -> bool:
@@ -265,7 +281,7 @@ def lockfile_hosts(files: list[FileChange]) -> list[Hit]:
             # stripped anywhere and a backslash is a path separator, so
             # "https://evil\@registry.npmjs.org" goes to evil.
             text = re.sub(r"[\t\n\r]", "", text).replace("\\", "/")
-            for scheme, netloc in _URL.findall(text):
+            for scheme, netloc in _urls(text):
                 host = _host(netloc)
                 if scheme.lower() not in _OK_SCHEMES or host not in allowed or _odd_userinfo(scheme, netloc):
                     bad.append(f"{scheme.lower()}://{host}")

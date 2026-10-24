@@ -242,6 +242,46 @@ def test_lockfile_urls_are_parsed_like_npm_parses_them(line):
     assert (hit.rule, hit.overridable) == ("lockfile-host", False)
 
 
+@pytest.mark.parametrize("line", [
+    # WHATWG treats any run of / or \ (even none) after a special scheme as
+    # the authority separator.
+    '"resolved": "https:evil.example/a.tgz",',
+    '"resolved": "https:/evil.example/a.tgz",',
+    '"resolved": "https:///evil.example/a.tgz",',
+    r'"resolved": "https:\\\\evil.example/a.tgz",',
+    '"resolved": "HTTPS://evil.example/a.tgz",',
+    '"resolved": "https://[::1]/a.tgz",',
+    '"resolved": "https://[2001:db8::1]:8443/a.tgz",',
+    '"resolved": "git+https:evil.example/x.git",',
+    '"resolved": "ftp://evil.example/a.tgz",',
+    '"resolved": "file:evil.example/a.tgz",',
+    '"resolved": "wss:evil.example/a.tgz",',
+    # Not in the fixed scheme set, but "scheme://" is still a URL.
+    '"resolved": "svn://evil.example/x",',
+    # A junk "word:" prefix must not swallow the real URL after it.
+    '"resolved": "x:https://evil.example/a.tgz",',
+])
+def test_every_url_form_a_package_manager_accepts_is_host_checked(line):
+    [hit] = checks.lockfile_hosts([fc("package-lock.json", [line])])
+    assert (hit.rule, hit.overridable) == ("lockfile-host", False)
+
+
+@pytest.mark.parametrize("path,line", [
+    ("package-lock.json", '"integrity": "sha512-AbC+/dEf==",'),
+    ("package-lock.json", '"version": "1.0.0",'),
+    ("Cargo.lock", 'version = "1.0"'),
+    ("pnpm-lock.yaml", "lockfileVersion: '9.0'"),
+    ("pnpm-lock.yaml", "    resolution: {integrity: sha512-AbC+/dEf==}"),
+    ("pnpm-lock.yaml", "  /@babel/core@7.24.0:"),
+    ("pnpm-lock.yaml", "    file:"),
+    ("yarn.lock", '"@scope/pkg@^1.0.0":'),
+    ("uv.lock", 'requires-python = ">=3.11"'),
+    ("package-lock.json", '"resolved": "https:registry.npmjs.org/a/-/a-1.0.0.tgz",'),
+])
+def test_ordinary_lockfile_lines_are_not_hits(path, line):
+    assert checks.lockfile_hosts([fc(path, [line])]) == []
+
+
 @pytest.mark.parametrize("path,line", [
     ("package-lock.json", r'"resolved": "https:\/\/registry.npmjs.org\/a\/-\/a-1.0.0.tgz",'),
     ("uv.lock", r'url = "https:\u002f\u002ffiles.pythonhosted.org/x.whl"'),
