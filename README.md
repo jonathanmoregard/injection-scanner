@@ -9,7 +9,7 @@ Layered prompt-injection / secret-exfil scanner. Extracted from `research-agent`
 | L0 | `unicode_sanitize` | Strip covert channels (zero-width, bidi, tag-block), NFKC normalize, flag anomalous density. |
 | L1b | `secret_shapes` | High-precision API key / JWT / PEM patterns. |
 | L2 | `lakera` | Hosted Lakera Guard prompt-injection classifier, wired fail-closed. Exact quota pressure may defer to L3/L4; every other failure rejects. Paced fleet-wide — see [Lakera rate limiting](#lakera-rate-limiting). |
-| L3 | `honeypot` | Run the report past a 3-model judge ensemble (`claude-haiku-4-5`, `gpt-4o-mini`, `gpt-4.1-nano`) across six canary scenarios — two scenarios per model. If any judge gets coerced into calling a bait tool, echoing a canary via a legitimate tool argument, or surfacing one in freeform text, the report is rejected. |
+| L3 | `honeypot` | Run the report past a 3-model judge ensemble (`claude-haiku-4-5`, `gpt-4o-mini`, `gpt-4.1-mini`) across six canary scenarios — two scenarios per model. If any judge gets coerced into calling a bait tool, echoing a canary via a legitimate tool argument, or surfacing one in freeform text, the report is rejected. |
 | L4 | `judge` | Arbitration when Lakera says `prompt_attack` or reports exact quota pressure and the honeypot is fully clean: a cross-family panel must unanimously rule the text "describes, not directs" before delivery. |
 
 L1a (regex) was retired (legit research output false-positived); wrap-escape protection moved to the consumer's delivery boundary.
@@ -23,7 +23,7 @@ pip install -e ~/Repos/injection-scanner
 L3 honeypot environment requirements (fail-closed if any are missing):
 
 - `ANTHROPIC_API_KEY` — required (2 of 6 scenarios run on `claude-haiku-4-5`).
-- `OPENAI_API_KEY` — required (4 of 6 scenarios run on `gpt-4o-mini` / `gpt-4.1-nano`).
+- `OPENAI_API_KEY` — required (4 of 6 scenarios run on `gpt-4o-mini` / `gpt-4.1-mini`).
 
 A missing key surfaces as `honeypot_unavailable:<scenario>:unavailable:no-<provider>-api-key+skipped=N/6` in the Verdict. Per the fail-closed contract, that quarantines every report until the key is restored. Keys may live in env OR in the local secret store under `app=research-agent, key={anthropic,openai}-api-key`.
 
