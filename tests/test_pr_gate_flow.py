@@ -236,6 +236,26 @@ def test_request_changes_refused_falls_back_to_comment():
     assert ev == "COMMENT" and verdict.parse_marker(body)[0] == "block"
 
 
+def test_a_block_posted_as_a_comment_says_it_cannot_be_dismissed():
+    # GitHub cannot dismiss a COMMENT review: "dismiss to override" would
+    # leave the owner stuck.
+    gh = FakeGitHub()
+    gh.refuse_request_changes = True
+    out, _ = run(gh, FakeModel([PassResult("monitor_a", "ok", suspicion=80)]))
+    [(_, _, body)] = gh.posted
+    assert "the owner dismisses this review" not in body
+    for text in (body, out.message):
+        assert "cannot be dismissed" in text and "ruleset bypass" in text
+
+
+def test_a_request_changes_block_still_says_dismiss_to_override():
+    gh = FakeGitHub()
+    run(gh, FakeModel([PassResult("monitor_a", "ok", suspicion=80)]))
+    [(ev, _, body)] = gh.posted
+    assert ev == "REQUEST_CHANGES" and "the owner dismisses this review" in body
+    assert "cannot be dismissed" not in body
+
+
 def test_incomplete_model_answer_blocks_with_a_review():
     gh = FakeGitHub()
     out, _ = run(gh, FakeModel([PassResult("monitor_a", "incomplete", "refusal")]))
@@ -870,7 +890,16 @@ def test_a_dismissal_whose_block_is_not_on_the_timeline_does_not_count():
 def test_a_block_posted_as_a_comment_still_blocks_the_head():
     gh = FakeGitHub(reviews=[gate_review("block", HEAD, "0" * 64, rid=1, state="COMMENTED")])
     out, model = run(gh)
-    assert out.exit_code == 1 and model.calls == [] and "dismiss its review" in out.message
+    assert out.exit_code == 1 and model.calls == []
+    assert "must dismiss" not in out.message
+    assert "cannot be dismissed" in out.message and "ruleset bypass" in out.message
+
+
+def test_a_dismissable_block_beside_a_comment_block_says_dismiss_it():
+    gh = FakeGitHub(reviews=[gate_review("block", HEAD, "0" * 64, rid=1, state="COMMENTED"),
+                             gate_review("block", HEAD, "0" * 64, rid=2)])
+    out, _ = run(gh)
+    assert "jonathan must dismiss its review" in out.message
 
 
 def test_a_dismissed_block_of_an_older_head_does_not_override_this_one():

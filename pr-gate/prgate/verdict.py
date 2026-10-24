@@ -128,6 +128,13 @@ def verify_marker(body, key: bytes | None, *, repo: str, number: int
     return m[:3] if hmac.compare_digest(m[3], expected) else None
 
 
+# A block GitHub would not take as REQUEST_CHANGES goes out as a COMMENT,
+# and GitHub cannot dismiss a COMMENT review: there is no override.
+UNDISMISSABLE = ("this block was posted as a comment (GitHub refused a request-changes "
+                 "review), and a comment cannot be dismissed on GitHub, so it cannot be "
+                 "overridden. The only way past a false alarm is the owner's ruleset "
+                 "bypass, or temporarily removing the required ai-gate check")
+
 _MODE_LINE = {
     "full": "",
     "owner-override": "The owner dismissed the gate's block of this head commit; the "
@@ -139,8 +146,11 @@ _MODE_LINE = {
 
 
 def render_body(r: Result, *, key: bytes | None, repo: str, number: int, head: str,
-                own_hash: str, threshold: int, model: str, effort: str, mode: str) -> str:
-    """`key=None` (dry-run) renders an unsigned marker that never verifies."""
+                own_hash: str, threshold: int, model: str, effort: str, mode: str,
+                dismissable: bool = True) -> str:
+    """`key=None` (dry-run) renders an unsigned marker that never verifies.
+    `dismissable=False`: the block goes out as a COMMENT, which GitHub
+    cannot dismiss, so the body must not tell the owner to dismiss it."""
     verdict = "block" if r.block else "pass"
     out = [render_marker(key, verdict=verdict, repo=repo, number=number, head=head,
                          own_hash=own_hash)]
@@ -175,7 +185,9 @@ def render_body(r: Result, *, key: bytes | None, repo: str, number: int, head: s
     if r.scrutiny:
         out.append("**Extra scrutiny** (not blocking)")
         out += [f"- {neutralise(s.path, 200)}: {s.reason}" for s in r.scrutiny[:MAX_HITS]]
-    if r.block:
+    if r.block and not dismissable:
+        out.append(f"**This block cannot be dismissed:** {UNDISMISSABLE}.")
+    elif r.block:
         out.append(
             "**To clear a false alarm:** the owner dismisses this review, then re-runs the "
             "failed ai-gate check. Hidden-Unicode, lockfile-host and text-binary hits "

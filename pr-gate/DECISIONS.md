@@ -104,6 +104,15 @@ it, each with the reason. Design: `docs/superpowers/specs/2026-10-24-pr-gate-des
     starts with a VERIFIED gate marker `verdict=block` whose (MAC'd) head is
     this head (item 27), in any state (dismissed or COMMENT-fallback
     included). An unverifiable block marker is not a block.
+10a. **A COMMENT-fallback block says it cannot be dismissed.** GitHub
+    cannot dismiss a COMMENT review (the dismissals endpoint answers 422),
+    so "dismiss to override" would leave the owner stuck. No new override
+    mechanism: when the block goes out as a COMMENT, the review body and
+    the check message say, in fixed text (`verdict.UNDISMISSABLE`), that
+    it cannot be dismissed and that the only way past a false alarm is the
+    owner's ruleset bypass or temporarily removing the required check.
+    Step 4 says the same when every verified block on the head is a
+    COMMENT; "must dismiss" only when one is still CHANGES_REQUESTED.
 11. **Owner override = dismissal, not approval** (replaces the earlier
     approve-then-re-run rule). The run passes on the always-on checks only
     if the issue timeline has a `review_dismissed` event whose

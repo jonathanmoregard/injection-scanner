@@ -145,6 +145,13 @@ Org repos need their own secret and ruleset.
   dismissal and passes without a model call. This works on your own PRs too
   (GitHub won't let you approve those). Hidden-Unicode, lockfile-host and
   text-binary hits cannot be cleared this way: fix the change.
+- **A block posted as a COMMENT cannot be dismissed.** If GitHub refuses
+  the gate's REQUEST_CHANGES review, the block goes out as a COMMENT, and
+  GitHub cannot dismiss a COMMENT review, so there is no override. The
+  review body and the check say so. Past a false alarm the only way is
+  your ruleset bypass, or temporarily removing the required `ai-gate`
+  check for that merge (or push a change and re-enable auto-merge for a
+  fresh review).
 - **Dismissing the gate's review IS the override**, not housekeeping. It
   applies only to the commit the PR is at when you dismiss, only if `owner`
   did it, and only while the PR stays there: a later commit voids it, and so
@@ -260,7 +267,9 @@ their maximum suspicion.
   enable auto-merge and dismiss the gate's review, so the gate is only as
   strong as the custody of that identity.
 - A block posted as a COMMENT (GitHub refused REQUEST_CHANGES) cannot be
-  dismissed, so it cannot be overridden: push a fix and re-enable auto-merge.
+  dismissed, so it cannot be overridden: push a fix and re-enable
+  auto-merge, or use the owner's ruleset bypass (or temporarily remove
+  the required check) for a false alarm.
 - The lockfile check parses with Python's parsers (`json`, `tomllib`,
   PyYAML's safe loader), not each package manager's own. Duplicate keys,
   YAML aliases and YAML tags beyond the safe set do not parse, which closes
@@ -290,7 +299,9 @@ their maximum suspicion.
   cannot be overridden; rewrite the text without it.
 - Things to verify on the first pilot are listed in the design doc ("Must be
   verified empirically"), notably whether the REQUEST_CHANGES review from
-  `github-actions[bot]` is accepted on personal repos and whether
+  `github-actions[bot]` (posted with `GITHUB_TOKEN`) is accepted on
+  personal repos (if not, every block is an undismissable COMMENT and
+  false alarms need the ruleset bypass) and whether
   `auto_merge_enabled` fires reliably.
 
 ## Updating the gate

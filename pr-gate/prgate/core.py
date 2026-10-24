@@ -253,17 +253,21 @@ def _text_contents(gh, ev: Event, files: list[FileChange]) -> tuple[dict[str, st
 
 def _report(gh, ev: Event, cfg: Config, result: verdict.Result, own_hash: str,
             mode: str, reviews: list[Review]) -> Outcome:
-    body = verdict.render_body(result, key=cfg.marker_key, repo=ev.repo, number=ev.number,
-                               head=ev.head_sha, own_hash=own_hash,
-                               threshold=cfg.threshold, model=cfg.model,
-                               effort=cfg.effort, mode=mode)
+    def body(dismissable: bool = True) -> str:
+        return verdict.render_body(result, key=cfg.marker_key, repo=ev.repo, number=ev.number,
+                                   head=ev.head_sha, own_hash=own_hash,
+                                   threshold=cfg.threshold, model=cfg.model,
+                                   effort=cfg.effort, mode=mode, dismissable=dismissable)
+
     if result.block:
+        blocked = "blocked: " + "; ".join(result.reasons)
         try:
-            gh.post_review(ev.number, ev.head_sha, "REQUEST_CHANGES", body)
+            gh.post_review(ev.number, ev.head_sha, "REQUEST_CHANGES", body())
         except GitHubError:
-            gh.post_review(ev.number, ev.head_sha, "COMMENT", body)
-        return Outcome(1, "blocked: " + "; ".join(result.reasons))
-    gh.post_review(ev.number, ev.head_sha, "COMMENT", body)
+            gh.post_review(ev.number, ev.head_sha, "COMMENT", body(dismissable=False))
+            return Outcome(1, f"{blocked}; {verdict.UNDISMISSABLE}")
+        return Outcome(1, blocked)
+    gh.post_review(ev.number, ev.head_sha, "COMMENT", body())
     undismissed = []
     for r, m in _gate_reviews(reviews, ev, cfg.marker_key):
         if m[0] == "block" and r.state == "CHANGES_REQUESTED":
@@ -338,16 +342,19 @@ def _run(ev: Event, cfg: Config, gh, review_fn: ReviewFn) -> Outcome:
     blocks = _blocks_on_head(reviews, ev, cfg.marker_key)
     if blocks:
         if not _owner_dismissed(gh, ev, cfg.owner, blocks):
-            # A review can be dismissed only once.
-            if all(r.state == "DISMISSED" for r in reviews if r.id in blocks):
-                return Outcome(1, "the gate blocked this commit and its review is already "
-                                  "dismissed, but that dismissal does not count: it was not "
-                                  f"by {cfg.owner}, or a force push or branch restore came "
-                                  "after the block. A review cannot be dismissed twice: push "
-                                  "a new commit to the PR, then disable and re-enable "
-                                  "auto-merge for a fresh review")
-            return Outcome(1, f"the gate blocked this commit; {cfg.owner} must dismiss its "
-                              "review to override, then re-run this check")
+            states = {r.state for r in reviews if r.id in blocks}
+            if "CHANGES_REQUESTED" in states:
+                return Outcome(1, f"the gate blocked this commit; {cfg.owner} must dismiss "
+                                  "its review to override, then re-run this check")
+            if "DISMISSED" not in states:  # only COMMENT blocks: not dismissable
+                return Outcome(1, f"the gate blocked this commit; {verdict.UNDISMISSABLE}")
+            # Dismissed already, and a review can be dismissed only once.
+            return Outcome(1, "the gate blocked this commit and its review is already "
+                              "dismissed, but that dismissal does not count: it was not "
+                              f"by {cfg.owner}, or a force push or branch restore came "
+                              "after the block. A review cannot be dismissed twice: push "
+                              "a new commit to the PR, then disable and re-enable "
+                              "auto-merge for a fresh review")
         return _report(gh, ev, cfg, _always_on(g, cfg), g.own_hash, "owner-override", reviews)
 
     # Step 5: any writer can re-run a check; only an owner click buys a roll.
