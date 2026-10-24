@@ -1137,6 +1137,43 @@ def test_pip_tools_requirements_layouts_are_host_checked(path):
     assert line_hits(path, ["--index-url https://pypi.org\\"]) != []
 
 
+@pytest.mark.parametrize("option", [
+    # pip shlex-splits a line's options and hands them to optparse, which
+    # takes a short option's value attached ("-iURL").
+    "-i{}/simple", "-f{}/", "-e{}/x.zip", "-r{}/r.txt", "-c{}/c.txt",
+    "--index-url={}/simple", "--extra-index-url={}/simple", "--find-links={}/",
+    "-i '{}/simple'", "-i{}'/simple'",
+    "requests==2.32.3 -i{}/simple",
+])
+def test_a_pip_option_value_is_host_checked_however_it_is_attached(option):
+    [hit] = line_hits("requirements.txt", [option.format("https://evil.example")])
+    assert (hit.rule, hit.overridable) == ("lockfile-host", False)
+    assert line_hits("requirements.txt", [option.format("https://pypi.org")]) == []
+
+
+@pytest.mark.parametrize("line", [
+    '-i h"ttps://evil.example/simple"',     # shlex joins the quoted pieces
+    "-i\\https://evil.example/simple",      # shlex drops the backslash
+    "-i \\https://evil.example/simple",
+])
+def test_a_pip_shlex_rewritten_url_is_a_hit(line):
+    assert line_hits("requirements.txt", [line]) != []
+
+
+def test_pip_options_that_pip_cannot_split_are_a_hit():
+    assert line_hits("requirements.txt", ['-i "https://pypi.org/simple']) != []
+
+
+@pytest.mark.parametrize("line", [
+    'foo==1.0; python_version < "3.8"',      # markers are not shlex-split by pip
+    "    --hash=sha256:70761cfe03c773ceb22aa2f671b4757976145175cdfca038c02654d061d6dcc6 \\",
+    "# don't -ihttps://evil.example/ in a comment",
+    "-r requirements/base.txt", "-c constraints.txt", "-e .",
+])
+def test_ordinary_pip_lines_are_not_hits(line):
+    assert line_hits("requirements.txt", [line]) == []
+
+
 @pytest.mark.parametrize("path", ["docs/notes.txt", "requirements/README.md", "deps.in"])
 def test_other_txt_and_in_files_are_not_host_checked(path):
     assert line_hits(path, ["https://evil.example/"]) == []

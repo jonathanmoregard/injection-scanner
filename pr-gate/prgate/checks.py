@@ -14,6 +14,7 @@ from __future__ import annotations
 import fnmatch
 import json
 import re
+import shlex
 import tomllib
 from collections import Counter
 from dataclasses import dataclass
@@ -387,6 +388,25 @@ def _bad_urls(text: str, allowed: frozenset[str]) -> list[str]:
     return bad
 
 
+_PIP_COMMENT = re.compile(r"(^|\s+)#.*$")  # pip's COMMENT_RE
+_PIP_ATTACHED = re.compile(r"-[icref].")    # pip's short options that take a value
+
+
+def _pip_options(line: str) -> str | None:
+    """The line's options as pip reads them (req_file.py): comment dropped,
+    everything from the first token starting with "-" shlex-split, and a
+    short option's attached value ("-iURL", which optparse accepts) split
+    off. None when shlex cannot split them (pip then refuses the line)."""
+    line = _PIP_COMMENT.sub("", line).strip().removesuffix("\\")  # pip joins continuations
+    tokens = line.split(" ")
+    start = next((i for i, t in enumerate(tokens) if t.startswith("-")), len(tokens))
+    try:
+        opts = shlex.split(" ".join(tokens[start:]))
+    except ValueError:
+        return None
+    return " ".join(f"{t[:2]} {t[2:]}" if _PIP_ATTACHED.match(t) else t for t in opts)
+
+
 def _line_hits(f: FileChange, allowed: frozenset[str], lines) -> list[Hit]:
     pip = _kind(f.path) == "requirements"
     yarn = _kind(f.path) == "yarn.lock"
@@ -399,6 +419,9 @@ def _line_hits(f: FileChange, allowed: frozenset[str], lines) -> list[Hit]:
         if undecoded and _SCHEMEISH.search(text):
             bad.append("undecodable escape near a URL")
         bad += _bad_urls(text, allowed)
+        if pip:
+            opts = _pip_options(original)
+            bad += ["options pip cannot split"] if opts is None else _bad_urls(opts, allowed)
         if yarn:
             bad += _yarn_v1_line_bad(text)
         if bad:

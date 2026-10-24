@@ -241,6 +241,16 @@ it, each with the reason. Design: `docs/superpowers/specs/2026-10-24-pr-gate-des
     parity does not count there; instead a run preceded by whitespace is
     fine, which is how pip-compile writes its `pkg==1.0 \` / `--hash=... \`
     lines and which cannot glue a URL together.
+    pip requirement lines are also checked the way pip reads their options
+    (`req/req_file.py`): comment dropped, everything from the first token
+    starting with `-` shlex-split (quotes joined, backslashes dropped), and
+    a value attached to a short option that takes one (`-i -f -e -r -c`,
+    the URL-taking options in pip's `SUPPORTED_OPTIONS`; optparse accepts
+    `-ihttps://evil.x`) split off before the URL check. `--index-url=`,
+    `--extra-index-url=`, `--find-links=` and `--editable=` already put
+    the URL after `=`. Options shlex cannot split are a hit: pip refuses
+    that line too. The requirement part before the options is not
+    shlex-split, as in pip (markers use quotes).
 22a. **Lockfiles are parsed, not read line by line** (replaces the round-6
     rule that joined consecutive added lines). Re-implementing YAML/TOML
     string folding line by line kept losing: a blank line inside a YAML
@@ -329,6 +339,10 @@ it, each with the reason. Design: `docs/superpowers/specs/2026-10-24-pr-gate-des
     whose inner locator only appears inside the `patch:` reference is
     covered by the decoded-form URL and hosted-git checks alone (a bare
     `owner/repo` there is not caught).
+    **Known false positive:** a Berry local reference to a directory
+    named like a URL scheme with no `./` or `../` in front
+    (`x@link:ws::locator=...`) still reads `ws:` as a scheme and is a hit;
+    Berry normally writes such paths with a `./` or `../` prefix.
     **Metadata exempt from every string check** (npm family only): a
     package entry's `funding` (a string, `{type, url}`, or a list of
     those), `deprecated` (npm, pnpm) and `license`. No package manager
