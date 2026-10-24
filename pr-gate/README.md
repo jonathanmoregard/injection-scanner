@@ -187,8 +187,9 @@ their maximum suspicion.
 - A block posted as a COMMENT (GitHub refused REQUEST_CHANGES) cannot be
   dismissed, so it cannot be overridden: push a fix and re-enable auto-merge.
 - Lockfile hosts outside the allowlist (e.g. a private registry) cannot be
-  cleared per repo; that needs a gate change. The same goes for `file:`
-  references in a lockfile (`file:../pkg`), which are always hits.
+  cleared per repo; that needs a gate change. Local `file:../pkg`
+  references are not host-checked (the referenced path is in the diff);
+  `file://` URLs are hits.
 - A single emoji presentation selector straight after an emoji (the usual
   spelling of a warning-sign emoji) is allowed. Anything else with variation
   selectors, zero-width joiners or other invisible characters (including

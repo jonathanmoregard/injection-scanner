@@ -254,7 +254,7 @@ def test_lockfile_urls_are_parsed_like_npm_parses_them(line):
     '"resolved": "https://[2001:db8::1]:8443/a.tgz",',
     '"resolved": "git+https:evil.example/x.git",',
     '"resolved": "ftp://evil.example/a.tgz",',
-    '"resolved": "file:evil.example/a.tgz",',
+    '"resolved": "file://evil.example/a.tgz",',
     '"resolved": "wss:evil.example/a.tgz",',
     # Not in the fixed scheme set, but "scheme://" is still a URL.
     '"resolved": "svn://evil.example/x",',
@@ -277,6 +277,7 @@ def test_every_url_form_a_package_manager_accepts_is_host_checked(line):
     ("yarn.lock", '"@scope/pkg@^1.0.0":'),
     ("uv.lock", 'requires-python = ">=3.11"'),
     ("package-lock.json", '"resolved": "https:registry.npmjs.org/a/-/a-1.0.0.tgz",'),
+    ("package-lock.json", '"resolved": "file:../packages/local",'),
 ])
 def test_ordinary_lockfile_lines_are_not_hits(path, line):
     assert checks.lockfile_hosts([fc(path, [line])]) == []

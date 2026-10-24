@@ -195,11 +195,12 @@ _REQUIREMENTS = re.compile(r"^(requirements|constraints)[\w.-]*\.txt$")
 _OK_SCHEMES = frozenset({"https", "git+https", "registry+https", "sparse+https",
                          "git+ssh", "ssh"})
 # A URL is a scheme from a fixed set (http, https, ftp, ws, wss, git, ssh,
-# file, or `<word>+` one of those, like git+https or sparse+https) followed by
+# or `<word>+` one of those, like git+https or sparse+https) followed by
 # ":" and ANY run of slashes, even none: WHATWG/npm read "https:evil.x" and
-# "https:///evil.x" as host evil.x. Any other "scheme://" is a URL too.
+# "https:///evil.x" as host evil.x. Any other "scheme://" is a URL too
+# (including file://); a bare local `file:../pkg` reference is not.
 _SCHEME = re.compile(r"(?<![A-Za-z0-9+.-])([A-Za-z][A-Za-z0-9+.-]*):")
-_KNOWN_SCHEME = re.compile(r"(?:\w+\+)?(?:https?|ftp|wss?|git|ssh|file)", re.I)
+_KNOWN_SCHEME = re.compile(r"(?:\w+\+)?(?:https?|ftp|wss?|git|ssh)", re.I)
 _AUTHORITY = re.compile(r"(/*)([^/?#\s\"'`]*)")
 _FLAKE_TYPE = re.compile(r'"type"\s*:\s*"([^"]*)"')
 _FLAKE_HOST = re.compile(r'"host"\s*:\s*"([^"]*)"')
