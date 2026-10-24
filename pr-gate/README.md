@@ -70,7 +70,10 @@ the base branch). In order, failing closed at every step:
 
 API or network errors fail the check without posting a review; since a
 re-run never asks the model, retry by disabling and re-enabling auto-merge.
-The annotation on the check says what failed.
+A model API 4xx other than 408/409/429 (wrong model name or key, prompt too
+long) is reported as a config error instead, since retrying the same
+request cannot help: fix the input or split the PR first. The annotation on
+the check says what failed.
 
 ## Setup checklist (per consuming repo, once)
 

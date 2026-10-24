@@ -24,9 +24,9 @@ it, each with the reason. Design: `docs/superpowers/specs/2026-10-24-pr-gate-des
    Otherwise a PR could steer review away from Fable to a weaker fallback by
    provoking a policy decline. The fallback's findings are still shown.
 4. **No text-JSON fallback** for models without structured outputs: both
-   target models support them, and a 400 from an unsupported model is an
-   infra failure (check fails; an auto-merge toggle retries). Output is still parsed and
-   validated in code.
+   target models support them, and a 400 from an unsupported model is a
+   config failure (check fails, no review; item 6). Output is still parsed
+   and validated in code.
 5. **Exceptions also never cover `.github/actions/`** (local actions run
    inside workflows, same power as `.github/workflows/`).
 
@@ -39,7 +39,12 @@ it, each with the reason. Design: `docs/superpowers/specs/2026-10-24-pr-gate-des
      fails, **no review**.
    - *Infra* (GitHub or Anthropic API errors, missing key): check fails, no
      review. A transport error is not a verdict. The retry is an auto-merge
-     toggle, since a re-run never asks the model.
+     toggle, since a re-run never asks the model. A model API 4xx other than
+     408/409/429 (bad model name or key, prompt too long) is reported as a
+     *config* error with that diagnosis instead of "toggle to retry": the
+     same request fails the same way every time. Still fail closed, no
+     review; the reason is the closed `api-status-<code>` vocabulary, never
+     the provider's error body.
    - *Verdict* (including refusal, `max_tokens`, malformed or out-of-range
      output): REQUEST_CHANGES review. These are outcomes on the PR's
      content; only the owner's dismissal overrides them.

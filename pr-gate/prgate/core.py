@@ -14,7 +14,9 @@ Three kinds of failure, deliberately different:
   - procedural (steps 1-5, unreadable diff): the check fails with a message
     and NO review is posted.
   - infra (GitHub or model API errors): the check fails, no review. Not a
-    verdict on the PR; an owner auto-merge toggle retries.
+    verdict on the PR; an owner auto-merge toggle retries. A model 4xx other
+    than 408/409/429 (model name, key, prompt size) is reported as a config
+    error instead: retrying the same request cannot help.
   - verdict: a review is posted on the head SHA. Block = REQUEST_CHANGES
     (COMMENT if refused) and exit 1; pass = COMMENT, dismiss the gate's own
     earlier blocks, exit 0.
@@ -29,7 +31,7 @@ from typing import Callable
 from . import checks, verdict
 from .diffparse import DiffError, FileChange, own_changes_hash, parse
 from .github import GitHubError, Review, TooLarge
-from .llm import EFFORTS, PassResult
+from .llm import EFFORTS, PassResult, is_config_error
 
 GATE_LOGIN = "github-actions[bot]"
 ACTIONS = ("auto_merge_enabled", "synchronize", "reopened")
@@ -291,6 +293,11 @@ def _run(ev: Event, cfg: Config, gh, review_fn: ReviewFn) -> Outcome:
     # Step 6: full review.
     result = full_review(g, cfg, review_fn, lambda: _text_contents(gh, ev, g.files))
     if result.infra:
-        return Outcome(1, "infra: model call failed (" + ", ".join(result.infra)
-                          + f"); {RETRY}")
+        failed = ", ".join(result.infra)
+        if any(p.status == "infra" and is_config_error(p.reason) for p in result.passes):
+            return Outcome(1, f"config: the model API rejected the request ({failed}); "
+                              "check the model name, the anthropic-api-key secret and the "
+                              "PR size (a prompt too long needs a smaller PR). Retrying "
+                              "will not help until that is fixed")
+        return Outcome(1, f"infra: model call failed ({failed}); {RETRY}")
     return _report(gh, ev, cfg, result, g.own_hash, "full", reviews)

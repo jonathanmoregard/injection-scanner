@@ -207,6 +207,24 @@ def test_http_error_is_infra_and_never_echoes_the_body():
     assert secret not in repr(r)
 
 
+def test_an_unknown_model_is_a_config_error_and_never_echoes_the_body():
+    stub = Stub((404, {"type": "error", "error": {"type": "not_found_error",
+                                                  "message": "model: SECRET-TYPO"}}))
+    r = _monitor(stub)
+    assert (r.status, r.reason) == ("infra", "api-status-404")
+    assert llm.is_config_error(r.reason) and "SECRET" not in repr(r)
+
+
+@pytest.mark.parametrize("reason,config", [
+    ("api-status-400", True), ("api-status-404", True), ("api-status-499", True),
+    ("api-status-408", False), ("api-status-409", False), ("api-status-429", False),
+    ("api-status-500", False), ("api-status-other", False), ("api-rate-limit", False),
+    ("api-timeout", False), ("no-key", False),
+])
+def test_is_config_error(reason, config):
+    assert llm.is_config_error(reason) is config
+
+
 def test_rate_limit_is_infra():
     r = _monitor(Stub((429, {"type": "error", "error": {"type": "rate_limit_error", "message": "x"}})))
     assert (r.status, r.reason) == ("infra", "api-rate-limit")

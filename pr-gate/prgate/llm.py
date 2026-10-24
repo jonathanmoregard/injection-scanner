@@ -229,6 +229,17 @@ def _api_reason(e: BaseException) -> str:
     return "api-other"
 
 
+_TRANSIENT_4XX = frozenset({408, 409, 429})
+
+
+def is_config_error(reason: str) -> bool:
+    """An `api-status-4xx` reason the API will repeat for the same request
+    (bad model name, bad key, prompt too long), unlike 408/409/429."""
+    code = reason.removeprefix("api-status-")
+    return (code != reason and code.isdigit() and 400 <= int(code) <= 499
+            and int(code) not in _TRANSIENT_4XX)
+
+
 def _valid_findings(raw, categories, source) -> list[Finding] | None:
     if not isinstance(raw, list):
         return None

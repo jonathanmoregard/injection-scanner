@@ -239,6 +239,30 @@ def test_infra_failure_fails_without_a_review_and_says_how_to_retry():
     assert "api-timeout" in out.message and "re-enable auto-merge" in out.message
 
 
+@pytest.mark.parametrize("reason", ["api-status-400", "api-status-401", "api-status-404",
+                                    "api-status-413"])
+def test_a_persistent_model_4xx_is_a_config_error_not_a_retry(reason):
+    # A model-name typo or a too-long prompt fails the same way every time.
+    gh = FakeGitHub()
+    out, _ = run(gh, FakeModel([PassResult("monitor_a", "ok", suspicion=1),
+                                PassResult("review", "infra", reason)]))
+    assert out.exit_code == 1 and gh.posted == []
+    assert out.message.startswith("config:") and reason in out.message
+    assert "model" in out.message and "will not help" in out.message
+    assert core.RETRY not in out.message
+
+
+@pytest.mark.parametrize("reason", ["api-status-408", "api-status-409", "api-rate-limit",
+                                    "api-status-429", "api-status-500", "api-status-529",
+                                    "api-timeout", "api-connection", "api-other",
+                                    "api-status-other"])
+def test_transient_model_failures_stay_infra_with_a_retry_hint(reason):
+    gh = FakeGitHub()
+    out, _ = run(gh, FakeModel([PassResult("review", "infra", reason)]))
+    assert out.exit_code == 1 and gh.posted == []
+    assert out.message.startswith("infra:") and core.RETRY in out.message
+
+
 def test_pass_dismisses_only_the_gates_own_earlier_blocks():
     reviews = [
         gate_review("block", OLD, "0" * 64, rid=1),
