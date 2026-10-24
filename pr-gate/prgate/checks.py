@@ -467,14 +467,15 @@ def _load(name: str, data: bytes):
 
 # Package-entry metadata that no npm-family package manager fetches from:
 # npm's `funding` (string, {type, url}, or a list of those), `deprecated`
-# messages (npm, pnpm) and `license`. Exempt only inside a package entry
-# (a mapping with `version` or `resolution`) and only in that shape, so a
-# package or dependency NAMED "funding" is still checked.
+# messages (npm, pnpm) and `license`. Exempt only in a mapping that IS a
+# package entry by its position in the format (_package_entries), never in
+# a name -> spec map nested in one, where a package NAMED "funding" is a
+# dependency npm fetches from its spec. And only in that shape.
 _METADATA_KEYS = frozenset({"funding", "deprecated", "license"})
 
 
 def _metadata(entry: dict, key) -> bool:
-    if key not in _METADATA_KEYS or not ("version" in entry or "resolution" in entry):
+    if key not in _METADATA_KEYS:
         return False
     v = entry[key]
     return all(isinstance(i, str) or (isinstance(i, dict) and set(i) <= {"type", "url"}
@@ -482,29 +483,59 @@ def _metadata(entry: dict, key) -> bool:
                for i in (v if isinstance(v, list) else [v]))
 
 
-def _strings(doc, skip_metadata: bool = False):
-    """Every string in a parsed document, mapping keys included (minus
-    npm-family package metadata if asked). A container reached twice is a
-    YAML alias: lockfiles never use them, and expanding them can explode,
-    so that does not parse."""
+def _package_entries(name: str, doc) -> set[int]:
+    """ids of the mappings that are package entries, by position:
+    package-lock `packages.<path>` and v1 `dependencies.<name>` (nested to
+    any depth), pnpm `packages.<key>` / `snapshots.<key>`, bun's metadata
+    object in a `packages.<name>` tuple, yarn's top-level entries."""
+    out: set[int] = set()
+    if not isinstance(doc, dict):
+        return out
+    if name in ("package-lock.json", "npm-shrinkwrap.json"):
+        out.update(id(e) for e in _dicts(doc.get("packages")))
+        stack = [doc.get("dependencies")]
+        while stack:
+            for e in _dicts(stack.pop()):
+                out.add(id(e))
+                stack.append(e.get("dependencies"))
+    elif name == "pnpm-lock.yaml":
+        for section in ("packages", "snapshots"):
+            out.update(id(e) for e in _dicts(doc.get(section)))
+    elif name == "bun.lock":
+        packages = doc.get("packages")
+        for e in packages.values() if isinstance(packages, dict) else ():
+            if isinstance(e, list):
+                out.update(id(x) for x in e if isinstance(x, dict))
+    elif name == "yarn.lock":
+        out.update(id(e) for k, e in doc.items() if k != "__metadata" and isinstance(e, dict))
+    return out
+
+
+def _strings(doc, entries: set[int] = frozenset()):
+    """(string, is metadata) for every string in a parsed document, mapping
+    keys included; metadata = a value under a metadata key of a package
+    entry in `entries`. A container reached twice
+    is a YAML alias: lockfiles never use them, and expanding them can
+    explode, so that does not parse (which also stops an alias from making
+    one mapping both a package entry and a dependency map)."""
     seen: set[int] = set()
-    stack = [doc]
+    stack = [(doc, False)]
     while stack:
-        v = stack.pop()
+        v, meta = stack.pop()
         if isinstance(v, (dict, list, tuple)):
             if id(v) in seen:
                 raise ValueError("alias")
             seen.add(id(v))
             if isinstance(v, dict):
-                stack.extend(v.keys())
-                stack.extend(x for k, x in v.items()
-                             if not (skip_metadata and _metadata(v, k)))
+                stack.extend((k, meta) for k in v)
+                stack.extend((x, meta or (id(v) in entries and _metadata(v, k)))
+                             for k, x in v.items())
             else:
-                stack.extend(v)
+                stack.extend((x, meta) for x in v)
         elif isinstance(v, bytes):  # YAML !!binary: a JS consumer stringifies it
-            yield v.decode("utf-8", errors="replace")
+            yield v.decode("utf-8", errors="replace"), meta
         elif isinstance(v, str):
-            yield v
+            yield v, meta
 
 
 # npm-family lockfiles also name packages by SPEC, with no URL in sight:
@@ -659,9 +690,11 @@ def _findings(name: str, data: bytes, allowed: frozenset[str]) -> Counter:
     doc = _load(name, data)
     npm = name in _NPM_LOCKS
     bad: Counter = Counter()
-    for s in _strings(doc, skip_metadata=npm):
+    for s, meta in _strings(doc, _package_entries(name, doc) if npm else frozenset()):
         if _CONTROL.search(s):
             bad[MULTI_LINE] += 1
+        if meta:
+            continue  # nothing fetches from it: no URL or spec checks
         # Berry percent-encodes locators inside locators
         # (npm:1.0.0::__archiveUrl=https%3A%2F%2F...): check both forms.
         for t in dict.fromkeys((s, unquote(s))) if npm else (s,):

