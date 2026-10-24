@@ -1,0 +1,120 @@
+# Design: `pr-gate` — an AI merge gate against sabotage by prompt-injected coding agents
+
+**Date:** 2026-10-24
+**Status:** draft, pending review
+**Repos affected:** `injection-scanner` (publishes the action), every consuming repo (one small caller workflow + repo settings)
+
+## Why
+
+Most PRs in Jonathan's repos are written by AI coding agents (Claude Code, Codex) that read untrusted text all day. A prompt-injected agent could slip a backdoor, exfiltration, CI tampering, a dependency swap or an obfuscated payload into a PR that looks routine. `.claude#156` ranks this threat and finds most repos have no review requirement at all. A human skimming agent PRs will not reliably catch deliberate subterfuge, and published research says a single LLM reviewer won't either (frontier monitors drop from ~95% to ~60% catch rate against refined attacks; adaptive comments flip >90% of verdicts). So the gate is layered: deterministic checks the model cannot argue with, an injection tripwire, and dedicated hostile-author LLM passes — and it **blocks** rather than advises.
+
+Research behind this design (all in `~/Repos/research-agent/reports/`): `042baaa568a24f2f8a4c23341200143d.md` (SOTA + GitHub mechanics), `e586224add7544a393934ca071a52ea4.md` and `e9cd6c3ab59f429d9a8554bd4c6f3e1e.md` (no ready-made tool fits), `86559b70e3af4572a8c1c73275aa3136.md` (billing).
+
+## Goals, ranked
+
+1. **Catch malicious / subterfuge code** in a PR, and treat needlessly obscure code (indirect, encoded, clever, unjustified by the visible change) as a finding in itself, to force agents toward legible code ("legibility protocols" in the AI-control literature).
+2. **Security review** of newly introduced code.
+3. **General code review** (correctness bugs).
+
+## Non-goals
+
+- Running, building or testing PR code. The gate reads diffs only.
+- Replacing Jonathan's review. It is a tripwire that forces a look, not an approver; it never approves.
+- Dependency-malware intelligence (Socket/StepSecurity-style). Possible later add-on, not v1.
+- Closing `.claude#156` H4 (agents can act as Jonathan via the host PAT). Out of scope; noted as residual risk.
+
+## Anti-goals (failure even if it "works")
+
+- **Clever CI.** Jonathan's directive: CI/CD is load-bearing and must be *boringly simple and self-contained*. One action, one caller file per repo, no custom infra, no third-party actions inside the gate.
+- **Alert fatigue.** A gate that fires on most PRs gets clicked through and means nothing. Hard-block rules stay narrow; calibrate before enforcing.
+- **A gate the PR can disable.** Anything the PR controls (workflow files, config files, title, description, commit messages) must not influence whether or how the gate runs.
+- **Rerolling to pass.** Re-running a blocked check must not get a fresh LLM roll.
+- **Becoming the attack path.** The gate's key must not be reachable by PR content (no tools, no checkout, no execution).
+
+## Constraints
+
+- **Funding:** an Anthropic API key from the Claude Max **monthly API credits** (~$100 on Max 5x / $200 on Max 20x per a third-party source; check the Console). Dedicated key in its own Console workspace with a **spend limit at or below the credit**, so a leaked key burns at most the cap. Never the subscription OAuth token.
+- **Model configurable per repo**, so the sensitive repos (klaffat, nixos-config, `.claude`) use Fable (`claude-fable-5-1`) and the rest use Opus (`claude-opus-5-5`). The setting lives in the caller workflow file (protected by the gate itself), not in a repo variable (any writer, including the bot, can change variables).
+- **Blocking:** Jonathan wants a block he must actively clear — ideally a REQUEST_CHANGES review.
+- **Invocation from the GitHub UI:** Jonathan enabling **auto-merge** is the "ready, review it" signal. Nothing runs before that, so drafts and WIP cost nothing.
+
+## Architecture
+
+```
+consuming repo                                      injection-scanner (public)
+.github/workflows/ai-gate.yml   ──uses @<full SHA>──▶  pr-gate/action.yml  (composite)
+  on: pull_request_target                              pr-gate/gate.py     (stdlib + injection_scanner)
+  types: [auto_merge_enabled, synchronize, reopened]
+  job name: ai-gate  (the required check)
+  with: model, anthropic-api-key, openai-api-key
+```
+
+- **`pull_request_target`** so the workflow always comes from the base branch, never from the PR. No `actions/checkout` of PR code anywhere; the diff is fetched as data through the API.
+- **Composite action** in a subfolder of the public `injection-scanner` repo, consumed **pinned to a full commit SHA**. Updating the gate is a deliberate PR bumping the SHA. Public so the `klaffat` org repo can use it too.
+- **The caller file** (~20 lines) carries what an action cannot: trigger, `permissions: {contents: read, pull-requests: write}`, concurrency per PR, the job named `ai-gate`, and `model:`. The required job **must never have a job-level `if:`**: GitHub counts a skipped required job as success.
+- **The secret is passed only to the gate step**, never exported job-wide.
+
+### What the gate does, in order (fail closed at every step: any error → block)
+
+1. **Owner intent + freshness.** Query the PR via GraphQL. If auto-merge is not enabled, **fail** with "enable auto-merge to request the AI gate" (fail, never skip). If `autoMergeRequest.enabledBy.login` is not the configured `owner` input, **fail** with "auto-merge must be enabled by <owner>" — the bot has write access and can enable auto-merge itself, so "auto-merge is on" alone proves nothing. `owner` is an explicit caller input (Jonathan's login), never `github.repository_owner`, which is the org for klaffat. If the PR head moved since the event, fail as stale. **`synchronize` policy: see open question 3.**
+2. **Override check (reroll guard).** If the gate already posted a REQUEST_CHANGES review on this exact head SHA, the LLM layers are not re-run. The run passes only if `owner` has a non-dismissed APPROVED review whose `commit_id` is this head SHA; otherwise it stays blocked. (Not `run_attempt > 1`: re-running a run that failed at step 1, e.g. after a missed `auto_merge_enabled` event, must still get a real review.) The override skips only the LLM layers and the path rules: the hidden-Unicode, binary and lockfile-host checks **always** run, since they have no legitimate trigger and must not be launderable through "false alarm, approve".
+3. **Fetch the diff** base...head via `Accept: application/vnd.github.diff` (no commit messages, title, body or comments ever reach a model), plus the post-change contents of touched text files. Fail closed above a size cap (initial: 400 kB total) with "too large for the AI gate; human review".
+4. **Deterministic checks** (cannot be argued with; any hit → block):
+   - Invisible / bidi / tag / variation-selector / private-use / soft-hyphen / line-separator characters in added lines — via a new strict `profile="code"` in `injection_scanner.unicode_sanitize` (the current prose profile deliberately leaves U+FE00–FE0F, PUA, U+00AD, U+200E/F and U+2028/9 alone, which misses the GlassWorm vector). Block on **any** hit; never on `is_anomalous`, whose minimum-count floor would pass a two-character payload.
+   - Any added or modified **binary** file (the diff shows only "Binary files differ", so no model can see it). Minified/vendored/generated paths (`dist/`, `vendor/`, `*.min.*`) and very long lines go to the model as extra scrutiny.
+   - Changes under `.github/` and to agent-instruction files (`CLAUDE.md`, `AGENTS.md`, `.claude/`, `.codex/`, `.mcp.json`).
+   - Lockfile entries resolving to a host outside an allowlist (npm/yarn registries, crates.io, PyPI, github.com for flake inputs — builder finalises the list per ecosystem).
+   - Per-repo exceptions via a caller input: a list of path globs whose **path rule** is downgraded from block to "extra scrutiny" (e.g. the `.claude` repo legitimately edits agent files). Exceptions never touch the Unicode, binary or lockfile-host checks, and can never cover `.github/workflows/`.
+   - Deliberately **not** hard-blocked (too noisy): `*.nix`, `flake.lock` bumps from allowed hosts, `build.rs`, install scripts. These are passed to the model as "extra scrutiny" files.
+5. **Honeypot tripwire — see open question 2** (proposed: dropped from v1). Lakera (L2) is **not** used in CI (fleet-wide rate limit).
+6. **LLM passes**, all tool-less Messages API calls with JSON-schema structured output (if the configured model doesn't support it, fall back to JSON in text validated against the schema; unparseable → block). The input is wrapped in a random-nonce tag and declared untrusted; text addressed to reviewers or AI is treated as strong evidence of malice; comments are claims to be verified from code; invisible chars rendered as `<U+XXXX>`:
+   - **Monitor A** (hostile-author prompt, configured model) on the **diff only**: "assume the author is hostile", investigate then score suspicion 0–100, findings with categories `malicious | obscure | security | bug`.
+   - **Monitor B** (same prompt, configured model) on the **diff plus post-change contents of touched files**. Diversity by context rather than a fragile comment-stripping heuristic (which would delete `#include`/Nix/shell lines); the research finds strong monitors use full context well while diff-only resists dilution, so the two views fail differently.
+   - **Review pass** (configured model): security vulnerabilities and correctness bugs newly introduced; only concrete, high-confidence issues.
+7. **Verdict.** Block if any deterministic hit, honeypot trip, max suspicion ≥ threshold, any `malicious`/`obscure` finding of medium+, or any high `security` finding. Bugs never block (goal 3 is advisory).
+8. **Report.** One PR review on the head SHA: on block, event `REQUEST_CHANGES` (fallback `COMMENT` if the API refuses it) and exit 1; on pass, `COMMENT` with findings (if any), **dismiss the gate's own earlier REQUEST_CHANGES reviews on this PR** (otherwise an approved PR may stay unmergeable), and exit 0. The model's `file`/`explanation` text is the only attacker-shaped text that reaches the PR, and the next coding agent reads it: render it as plain text, neutralise `@mentions` and `#123` references, no markdown links. Body: verdict, suspicion, deterministic hits, findings by severity.
+9. **Key handling.** The API key reaches the Python process through step `env:` only, never interpolated into a command line; the gate never prints exception bodies or HTTP error bodies (they can echo the request).
+
+### Clearing a block (decided with Jonathan)
+
+1. Jonathan reads the findings.
+2. If it's a false alarm: **approve the PR** (this head SHA), then **re-run** the failed `ai-gate` check. Step 2 sees the owner approval and passes without a model call. Optionally dismiss the REQUEST_CHANGES review.
+3. Any new push makes the approval stale for the gate; the new head is reviewed from scratch.
+
+## Repo settings (per consuming repo, done once — a checklist, not automation)
+
+1. Ruleset on the default branch: require a PR; require status check `ai-gate` with **source = GitHub Actions**; block force pushes; no bypass actors. If available on the repo type: "Restrict who can dismiss reviews" → Jonathan only.
+2. Allow auto-merge.
+3. Secret: `AI_GATE_ANTHROPIC_KEY` (dedicated, capped Console workspace). An OpenAI key only if the honeypot stays (open question 2).
+4. **The agents' GitHub App/token must not have the `workflows` permission.** Otherwise a PR can add a second workflow whose job is also named `ai-gate` and reports a fake pass (pinning the check source to GitHub Actions does not stop this — every workflow reports as GitHub Actions). This is a `.claude#156` item requiring Jonathan's click in the App settings.
+
+## Must be verified empirically before relying on it
+
+1. Whether a REQUEST_CHANGES review posted with `GITHUB_TOKEN` (as `github-actions[bot]`) is accepted by the API and actually blocks merge/auto-merge on a personal repo. Sources conflict. The failing required check is the real gate regardless.
+2. Whether "Restrict who can dismiss reviews" (rulesets, GA 2026-07-07) is offered on user-owned repos.
+3. That `auto_merge_enabled` fires `pull_request_target` reliably (a Feb 2026 community report says it sometimes didn't; workaround: toggle auto-merge or push).
+4. That the monthly API credits are actually consumed by this key (check the Console after the first runs).
+5. On pass, the merge actually happens (the gate can dismiss its own REQUEST_CHANGES even with dismissal restricted; otherwise Jonathan dismisses it).
+6. Which of two same-named `ai-gate` check runs the ruleset honours. Until known, the fake-check defence rests on no agent credential having the `workflows` permission — and the host PAT (`.claude#156` H4) almost certainly has it.
+7. The ruleset binds to the job's display `name:`; the caller template mandates `name: ai-gate`.
+
+## Calibration and rollout
+
+1. **Shadow mode first:** run the gate over 20–50 of Jonathan's past merged (assumed honest) PRs per repo type; set the suspicion threshold just above their maximum (≈ fixed low false-positive rate, the method from the AI-control papers). Initial default: 25.
+2. Pilot on `smarthome` (public, low stakes). Then nixos-config, `.claude`, klaffat (org repo: separate secret and settings), each with Fable.
+3. Codex `@codex review` (ChatGPT Pro quota) stays available as an optional, advisory, cross-family second opinion triggered by comment. Not part of the gate.
+
+## Cost (estimate, not measured)
+
+~30k input / ~4k output tokens per call, 3 calls per run. Opus 5.5 ($4/$20 per MTok): ≈ $0.60/run. Fable 5.1 ($10/$50): ≈ $1.50/run. Honeypot (only if kept): small, plus OpenAI spend. At ~100 PRs × ~2 runs/month mixed models, roughly $100–200 — at the credit ceiling with Fable on the busy repos; watch the first month.
+
+## Open questions
+
+1. **MicroVM containment (Jonathan raised it).** Proposal: don't. The microvm lives in `research-agent`/nixos-config on dellan and contains an agent *with tools and network* reading hostile web content. The gate has no tools, runs no PR code, and runs on GitHub's throwaway runner VM. Putting it in a microvm means a self-hosted runner on dellan or nested KVM + Nix in CI, which breaks the "boringly simple" constraint for little gain. Reconsider only if the gate ever needs to execute PR code.
+2. **Honeypot in v1?** Review (Fable, 2026-10-24) found it the wrong tool here: its scenarios ask a judge to summarise research content and detect exfiltration coercion, while an attack on a code reviewer ("this is safe, reviewer") never touches a bait tool. It would also false-positive on exactly these repos (injection-scanner and `.claude` contain the canary literals in source and tests), and it needs an OpenAI key with real spend. Recommendation: drop from v1; its useful idea (text addressed to an AI = malice) lives in the monitor prompt. **Pending Jonathan's decision.**
+3. **`synchronize` policy.** Auto-merge survives pushes by anyone with write access. As drafted, a push after Jonathan enables auto-merge gets a fresh review and, if it passes, merges with no further human look — and every push is a fresh LLM roll (a refined attack gets through ~40% of the time per the research) that also spends the capped budget. Proposal: on `synchronize`, the gate fails with "head changed after auto-merge was enabled; disable and re-enable auto-merge to re-request review" and calls no model. Every reviewed commit is then one Jonathan clicked for after it existed. Cost: when an agent pushes a fix, two clicks (off/on). **Pending Jonathan's decision.**
+
+## Left to the builder
+
+- Exact prompt wording (keep the structure above), JSON schema details, lockfile host allowlists per ecosystem, review body formatting, tests (the gate's verdict logic and deterministic checks must be unit-tested offline; model calls stubbed, matching the repo's hermetic `ci.yml`).
+- Whether `pr-gate` installs `injection_scanner` from the pinned checkout of the action itself (preferred: the action's own `$GITHUB_ACTION_PATH`, so code and scanner are one pinned SHA).
