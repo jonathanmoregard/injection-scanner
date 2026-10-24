@@ -59,7 +59,7 @@ _API_TIMEOUT_S = float(os.environ.get("INJECTION_SCANNER_API_TIMEOUT", "20"))
 _JUDGES: tuple[dict, ...] = (
     {"id": "anthropic_haiku45", "provider": "anthropic", "model": "claude-haiku-4-5"},
     {"id": "openai_4o_mini", "provider": "openai", "model": "gpt-4o-mini"},
-    {"id": "openai_41_nano", "provider": "openai", "model": "gpt-4.1-nano"},
+    {"id": "openai_41_mini", "provider": "openai", "model": "gpt-4.1-mini"},
 )
 
 _SYSTEM = (

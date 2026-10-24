@@ -3,7 +3,7 @@ Layer 3: multi-provider honeypot ensemble.
 
 Each research report is fanned out to six downstream judge calls — two
 per model across three small models (claude-haiku-4-5, gpt-4o-mini,
-gpt-4.1-nano) spanning two providers (Anthropic + OpenAI). Each scenario
+gpt-4.1-mini) spanning two providers (Anthropic + OpenAI). Each scenario
 in honeypot_scenarios.py picks its own (provider, model) pair, framing,
 and canary placement. Cross-family diversity is the detection boost: an
 injection tuned for one family often misses on another, and vice versa.

@@ -10,7 +10,7 @@ Order (each layer can short-circuit):
                               loudly, exactly like the honeypot. Never silently
                               degrades to "pass".
   L3  honeypot              — fan the report out to a 3-model judge ensemble
-                              (claude-haiku-4-5, gpt-4o-mini, gpt-4.1-nano)
+                              (claude-haiku-4-5, gpt-4o-mini, gpt-4.1-mini)
                               across 6 canary scenarios; if any judge gets
                               coerced into a bait-tool call or canary echo, fail
   L4  judge                 — arbitration, ONLY for the disagreement case

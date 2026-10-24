@@ -60,7 +60,7 @@ def test_unanimous_benign_passes(monkeypatch):
     _stub_votes(monkeypatch, [
         JudgeVote("anthropic_haiku45", "benign", "verdict"),
         JudgeVote("openai_4o_mini", "benign", "verdict"),
-        JudgeVote("openai_41_nano", "benign", "verdict"),
+        JudgeVote("openai_41_mini", "benign", "verdict"),
     ])
     r = judge.check("agent tooling prose")
     assert r.ok
@@ -72,7 +72,7 @@ def test_single_attack_vote_rejects(monkeypatch):
     _stub_votes(monkeypatch, [
         JudgeVote("anthropic_haiku45", "benign", "verdict"),
         JudgeVote("openai_4o_mini", "attack", "verdict"),
-        JudgeVote("openai_41_nano", "benign", "verdict"),
+        JudgeVote("openai_41_mini", "benign", "verdict"),
     ])
     r = judge.check("x")
     assert not r.ok
@@ -83,11 +83,11 @@ def test_single_unavailable_rejects(monkeypatch):
     _stub_votes(monkeypatch, [
         JudgeVote("anthropic_haiku45", "benign", "verdict"),
         JudgeVote("openai_4o_mini", "benign", "verdict"),
-        JudgeVote("openai_41_nano", "unavailable", "api-error:TimeoutError"),
+        JudgeVote("openai_41_mini", "unavailable", "api-error:TimeoutError"),
     ])
     r = judge.check("x")
     assert not r.ok
-    assert r.reason == "unavailable:openai_41_nano:api-error:TimeoutError"
+    assert r.reason == "unavailable:openai_41_mini:api-error:TimeoutError"
 
 
 def test_raising_judge_coroutine_fails_closed(monkeypatch):
@@ -224,7 +224,7 @@ def test_check_works_inside_running_event_loop(monkeypatch):
     _stub_votes(monkeypatch, [
         JudgeVote("anthropic_haiku45", "benign", "verdict"),
         JudgeVote("openai_4o_mini", "benign", "verdict"),
-        JudgeVote("openai_41_nano", "benign", "verdict"),
+        JudgeVote("openai_41_mini", "benign", "verdict"),
     ])
 
     async def in_loop():
