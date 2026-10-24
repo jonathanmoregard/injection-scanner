@@ -238,7 +238,10 @@ _JSON_LOCKS = frozenset({"package-lock.json", "npm-shrinkwrap.json", "pipfile.lo
                          "flake.lock", "bun.lock"})
 _TOML_LOCKS = frozenset({"cargo.lock", "uv.lock", "poetry.lock", "pdm.lock"})
 _YAML_LOCKS = frozenset({"pnpm-lock.yaml", "yarn.lock"})
-_REQUIREMENTS = re.compile(r"^(requirements|constraints)[\w.-]*\.txt$")
+# pip requirement files: requirements*.txt / constraints*.txt, pip-tools'
+# requirements*.in / constraints*.in, and any .txt / .in in a directory
+# named "requirements" (requirements/base.txt, requirements/dev.in).
+_REQUIREMENTS = re.compile(r"^(requirements|constraints)[\w.-]*\.(txt|in)$")
 # yarn's own test for its v1 format (Berry's LEGACY_REGEXP).
 _YARN_V1 = re.compile(r"(?:#.*\r?\n)*?#\s+yarn\s+lockfile\s+v1\r?\n", re.I)
 _OK_SCHEMES = frozenset({"https", "git+https", "registry+https", "sparse+https",
@@ -271,7 +274,8 @@ def _kind(path: str) -> str | None:
     name = PurePosixPath(path).name.casefold()
     if name in _LOCKFILES:
         return name
-    if _REQUIREMENTS.match(name):
+    if _REQUIREMENTS.match(name) or (PurePosixPath(path).parent.name.casefold() == "requirements"
+                                     and name.endswith((".txt", ".in"))):
         return "requirements"
     return None
 
@@ -383,7 +387,7 @@ def _bad_urls(text: str, allowed: frozenset[str]) -> list[str]:
 
 
 def _line_hits(f: FileChange, allowed: frozenset[str], lines) -> list[Hit]:
-    pip = bool(_REQUIREMENTS.match(PurePosixPath(f.path).name.casefold()))
+    pip = _kind(f.path) == "requirements"
     hits = []
     for line_no, original in lines:
         text, undecoded = _decode_escapes(original)

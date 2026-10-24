@@ -51,13 +51,16 @@ the base branch). In order, failing closed at every step:
      to the base count. For a rename the base is the old path only if that
      was the same kind of lockfile; a file renamed into a lockfile name from
      anything else (`fixtures/lock.json` to `package-lock.json`) counts as
-     all new, and a line-checked one is then checked whole. A lockfile that does not parse or is too large to
-     fetch, or a string holding a line break or control character, is a hit
-     too. `requirements*.txt`, `Gemfile.lock` and yarn v1 lockfiles have no
-     multi-line strings and are checked one added line at a time; an added
-     line ending in a backslash continuation that could glue the next line
-     onto a URL is a hit (in `requirements*.txt` any run not preceded by
-     whitespace, since pip joins them all). Any URL form a package manager
+     all new, and a line-checked one is then checked whole. A lockfile that
+     does not parse or is too large to fetch, or a string holding a line
+     break or control character, is a hit too. pip requirement files
+     (`requirements*.txt`, `constraints*.txt`, pip-tools'
+     `requirements*.in` / `constraints*.in`, and any `.txt` or `.in` in a
+     directory named `requirements`), `Gemfile.lock` and yarn v1 lockfiles
+     have no multi-line strings and are checked one added line at a time;
+     an added line ending in a backslash continuation that could glue the
+     next line onto a URL is a hit (in pip requirement files any run not
+     preceded by whitespace, since pip joins them all). Any URL form a package manager
      accepts counts (`https:evil.x`, `https:\\evil.x`, escaped slashes, IPv6
      hosts). **Never overridable.**
    - a file git treats as binary (so no model and no other check can see
@@ -257,6 +260,9 @@ their maximum suspicion.
   cleared per repo; that needs a gate change. Local `file:../pkg`
   references are not host-checked (the referenced path is in the diff);
   `file://` URLs are hits.
+- A pip requirement file is recognised by its name or a `requirements/`
+  parent directory. A file pulled in with `-r` / `-c` under any other name
+  (`deps/base.txt`) is not host-checked; the model passes still see it.
 - A single emoji presentation selector straight after an emoji (the usual
   spelling of a warning-sign emoji) is allowed. Anything else with variation
   selectors, zero-width joiners or other invisible characters (including

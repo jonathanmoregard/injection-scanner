@@ -921,6 +921,24 @@ def test_requirements_lines_are_not_joined():
     assert line_hits("requirements.txt", lines) == []
 
 
+@pytest.mark.parametrize("path", [
+    # pip-tools layouts.
+    "requirements/base.txt", "requirements/dev.in", "Requirements/prod.txt",
+    "requirements.in", "requirements-dev.in", "constraints.in", "sub/constraints-ci.in",
+])
+def test_pip_tools_requirements_layouts_are_host_checked(path):
+    [hit] = line_hits(path, ["--extra-index-url https://evil.example/simple"])
+    assert (hit.rule, hit.overridable) == ("lockfile-host", False)
+    # ...with pip's line-continuation rule.
+    assert line_hits(path, ["requests==2.32.3 \\"]) == []
+    assert line_hits(path, ["--index-url https://pypi.org\\"]) != []
+
+
+@pytest.mark.parametrize("path", ["docs/notes.txt", "requirements/README.md", "deps.in"])
+def test_other_txt_and_in_files_are_not_host_checked(path):
+    assert line_hits(path, ["https://evil.example/"]) == []
+
+
 def test_non_lockfiles_are_not_host_checked():
     assert line_hits("README.md", ["https://evil.example/"]) == []
 

@@ -208,8 +208,12 @@ it, each with the reason. Design: `docs/superpowers/specs/2026-10-24-pr-gate-des
     U+0085 have no use in source. Same non-overridable hit, with the code
     points listed.
 22. **Lockfile allowlists:** npm-family locks: `registry.npmjs.org`,
-    `registry.yarnpkg.com`. Python locks and `requirements*.txt` /
-    `constraints*.txt`: `pypi.org`, `files.pythonhosted.org`. `Cargo.lock`:
+    `registry.yarnpkg.com`. Python locks and pip requirement files
+    (`requirements*.txt` / `constraints*.txt`, pip-tools'
+    `requirements*.in` / `constraints*.in`, and any `.txt` / `.in` whose
+    parent directory is named `requirements`, casefolded): `pypi.org`,
+    `files.pythonhosted.org`. **Residual:** a file included with `-r` /
+    `-c` under any other name is not host-checked (only the model sees it). `Cargo.lock`:
     `github.com` (crates.io index), `index.crates.io`, `static.crates.io`.
     `flake.lock`: `github.com`, `channels.nixos.org`, `releases.nixos.org`;
     flake input types other than github/git/tarball/file/path/indirect and
@@ -228,7 +232,7 @@ it, each with the reason. Design: `docs/superpowers/specs/2026-10-24-pr-gate-des
     token, is a hit (fail closed). An added per-line lockfile line ending in
     a backslash-newline continuation is a hit on its own: an odd trailing
     backslash run (trailing whitespace ignored; an even run is escaped
-    backslashes). In `requirements*.txt` pip joins on any trailing run, so
+    backslashes). In pip requirement files pip joins on any trailing run, so
     parity does not count there; instead a run preceded by whitespace is
     fine, which is how pip-compile writes its `pkg==1.0 \` / `--hash=... \`
     lines and which cannot glue a URL together.
@@ -272,7 +276,7 @@ it, each with the reason. Design: `docs/superpowers/specs/2026-10-24-pr-gate-des
     neither does a YAML alias (a container reached twice; that also stops
     alias bombs); YAML `!!binary` values are checked as UTF-8 text, since a
     JS consumer stringifies them. Escape decoding is the parser's job.
-    `requirements*.txt` (pip reads per line) and `Gemfile.lock` (no
+    pip requirement files (pip reads per line) and `Gemfile.lock` (no
     multi-line strings) stay on the per-line check. `yarn.lock` with the
     `# yarn lockfile v1` header (yarn's own test for the format) is checked
     per line AND, where PyYAML parses it, as YAML: classic yarn falls back
