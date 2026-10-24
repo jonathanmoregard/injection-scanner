@@ -288,6 +288,42 @@ it, each with the reason. Design: `docs/superpowers/specs/2026-10-24-pr-gate-des
     PyYAML cannot parse. Owner-override and carry-over runs check the same
     contents, fetched in `gather` like binaries; the check itself stays a
     pure function over them.
+22b. **npm-family package specs.** npm/pacote, yarn, pnpm and bun fetch
+    `"resolved": "github:atk/x#sha"` (or `gitlab:`, `bitbucket:`, `gist:`,
+    or a bare `atk/x#sha`) from that host, and no URL appears, so the URL
+    check alone saw nothing. In `package-lock.json`,
+    `npm-shrinkwrap.json`, `bun.lock`, `yarn.lock` and `pnpm-lock.yaml`,
+    two more rules feed the same base-relative multiset:
+    (a) every string: a hosted-git protocol anywhere
+    (`[x+]git|github|gitlab|bitbucket|gist[+x]:`, not followed by
+    whitespace, so prose like `Deprecated: use b` is not one), and a
+    leading `word:` that is neither a URL scheme nor in the safe set
+    `npm: workspace: catalog: patch: file: link: portal:` (the last three
+    only with a relative path: no leading `/ \ ~`, no `:` before any `#`
+    or `::` params). Applied to npm-family files only: Python lockfiles
+    are full of `sha256:` hashes.
+    (b) every fetch slot must be an https URL (the URL check judges its
+    host) or local: package-lock `packages.*.resolved` (a bare relative
+    path only with `link: true`, as npm writes workspace links; else
+    `file:` + relative path) and lockfile v1 `dependencies.*.resolved` at
+    any depth; pnpm `packages.*.resolution` (no `repo`, `type` absent or
+    `directory`, `tarball` https or `file:` relative, `directory`
+    relative); bun `packages.*[0]` `name@spec` (a version, an https URL or
+    a safe protocol) and, for a registry entry, `[1]` empty or https;
+    Berry `resolution` (same spec rule); yarn v1 `resolved` lines (per
+    line, with the hosted-git rule). Strings with `%` are also checked
+    percent-decoded, since Berry encodes a custom tarball URL as
+    `npm:1.0.0::__archiveUrl=https%3A%2F%2F...`.
+    Deviation from the brief: `file:` + relative path is accepted in npm
+    `resolved` without `link: true`, because npm writes exactly that for
+    a local tarball dependency (`"resolved": "file:../x.tgz"`). `patch:`
+    is safe because its inner (percent-encoded) locator is resolved as its
+    own lockfile entry; the decoded form is checked as well.
+    **Cost:** a legitimate git dependency in an npm-family lockfile is a
+    non-overridable hit (it already was whenever a URL to github.com
+    appeared, which npm usually writes). **Residual:** a fetch slot this
+    list does not name (a future lockfile field) is covered only by rule
+    (a) and the URL check.
 23. **Binary magic** table covers common images, fonts, archives, PDF, and
     executables (ELF, PE, Mach-O, wasm, `#!` scripts); executables are
     labelled. Every binary blocks either way (design option (a)). Which

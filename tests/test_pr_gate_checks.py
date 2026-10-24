@@ -915,6 +915,154 @@ def test_bun_lock_urls_are_checked():
     assert "evil.example" in hit.detail
 
 
+# ----- npm-family package specs ------------------------------------------------
+#
+# npm, yarn, pnpm and bun fetch a hosted-git spec (github:o/r, bare o/r) from
+# that host without any URL in the lockfile.
+
+_V1_WS_RESOLVED = ('resolved "https://registry.yarnpkg.com/ws/-/ws-8.17.0.tgz'
+                   '#d145d18eca2ed25aaf791a183903f7be5e295fea"')
+_PNPM_TARBALL = "resolution: {tarball: https://registry.npmjs.org/tar-pkg/-/tar-pkg-1.0.0.tgz}"
+
+
+def npm_family(fmt, spec):
+    """(path, text): a realistic lockfile whose fetch slot for one package is `spec`."""
+    if fmt in ("package-lock.json", "npm-shrinkwrap.json"):
+        return fmt, _PACKAGE_LOCK.replace("https://registry.npmjs.org/ws/-/ws-8.17.0.tgz", spec)
+    if fmt == "bun.lock":
+        return fmt, _BUN_LOCK.replace('"ws@8.17.0", ""', f'"ws@{spec}"')
+    if fmt == "yarn-v1":
+        return "yarn.lock", _YARN_V1.replace(_V1_WS_RESOLVED, f'resolved "{spec}"')
+    if fmt == "yarn-berry":
+        return "yarn.lock", _YARN_BERRY.replace('resolution: "ws@npm:8.17.0"',
+                                                f'resolution: "ws@{spec}"')
+    assert fmt == "pnpm-lock.yaml"
+    return fmt, _PNPM_LOCK.replace(_PNPM_TARBALL, f"resolution: {{tarball: '{spec}'}}")
+
+
+_NPM_FORMATS = ["package-lock.json", "npm-shrinkwrap.json", "bun.lock", "yarn-v1",
+                "yarn-berry", "pnpm-lock.yaml"]
+
+
+@pytest.mark.parametrize("fmt", _NPM_FORMATS)
+@pytest.mark.parametrize("spec", [
+    "github:atk/x#0123abc", "gitlab:atk/x#0123abc", "bitbucket:atk/x#0123abc",
+    "gist:0123abc", "atk/x#0123abc", "GitHub:atk/x",
+])
+def test_a_hosted_git_spec_in_an_npm_lockfile_is_a_hit(fmt, spec):
+    path, text = npm_family(fmt, spec)
+    hits = lock_hits(path, text)
+    assert hits and {(h.rule, h.overridable) for h in hits} == {("lockfile-host", False)}
+
+
+@pytest.mark.parametrize("fmt", _NPM_FORMATS)
+def test_the_npm_family_fixtures_stay_clean_through_the_injector(fmt):
+    # The injector itself must not break the file: an allowlisted URL passes.
+    path, text = npm_family(fmt, "https://registry.npmjs.org/ws/-/ws-8.17.0.tgz")
+    assert lock_hits(path, text) == []
+
+
+@pytest.mark.parametrize("text", [
+    # pnpm git resolutions, and a specifier pnpm resolves from GitHub.
+    _PNPM_LOCK.replace(_PNPM_TARBALL, "resolution: {commit: 0123abc, repo: atk/x, type: git}"),
+    _PNPM_LOCK.replace("specifier: ^0.1.5", "specifier: github:atk/x"),
+    _PNPM_LOCK.replace(_PNPM_TARBALL, "resolution: {directory: /etc, type: directory}"),
+])
+def test_pnpm_git_and_non_local_resolutions_are_hits(text):
+    assert lock_hits("pnpm-lock.yaml", text) != []
+
+
+@pytest.mark.parametrize("entry", [
+    '"node_modules/w": {"resolved": "packages/w"}',               # no link: a github shorthand
+    '"node_modules/w": {"resolved": "/abs/w", "link": true}',
+    '"node_modules/w": {"resolved": "file:/etc/w"}',
+    '"node_modules/w": {"resolved": 1}',
+])
+def test_a_package_lock_resolved_must_be_https_or_a_local_link(entry):
+    assert lock_hits("package-lock.json", '{"packages": {' + entry + "}}") != []
+
+
+@pytest.mark.parametrize("entry", [
+    '"node_modules/w": {"resolved": "packages/w", "link": true}',  # npm's workspace links
+    '"node_modules/w": {"resolved": "file:../w.tgz"}',            # a local tarball
+])
+def test_local_package_lock_references_are_not_hits(entry):
+    assert lock_hits("package-lock.json", '{"packages": {' + entry + "}}") == []
+
+
+def test_a_v1_package_lock_resolved_is_checked_at_any_depth():
+    text = ('{"lockfileVersion": 1, "dependencies": {"a": {"version": "1.0.0", '
+            '"resolved": "https://registry.npmjs.org/a/-/a-1.0.0.tgz", "dependencies": '
+            '{"b": {"version": "1.0.0", "resolved": "atk/b#0123abc"}}}}}')
+    assert lock_hits("package-lock.json", text) != []
+
+
+@pytest.mark.parametrize("value", [
+    "jsr:@std/path@^1.0.0", "exec:./gen.js", "link:/abs/x", "file:~/x", "portal:C:/x",
+])
+def test_a_package_spec_protocol_outside_the_safe_set_is_a_hit(value):
+    text = '{"packages": {"": {"dependencies": {"x": "' + value + '"}}}}'
+    assert lock_hits("package-lock.json", text) != []
+
+
+@pytest.mark.parametrize("value", [
+    "npm:real@^1.0.0", "workspace:*", "workspace:^", "catalog:", "catalog:react18",
+    "link:../x", "file:../x", "file:packages/x.tgz", "^1.0.0 || ^2.0.0", "latest",
+])
+def test_registry_and_local_package_specs_are_not_hits(value):
+    text = '{"packages": {"": {"dependencies": {"x": "' + value + '"}}}}'
+    assert lock_hits("package-lock.json", text) == []
+
+
+def test_a_free_text_colon_is_not_a_package_spec():
+    text = ('{"packages": {"node_modules/a": {"resolved": "https://registry.npmjs.org/a.tgz",'
+            ' "deprecated": "Deprecated: use b instead"}}}')
+    assert lock_hits("package-lock.json", text) == []
+
+
+@pytest.mark.parametrize("resolution,hit", [
+    # Berry percent-encodes a custom tarball URL into the npm: locator.
+    ("ws@npm:8.17.0::__archiveUrl=https%3A%2F%2Fevil.example%2Fws.tgz", True),
+    ("ws@npm:8.17.0::__archiveUrl=https%3A%2F%2Fregistry.npmjs.org%2Fws.tgz", False),
+    ("ws@patch:ws@npm%3A8.17.0#~/.yarn/patches/ws.patch::version=8.17.0&hash=abc", False),
+    ("ws@patch:ws@github%3Aatk/ws#~/.yarn/patches/ws.patch", True),
+    ("lib@file:../lib#../lib::hash=4f2e8c&locator=app%40workspace%3A.", False),
+    ("lib@link:../lib::locator=app%40workspace%3A.", False),
+])
+def test_yarn_berry_resolutions(resolution, hit):
+    text = _YARN_BERRY.replace('resolution: "ws@npm:8.17.0"', f'resolution: "{resolution}"')
+    assert bool(lock_hits("yarn.lock", text)) is hit
+
+
+@pytest.mark.parametrize("path,text", [
+    ("pnpm-lock.yaml", _PNPM_LOCK.replace(
+        "      git:\n", "      lib:\n        specifier: workspace:*\n        version: link:../lib\n"
+        "      cat:\n        specifier: 'catalog:'\n        version: 1.0.0\n"
+        "      loc:\n        specifier: file:../loc\n        version: file:../loc\n      git:\n"
+    ).replace("  tar-pkg@1.0.0:", "  loc@file:../loc:\n    resolution: {directory: ../loc, type: directory}\n"
+              "    version: 1.0.0\n\n  local-tgz@1.0.0:\n"
+              "    resolution: {integrity: sha512-AbC=, tarball: file:vendor/local-tgz.tgz}\n"
+              "\n  tar-pkg@1.0.0:")),
+    ("bun.lock", _BUN_LOCK.replace('    "ws": [', '    "lib": ["lib@workspace:packages/lib"],\n'
+                                   '    "loc": ["loc@file:../loc", {}],\n'
+                                   '    "t": ["t@https://registry.npmjs.org/t/-/t-1.0.0.tgz", {}],\n'
+                                   '    "@types/node": ["@types/node@20.14.0", "", {}, "sha512-AbC="],\n'
+                                   '    "ws": [')),
+])
+def test_workspace_catalog_and_local_entries_are_not_hits(path, text):
+    assert lock_hits(path, text) == []
+
+
+def test_a_bun_registry_entry_must_name_an_https_tarball():
+    text = _BUN_LOCK.replace('"ws@8.17.0", ""', '"ws@8.17.0", "atk/ws#0123abc"')
+    assert lock_hits("bun.lock", text) != []
+
+
+def test_a_hosted_git_spec_already_in_the_base_is_not_a_hit():
+    path, head = npm_family("package-lock.json", "github:atk/x#0123abc")
+    assert lock_hits(path, head, base=head) == []
+
+
 def test_requirements_lines_are_not_joined():
     # pip has no multi-line strings: "https://pypi.org" + "requests" is two lines.
     lines = ["--index-url https://pypi.org", "requests==2.32.3"]

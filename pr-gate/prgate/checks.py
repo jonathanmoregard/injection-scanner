@@ -18,6 +18,7 @@ import tomllib
 from collections import Counter
 from dataclasses import dataclass
 from pathlib import PurePosixPath
+from urllib.parse import unquote
 
 import yaml
 from injection_scanner.unicode_sanitize import find_hidden
@@ -388,6 +389,7 @@ def _bad_urls(text: str, allowed: frozenset[str]) -> list[str]:
 
 def _line_hits(f: FileChange, allowed: frozenset[str], lines) -> list[Hit]:
     pip = _kind(f.path) == "requirements"
+    yarn = _kind(f.path) == "yarn.lock"
     hits = []
     for line_no, original in lines:
         text, undecoded = _decode_escapes(original)
@@ -397,6 +399,8 @@ def _line_hits(f: FileChange, allowed: frozenset[str], lines) -> list[Hit]:
         if undecoded and _SCHEMEISH.search(text):
             bad.append("undecodable escape near a URL")
         bad += _bad_urls(text, allowed)
+        if yarn:
+            bad += _yarn_v1_line_bad(text)
         if bad:
             hits.append(Hit("lockfile-host", f.path,
                             f"line {line_no}: not allowlisted: {', '.join(bad[:4])}", False))
@@ -461,6 +465,139 @@ def _strings(doc):
             yield v
 
 
+# npm-family lockfiles also name packages by SPEC, with no URL in sight:
+# npm/pacote, yarn, pnpm and bun fetch "github:o/r#sha" or a bare "o/r#sha"
+# from that host. So in these files (a) a hosted-git protocol anywhere in a
+# string, or a leading "word:" protocol outside a small safe set, is a
+# finding; and (b) each fetch slot (npm `resolved`, pnpm `resolution`, the
+# bun and Berry "name@spec" entries, yarn v1 `resolved`) must be an https
+# URL (whose host the URL check above judges) or a local relative path.
+_NPM_LOCKS = frozenset({"package-lock.json", "npm-shrinkwrap.json", "bun.lock",
+                        "yarn.lock", "pnpm-lock.yaml"})
+_GIT_WORD = r"(?:[A-Za-z0-9.-]+\+)?(?:git|github|gitlab|bitbucket|gist)(?:\+[A-Za-z0-9.-]+)?"
+_GIT_SPEC = re.compile(r"(?<![A-Za-z0-9+.-])(" + _GIT_WORD + r"):(?!\s)", re.I)
+_SPEC_PREFIX = re.compile(r"([A-Za-z][A-Za-z0-9+.-]*):(?!\s)")
+_LOCAL_PROTOCOLS = frozenset({"file", "link", "portal"})
+# npm: aliases a registry name; workspace: and catalog: resolve inside the
+# repo; patch: wraps another locator that the lockfile also resolves itself.
+_SAFE_PROTOCOLS = frozenset({"npm", "workspace", "catalog", "patch"}) | _LOCAL_PROTOCOLS
+_VERSION = re.compile(r"[0-9][0-9A-Za-z.+-]*")
+NOT_FETCHABLE = "fetch slot that is not an https URL or a local path"
+
+
+def _local(ref: str) -> bool:
+    """A relative local path (yarn may append "#..." or "::params")."""
+    path = re.split(r"#|::", ref, maxsplit=1)[0]
+    return bool(path) and not path.startswith(("/", "\\", "~")) and ":" not in path
+
+
+def _https(v) -> bool:
+    return isinstance(v, str) and v[:6].lower() == "https:"
+
+
+def _git_specs(s: str) -> list[str]:
+    return [f"hosted-git spec {m.group(1).lower()[:32]}:" for m in _GIT_SPEC.finditer(s)]
+
+
+def _spec_bad(s: str) -> list[str]:
+    """Package-spec findings for one string of an npm-family lockfile."""
+    bad = _git_specs(s)
+    m = _SPEC_PREFIX.match(s)
+    if m:
+        word = m.group(1).lower()
+        if re.fullmatch(_GIT_WORD, word) or _KNOWN_SCHEME.fullmatch(word):
+            pass  # reported above, or a URL for the URL check
+        elif word not in _SAFE_PROTOCOLS:
+            bad.append(f"package spec protocol {word[:32]}:")
+        elif word in _LOCAL_PROTOCOLS and not _local(s[m.end():]):
+            bad.append(f"{word}: reference that is not a relative path")
+    return bad
+
+
+def _resolved_bad(v, link=False) -> bool:
+    """npm's `resolved` (and pnpm's tarball): an https URL, a `file:`
+    relative path, or a bare relative path where npm marks `link: true`."""
+    if _https(v):
+        return False
+    if isinstance(v, str) and v[:5].lower() == "file:" and _local(v[5:]):
+        return False
+    return not (link is True and isinstance(v, str) and _local(v))
+
+
+def _spec_slot_bad(ident) -> bool:
+    """The spec half of a bun or Berry "name@spec" entry: a version, an
+    https URL, or a safe protocol (a local one with a relative path)."""
+    at = ident.find("@", 1) if isinstance(ident, str) else -1
+    if at < 1:
+        return True
+    spec = ident[at + 1:]
+    if _VERSION.fullmatch(spec) or _https(spec):
+        return False
+    m = _SPEC_PREFIX.match(spec)
+    word = m.group(1).lower() if m else ""
+    return word not in _SAFE_PROTOCOLS or (word in _LOCAL_PROTOCOLS
+                                           and not _local(spec[m.end():]))
+
+
+def _pnpm_resolution_bad(res) -> bool:
+    if not isinstance(res, dict) or "repo" in res or res.get("type") not in (None, "directory"):
+        return True  # a git resolution, or not one pnpm writes
+    if "tarball" in res and _resolved_bad(res["tarball"]):
+        return True
+    return "directory" in res and not (isinstance(res["directory"], str)
+                                       and _local(res["directory"]))
+
+
+def _dicts(v) -> list[dict]:
+    return [x for x in v.values() if isinstance(x, dict)] if isinstance(v, dict) else []
+
+
+def _npm_slots_bad(name: str, doc):
+    """One NOT_FETCHABLE per fetch slot that is neither https nor local."""
+    if not isinstance(doc, dict):
+        return
+    if name in ("package-lock.json", "npm-shrinkwrap.json"):
+        for e in _dicts(doc.get("packages")):
+            if "resolved" in e and _resolved_bad(e["resolved"], e.get("link")):
+                yield NOT_FETCHABLE
+        stack = [doc.get("dependencies")]  # lockfile v1: nested to any depth
+        while stack:
+            for e in _dicts(stack.pop()):
+                if "resolved" in e and _resolved_bad(e["resolved"]):
+                    yield NOT_FETCHABLE
+                stack.append(e.get("dependencies"))
+    elif name == "pnpm-lock.yaml":
+        for e in _dicts(doc.get("packages")):
+            if "resolution" in e and _pnpm_resolution_bad(e["resolution"]):
+                yield NOT_FETCHABLE
+    elif name == "bun.lock":
+        packages = doc.get("packages")
+        for e in packages.values() if isinstance(packages, dict) else ():
+            if not isinstance(e, list) or not e:
+                continue
+            # ["name@1.0.0", "<tarball URL, or empty for the registry>", {...}, "sha512-..."]
+            if _spec_slot_bad(e[0]) or (len(e) > 1 and isinstance(e[1], str)
+                                        and e[1] and not _https(e[1])):
+                yield NOT_FETCHABLE
+    elif name == "yarn.lock":
+        for e in _dicts(doc):
+            if "resolution" in e and _spec_slot_bad(e["resolution"]):  # Berry
+                yield NOT_FETCHABLE
+            if "resolved" in e and _resolved_bad(e["resolved"]):  # v1 read as YAML
+                yield NOT_FETCHABLE
+
+
+_YARN_V1_RESOLVED = re.compile(r'\s+resolved\s+"?([^"]*)"?\s*$')
+
+
+def _yarn_v1_line_bad(text: str) -> list[str]:
+    bad = _git_specs(text)
+    m = _YARN_V1_RESOLVED.match(text)
+    if m and _resolved_bad(m.group(1)):
+        bad.append(NOT_FETCHABLE)
+    return bad
+
+
 def _flake_bad(doc, allowed: frozenset[str]):
     nodes = doc.get("nodes") if isinstance(doc, dict) else None
     for node in nodes.values() if isinstance(nodes, dict) else ():
@@ -478,11 +615,19 @@ def _flake_bad(doc, allowed: frozenset[str]):
 def _findings(name: str, data: bytes, allowed: frozenset[str]) -> Counter:
     """Bad values in a parsed lockfile, counted. Raises if it does not parse."""
     doc = _load(name, data)
+    npm = name in _NPM_LOCKS
     bad: Counter = Counter()
     for s in _strings(doc):
         if _CONTROL.search(s):
             bad[MULTI_LINE] += 1
-        bad.update(_bad_urls(s, allowed))
+        # Berry percent-encodes locators inside locators
+        # (npm:1.0.0::__archiveUrl=https%3A%2F%2F...): check both forms.
+        for t in dict.fromkeys((s, unquote(s))) if npm else (s,):
+            bad.update(_bad_urls(t, allowed))
+            if npm:
+                bad.update(_spec_bad(t))
+    if npm:
+        bad.update(_npm_slots_bad(name, doc))
     if name == "flake.lock":
         bad.update(_flake_bad(doc, allowed))
     return bad

@@ -62,7 +62,16 @@ the base branch). In order, failing closed at every step:
      next line onto a URL is a hit (in pip requirement files any run not
      preceded by whitespace, since pip joins them all). Any URL form a package manager
      accepts counts (`https:evil.x`, `https:\\evil.x`, escaped slashes, IPv6
-     hosts). **Never overridable.**
+     hosts). npm-family lockfiles (`package-lock.json`,
+     `npm-shrinkwrap.json`, `bun.lock`, `yarn.lock`, `pnpm-lock.yaml`) can
+     also fetch from a host with no URL at all: a hosted-git spec
+     (`github:`, `gitlab:`, `bitbucket:`, `gist:`, `git+...:`) anywhere,
+     or a leading protocol other than `npm:`, `workspace:`, `catalog:`,
+     `patch:` or a relative `file:` / `link:` / `portal:` path, is a hit;
+     and every fetch slot (npm `resolved`, pnpm `resolution`, bun and yarn
+     Berry `name@spec` entries, yarn v1 `resolved`) must be an https URL
+     or a local relative path, so a bare `owner/repo#sha` there is a hit.
+     **Never overridable.**
    - a file git treats as binary (so no model and no other check can see
      it) that is not a known binary type: a text file with a NUL byte (`.js`,
      `.vbs`, `.csproj`, ...), UTF-16 text, a file with no extension, one
@@ -259,7 +268,9 @@ their maximum suspicion.
 - Lockfile hosts outside the allowlist (e.g. a private registry) cannot be
   cleared per repo; that needs a gate change. Local `file:../pkg`
   references are not host-checked (the referenced path is in the diff);
-  `file://` URLs are hits.
+  `file://` URLs are hits. So is every git dependency in an npm-family
+  lockfile (`github:o/r`, `git+ssh://...`), legitimate or not: only values
+  new relative to the base count, but a PR adding one cannot pass.
 - A pip requirement file is recognised by its name or a `requirements/`
   parent directory. A file pulled in with `-r` / `-c` under any other name
   (`deps/base.txt`) is not host-checked; the model passes still see it.
