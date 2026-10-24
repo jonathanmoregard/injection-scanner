@@ -48,7 +48,10 @@ the base branch). In order, failing closed at every step:
      Berry, ...) are parsed whole, at the head and at the base, and every
      string in them is checked, so escapes, block scalars and line folding
      resolve as the package manager resolves them. Only values new relative
-     to the base count. A lockfile that does not parse or is too large to
+     to the base count. For a rename the base is the old path only if that
+     was the same kind of lockfile; a file renamed into a lockfile name from
+     anything else (`fixtures/lock.json` to `package-lock.json`) counts as
+     all new, and a line-checked one is then checked whole. A lockfile that does not parse or is too large to
      fetch, or a string holding a line break or control character, is a hit
      too. `requirements*.txt`, `Gemfile.lock` and yarn v1 lockfiles have no
      multi-line strings and are checked one added line at a time; an added

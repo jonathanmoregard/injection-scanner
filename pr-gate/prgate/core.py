@@ -101,8 +101,9 @@ def gather(gh, base_oid: str, ev: Event) -> Gathered:
 
     Binary contents are fetched here because the hash needs them: the diff
     shows only "Binary files differ", which would let a binary change ride
-    a carried-over pass. Parsed lockfiles are fetched whole, head and live
-    base, for the always-on lockfile check that every path runs.
+    a carried-over pass. Parsed lockfiles (and line-checked ones renamed
+    from another kind) are fetched whole, head and live base, for the
+    always-on lockfile check that every path runs.
     """
     diff_bytes = gh.diff(base_oid, ev.head_sha, DIFF_HARD_CAP)
     return gather_from(diff_bytes,
@@ -111,11 +112,15 @@ def gather(gh, base_oid: str, ev: Event) -> Gathered:
 
 
 def _lockfile(gh, f: FileChange, base_oid: str, head: str) -> checks.Lockfile:
-    """Head and base contents; None where over the cap or (base) absent."""
+    """Head and base contents; None where over the cap or (base) absent.
+    The base is the old path of a rename only if that was the same kind of
+    lockfile: any other file was never checked as one."""
     try:
         head_data = gh.file_content(f.path, head, FILE_FETCH_CAP)
     except TooLarge:
         head_data = None
+    if checks.renamed_from_other_kind(f):
+        return checks.Lockfile(head_data, None)
     try:
         base_data = gh.file_content(f.old_path or f.path, base_oid, FILE_FETCH_CAP)
     except TooLarge:
@@ -134,7 +139,7 @@ def gather_from(diff_bytes: bytes, fetch_binary: Callable[[str], bytes],
     diff_text = diff_bytes.decode("utf-8", errors="replace")
     files = parse(diff_text)
     binaries = {f.path: fetch_binary(f.path) for f in files if f.binary and f.status != "deleted"}
-    lockfiles = {f.path: fetch_lockfile(f) for f in files if checks.parsed_lockfile(f)}
+    lockfiles = {f.path: fetch_lockfile(f) for f in files if checks.fetched_lockfile(f)}
     # The hash reads the diff with every invalid byte kept distinct
     # (surrogateescape); "replace" maps them all to U+FFFD, so swapping one
     # for another would ride a carried-over pass. Same files, same order:

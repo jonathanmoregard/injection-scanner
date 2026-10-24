@@ -236,8 +236,15 @@ it, each with the reason. Design: `docs/superpowers/specs/2026-10-24-pr-gate-des
     `uv.lock`, `poetry.lock`, `pdm.lock`; `tomllib`) or YAML lockfile
     (`pnpm-lock.yaml`, `yarn.lock`; PyYAML's safe loader, libyaml when
     present), core fetches the whole file at the head and at the live base
-    oid (the old path for a rename; a 404 there means "not in the base";
-    any other error is infra). Every string, mapping keys included, gets
+    oid (a 404 there means "not in the base"; any other error is infra).
+    For a rename or copy the base is the old path only if it is the same
+    kind of lockfile (same lockfile name, or both `requirements`-style);
+    from any other path there is no base: PR 1 adding
+    `tests/fixtures/lock.json` (not a lockfile name, so never checked) and
+    PR 2 renaming it unchanged to `package-lock.json` would otherwise diff
+    the file against itself and find nothing new. A line-checked lockfile
+    renamed from another kind is fetched and every line of it checked,
+    since a rename shows only the lines it changed. Every string, mapping keys included, gets
     the URL/host/userinfo/scheme checks above after WHATWG normalisation
     (tab/CR/LF stripped, backslash to slash). A string holding a line break
     (U+0085/2028/2029 included), a tab or another control character is a

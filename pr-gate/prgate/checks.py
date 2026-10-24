@@ -252,19 +252,39 @@ class Lockfile:
     base: bytes | None = None
 
 
-def _allowlist(path: str) -> frozenset[str] | None:
+def _kind(path: str) -> str | None:
+    """Which lockfile a path is: its lockfile name, "requirements", or None."""
     name = PurePosixPath(path).name.casefold()
     if name in _LOCKFILES:
-        return _LOCKFILES[name]
+        return name
     if _REQUIREMENTS.match(name):
-        return _PY
+        return "requirements"
     return None
 
 
+def _allowlist(path: str) -> frozenset[str] | None:
+    kind = _kind(path)
+    return _PY if kind == "requirements" else _LOCKFILES.get(kind)
+
+
+def renamed_from_other_kind(f: FileChange) -> bool:
+    """Renamed or copied from a path that is not the same kind of lockfile
+    (tests/fixtures/lock.json -> package-lock.json): the old file was never
+    checked as this lockfile, so nothing in it counts as already known."""
+    return f.old_path is not None and _kind(f.old_path) != _kind(f.path)
+
+
 def parsed_lockfile(f: FileChange) -> bool:
-    """A lockfile the check parses whole: core fetches its contents."""
+    """A lockfile the check parses whole."""
     return f.status != "deleted" and (PurePosixPath(f.path).name.casefold()
                                       in _JSON_LOCKS | _TOML_LOCKS | _YAML_LOCKS)
+
+
+def fetched_lockfile(f: FileChange) -> bool:
+    """A lockfile core fetches whole: a parsed one, or a line-checked one
+    renamed from another kind (a rename shows only the lines it changed)."""
+    return parsed_lockfile(f) or (f.status != "deleted" and _allowlist(f.path) is not None
+                                  and renamed_from_other_kind(f))
 
 
 # JSON / TOML / YAML double-quoted string escapes, for the line-checked
@@ -348,10 +368,10 @@ def _bad_urls(text: str, allowed: frozenset[str]) -> list[str]:
     return bad
 
 
-def _line_hits(f: FileChange, allowed: frozenset[str]) -> list[Hit]:
+def _line_hits(f: FileChange, allowed: frozenset[str], lines) -> list[Hit]:
     pip = bool(_REQUIREMENTS.match(PurePosixPath(f.path).name.casefold()))
     hits = []
-    for line_no, original in f.added:
+    for line_no, original in lines:
         text, undecoded = _decode_escapes(original)
         bad = []
         if _continues(original, pip):
@@ -476,6 +496,16 @@ def _parsed_hits(f: FileChange, name: str, allowed: frozenset[str],
     return [Hit("lockfile-host", f.path, f"not allowlisted: {', '.join(new[:4])}", False)]
 
 
+def _checked_lines(f: FileChange, lf: Lockfile | None):
+    """The lines the per-line check reads: the added ones, or every line of
+    a file renamed from another kind."""
+    if not renamed_from_other_kind(f):
+        return f.added
+    if lf is None or lf.head is None:
+        return None
+    return enumerate(lf.head.decode("utf-8", errors="replace").split("\n"), 1)
+
+
 def lockfile_hosts(files: list[FileChange], lockfiles: dict[str, Lockfile]) -> list[Hit]:
     hits = []
     for f in files:
@@ -483,17 +513,19 @@ def lockfile_hosts(files: list[FileChange], lockfiles: dict[str, Lockfile]) -> l
         if allowed is None or f.status == "deleted":
             continue
         name = PurePosixPath(f.path).name.casefold()
-        if not parsed_lockfile(f):
-            hits += _line_hits(f, allowed)
-            continue
         lf = lockfiles.get(f.path)
+        if not parsed_lockfile(f):
+            lines = _checked_lines(f, lf)
+            hits += (_line_hits(f, allowed, lines) if lines is not None else
+                     [Hit("lockfile-host", f.path, "lockfile too large to check", False)])
+            continue
         # yarn.lock with the v1 header is classic yarn's line format, which
         # classic yarn falls back to reading as YAML: check both readings.
         yarn_v1 = (name == "yarn.lock" and lf is not None and lf.head is not None
                    and bool(_YARN_V1.match(lf.head.decode("utf-8", errors="replace"))))
         hits += _parsed_hits(f, name, allowed, lf, yarn_v1)
         if yarn_v1:
-            hits += _line_hits(f, allowed)
+            hits += _line_hits(f, allowed, _checked_lines(f, lf))
     return hits
 
 
