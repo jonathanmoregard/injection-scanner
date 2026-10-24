@@ -140,9 +140,13 @@ it, each with the reason. Design: `docs/superpowers/specs/2026-10-24-pr-gate-des
     only verified blocks are dismissed. An empty key fails the run as a
     config error before anything is read or posted. Key rotation invalidates
     old markers: re-click auto-merge. Dry-run renders `mac=unsigned`, which
-    never parses. v1 markers (unsigned) are ignored. Residual: a workflow
-    with a write token can still copy or edit the gate's own review bodies
-    (same bot identity); see README Limitations.
+    never parses. v1 markers (unsigned) are ignored. A workflow with a write
+    token can still copy or edit the gate's own review bodies (same bot
+    identity). Defused by two rules: carry-over is refused if ANY verified
+    block of the same own-changes hash exists (replayed old pass), and any
+    `github-actions[bot]` REQUEST_CHANGES on the head arms the reroll guard
+    regardless of body (a body edit can strip a marker, not the state). A
+    forged REQUEST_CHANGES therefore only costs the owner an approval.
 
 ## Packaging
 

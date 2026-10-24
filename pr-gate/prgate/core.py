@@ -131,6 +131,13 @@ def _gate_reviews(reviews: list[Review], ev: Event, key: bytes):
 
 
 def _blocked_before(reviews: list[Review], ev: Event, key: bytes) -> bool:
+    """A verified gate block on this head, or ANY github-actions[bot]
+    REQUEST_CHANGES on it. The second clause matters because the same bot
+    identity can edit a review body (stripping the marker) but not its state;
+    a forged one only costs the owner an approval."""
+    if any(r.login == GATE_LOGIN and r.state == "CHANGES_REQUESTED"
+           and r.commit_id == ev.head_sha for r in reviews):
+        return True
     return any(m[0] == "block" and (m[1] == ev.head_sha or r.commit_id == ev.head_sha)
                for r, m in _gate_reviews(reviews, ev, key))
 
@@ -146,7 +153,12 @@ def _carries_over(reviews: list[Review], ev: Event, key: bytes, own_hash: str) -
     """The NEWEST gate marker (pass or block) is a pass of these exact own
     changes. An older pass never outlives a later block."""
     markers = [m for _, m in _gate_reviews(reviews, ev, key)]
-    return bool(markers) and markers[-1][0] == "pass" and markers[-1][2] == own_hash
+    if not markers or markers[-1][0] != "pass" or markers[-1][2] != own_hash:
+        return False
+    # A real pass can be re-posted (replayed) by another workflow running as
+    # the same bot after a later block; so any block of these changes, at
+    # any position, rules carry-over out.
+    return not any(m[0] == "block" and m[2] == own_hash for m in markers)
 
 
 def _text_contents(gh, ev: Event, files: list[FileChange]) -> tuple[dict[str, str], list[str]]:

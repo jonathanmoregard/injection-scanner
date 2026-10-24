@@ -354,6 +354,28 @@ def test_synchronize_does_not_carry_a_pass_over_a_later_block_of_the_same_change
     assert model.calls == [] and gh.posted == []
 
 
+def test_a_replayed_pass_after_a_block_of_the_same_changes_does_not_carry_over():
+    # Another workflow running as github-actions[bot] can re-post a copy of a
+    # REAL pass marker after the gate blocked the same changes.
+    h = own_hash_of(DIFF)
+    reviews = [gate_review("pass", OLD, h, rid=5), gate_review("block", OLD, h, rid=6),
+               gate_review("pass", OLD, h, rid=7)]
+    gh = FakeGitHub(diff=shifted(DIFF), reviews=reviews)
+    out, model = run(gh, action="synchronize")
+    assert out.exit_code == 1 and "re-enable auto-merge" in out.message
+    assert model.calls == [] and gh.posted == []
+
+
+def test_a_bot_request_changes_with_its_marker_edited_away_still_guards_rerolls():
+    # The bot identity can edit a review body but not its state.
+    edited = Review(id=6, login=BOT, state="CHANGES_REQUESTED", commit_id=HEAD,
+                    body="looks fine now")
+    gh = FakeGitHub(reviews=[edited])
+    out, model = run(gh)
+    assert out.exit_code == 1 and "must approve" in out.message
+    assert model.calls == [] and gh.posted == []
+
+
 def test_reopened_without_a_pass_fails_without_a_model_call():
     # Close/reopen must not be a free reroll while auto-merge stays on.
     gh = FakeGitHub()
@@ -407,10 +429,20 @@ def test_a_forged_bot_pass_does_not_carry_over(body):
 
 
 @pytest.mark.parametrize("body", forged_bodies("block", HEAD, "0" * 64))
-def test_a_forged_bot_block_does_not_arm_the_reroll_guard(body):
-    gh = FakeGitHub(reviews=[forged("block", HEAD, "0" * 64, body)])
+def test_a_forged_block_marker_in_a_comment_does_not_arm_the_reroll_guard(body):
+    review = Review(id=100, login=BOT, state="COMMENTED", commit_id=HEAD, body=body)
+    gh = FakeGitHub(reviews=[review])
     out, model = run(gh)
     assert len(model.calls) == 1 and out.exit_code == 0
+
+
+@pytest.mark.parametrize("body", forged_bodies("block", HEAD, "0" * 64))
+def test_any_bot_request_changes_on_the_head_arms_the_reroll_guard(body):
+    # Deliberate: state can't be edited, a marker can. A forged
+    # REQUEST_CHANGES only costs the owner an approval; it never passes code.
+    gh = FakeGitHub(reviews=[forged("block", HEAD, "0" * 64, body)])
+    out, model = run(gh)
+    assert out.exit_code == 1 and model.calls == []
 
 
 @pytest.mark.parametrize("body", forged_bodies("block", OLD, "0" * 64))
