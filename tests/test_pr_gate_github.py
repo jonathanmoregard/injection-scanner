@@ -9,7 +9,7 @@ import urllib.error
 
 import pytest
 
-from prgate.github import Dismissal, GitHub, GitHubError, TooLarge
+from prgate.github import GitHub, GitHubError, TimelineEvent, TooLarge
 
 TOKEN = "ghs_SECRETTOKEN"
 HEAD = "c" * 40
@@ -151,13 +151,25 @@ def dismissed(review_id, login):
                                  "dismissal_message": "false alarm"}}
 
 
-def test_review_dismissals_paginate_the_issue_timeline():
-    page1 = [{"event": "commented", "actor": {"login": "u"}, "body": "x"}] * 99 + [
-        dismissed(5, "jonathan")]
-    page2 = [{"event": "labeled", "actor": None}, dismissed(6, "github-actions[bot]")]
+def reviewed(review_id):
+    return {"event": "reviewed", "id": review_id, "user": {"login": "github-actions[bot]"},
+            "state": "changes_requested", "submitted_at": "2026-10-24T10:00:00Z"}
+
+
+def test_the_timeline_keeps_order_across_pages_and_only_what_the_override_needs():
+    page1 = [{"event": "commented", "actor": {"login": "u"}, "body": "x"}] * 96 + [
+        {"event": "committed", "sha": "a" * 40},
+        reviewed(5),
+        dismissed(5, "jonathan"),
+        {"event": "head_ref_force_pushed", "actor": {"login": "w"}}]
+    page2 = [{"event": "labeled", "actor": None}, {"event": "head_ref_restored"},
+             dismissed(6, "github-actions[bot]"), {"event": "committed"}]
     client, op = gh(page1, page2)
-    assert client.review_dismissals(7) == [Dismissal(5, "jonathan"),
-                                           Dismissal(6, "github-actions[bot]")]
+    assert client.timeline(7) == [
+        TimelineEvent("commit"), TimelineEvent("reviewed", 5),
+        TimelineEvent("dismissed", 5, "jonathan"), TimelineEvent("rewrite"),
+        TimelineEvent("rewrite"), TimelineEvent("dismissed", 6, "github-actions[bot]"),
+        TimelineEvent("commit")]
     first, second = op.requests
     assert first.full_url.startswith("https://api.github.test/repos/owner/repo/issues/7/timeline?")
     assert "page=2" in second.full_url and "per_page=100" in second.full_url
@@ -167,18 +179,28 @@ def test_review_dismissals_paginate_the_issue_timeline():
     {"event": "review_dismissed", "actor": {"login": "jonathan"}},
     {"event": "review_dismissed", "actor": {"login": "jonathan"},
      "dismissed_review": {"review_id": "five"}},
+    {"event": "reviewed"},
+    {"event": "reviewed", "id": "5"},
+    {"event": "reviewed", "id": None},
+    "not an event",
 ])
-def test_a_malformed_dismissal_fails_closed(item):
+def test_a_malformed_timeline_event_fails_closed(item):
     client, _ = gh([item])
     with pytest.raises(GitHubError) as e:
-        client.review_dismissals(7)
+        client.timeline(7)
     assert e.value.op == "timeline"
 
 
 def test_a_dismissal_without_an_actor_has_an_empty_login():
     client, _ = gh([{"event": "review_dismissed", "actor": None,
                      "dismissed_review": {"review_id": 5}}])
-    assert client.review_dismissals(7) == [Dismissal(5, "")]
+    assert client.timeline(7) == [TimelineEvent("dismissed", 5, "")]
+
+
+def test_a_timeline_longer_than_the_page_cap_fails_closed():
+    client, _ = gh(*([[{"event": "labeled"}] * 100] * 30))
+    with pytest.raises(GitHubError):
+        client.timeline(7)
 
 
 def test_post_review_and_dismiss():

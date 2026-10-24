@@ -5,7 +5,8 @@
   3. push / reopen: carry over iff the newest verified gate marker is a pass
      of these exact own changes; else fail
   4. a verified gate block on this head: override (always-on checks only)
-     iff the OWNER dismissed that review; else fail
+     iff the OWNER dismissed that review and the head has not moved since;
+     else fail
   5. a re-run (run attempt > 1) never asks the model: fail
   6. full review: deterministic checks + model passes
 
@@ -154,8 +155,29 @@ def _blocks_on_head(reviews: list[Review], ev: Event, key: bytes) -> list[int]:
 
 
 def _owner_dismissed(gh, ev: Event, owner: str, review_ids: list[int]) -> bool:
-    return any(d.review_id in review_ids and d.actor.casefold() == owner.casefold()
-               for d in gh.review_dismissals(ev.number))
+    """The owner dismissed one of these blocks while the PR sat at this
+    head, as far as the timeline can show it, scanned in order:
+      - a force push or branch restore after a block was posted voids it:
+        the head can only return to a blocked commit by a rewrite, and the
+        later fast-forward back shows up as a `committed` event at the
+        commit's own date, not at push time;
+      - a `committed` event after the dismissal voids the dismissal.
+    A dismissal of a block the timeline never showed being posted is ignored.
+    """
+    posted: set[int] = set()
+    ok = False
+    for e in gh.timeline(ev.number):
+        if e.kind == "reviewed" and e.review_id in review_ids:
+            posted.add(e.review_id)
+        elif (e.kind == "dismissed" and e.review_id in posted
+              and e.actor.casefold() == owner.casefold()):
+            ok = True
+        elif e.kind == "commit":
+            ok = False
+        elif e.kind == "rewrite":
+            posted.clear()
+            ok = False
+    return ok
 
 
 def _always_on(g: Gathered, cfg: Config) -> verdict.Result:

@@ -7,7 +7,7 @@ import _prgate  # noqa: F401
 import pytest
 
 from prgate import core, verdict
-from prgate.github import Dismissal, GitHubError, PullState, Review, TooLarge
+from prgate.github import GitHubError, PullState, Review, TimelineEvent, TooLarge
 from prgate.llm import Finding, PassResult
 
 OWNER = "jonathan"
@@ -33,13 +33,26 @@ index 1111111..2222222 100644
 """
 
 
+def dismissal(review_id, actor):
+    return TimelineEvent("dismissed", review_id, actor)
+
+
+def posted(review_id):
+    return TimelineEvent("reviewed", review_id)
+
+
+COMMIT = TimelineEvent("commit")
+REWRITE = TimelineEvent("rewrite")
+
+
 def shifted(diff, delta=40):
     return diff.replace("@@ -10,3 +10,4 @@", f"@@ -{10 + delta},3 +{10 + delta},4 @@")
 
 
 class FakeGitHub:
     def __init__(self, diff=DIFF, head=HEAD, enabled_by=OWNER, auto_merge=True,
-                 reviews=(), files=None, dismissals=(), base_ref="main", base_oid=BASE_OID):
+                 reviews=(), files=None, dismissals=(), base_ref="main", base_oid=BASE_OID,
+                 timeline=None):
         self.state = PullState(head_sha=head, auto_merge=auto_merge, enabled_by=enabled_by,
                                base_ref=base_ref, base_oid=base_oid)
         self.compared: list[tuple[str, str]] = []
@@ -50,7 +63,9 @@ class FakeGitHub:
         self.dismissed: list[int] = []
         self.refuse_request_changes = False
         self.fetched: list[str] = []
-        self._dismissals = list(dismissals)
+        # Default timeline: every review posted, then the dismissals.
+        self._timeline = (list(timeline) if timeline is not None else
+                          [posted(r.id) for r in reviews] + list(dismissals))
         self.timeline_reads = 0
 
     def pull_state(self, number):
@@ -73,9 +88,9 @@ class FakeGitHub:
     def reviews(self, number):
         return list(self._reviews)
 
-    def review_dismissals(self, number):
+    def timeline(self, number):
         self.timeline_reads += 1
-        return list(self._dismissals)
+        return list(self._timeline)
 
     def post_review(self, number, head, event, body):
         if event == "REQUEST_CHANGES" and self.refuse_request_changes:
@@ -169,7 +184,7 @@ def test_without_a_key_nothing_is_posted_or_trusted(action):
     # No key: no marker could be signed or verified.
     gh = FakeGitHub(reviews=[gate_review("pass", OLD, own_hash_of(DIFF), rid=5),
                              gate_review("block", HEAD, own_hash_of(DIFF), rid=6)],
-                    dismissals=[Dismissal(6, OWNER)])
+                    dismissals=[dismissal(6, OWNER)])
     out, model = run(gh, action=action, marker_key=b"", attempt=2)
     assert out.exit_code == 1 and "anthropic-api-key" in out.message
     assert gh.posted == [] and model.calls == []
@@ -370,7 +385,7 @@ def test_after_an_override_two_base_updates_in_a_row_carry_over():
     h = own_hash_of(DIFF)
     reviews = [gate_review("block", OLD, h, rid=5, state="DISMISSED"),
                gate_review("pass", OLD, h, rid=7)]
-    gh = FakeGitHub(diff=shifted(DIFF), reviews=reviews, dismissals=[Dismissal(5, OWNER)])
+    gh = FakeGitHub(diff=shifted(DIFF), reviews=reviews, dismissals=[dismissal(5, OWNER)])
     out, model = run(gh, action="synchronize")
     assert out.exit_code == 0 and model.calls == []
     [(_, _, carried)] = gh.posted
@@ -458,11 +473,11 @@ def test_an_unverified_bot_request_changes_is_not_a_gate_block(body):
     # Only a verified block guards the head. A forged or edited one gets the
     # owner's fresh review (attempt 1); a re-run never reaches the model.
     gh = FakeGitHub(reviews=[forged("block", HEAD, "0" * 64, body)],
-                    dismissals=[Dismissal(100, OWNER)])
+                    dismissals=[dismissal(100, OWNER)])
     out, model = run(gh)
     assert len(model.calls) == 1 and out.exit_code == 0
     gh2 = FakeGitHub(reviews=[forged("block", HEAD, "0" * 64, body)],
-                     dismissals=[Dismissal(100, OWNER)])
+                     dismissals=[dismissal(100, OWNER)])
     out2, model2 = run(gh2, attempt=2)
     assert out2.exit_code == 1 and model2.calls == [] and gh2.posted == []
 
@@ -527,7 +542,7 @@ def blocked(**kw):
 
 
 def test_owner_dismissal_then_rerun_is_an_override_pass_without_a_model_call():
-    gh = blocked(dismissals=[Dismissal(1, OWNER)])
+    gh = blocked(dismissals=[dismissal(1, OWNER)])
     out, model = run(gh, attempt=2)
     assert out.exit_code == 0 and model.calls == []
     [(ev, _, body)] = gh.posted
@@ -537,20 +552,20 @@ def test_owner_dismissal_then_rerun_is_an_override_pass_without_a_model_call():
 
 
 def test_owner_dismissal_compares_the_login_case_insensitively():
-    out, model = run(blocked(dismissals=[Dismissal(1, "Jonathan")]), attempt=2)
+    out, model = run(blocked(dismissals=[dismissal(1, "Jonathan")]), attempt=2)
     assert out.exit_code == 0 and model.calls == []
 
 
 def test_owner_dismissal_also_overrides_on_an_auto_merge_toggle():
-    out, model = run(blocked(dismissals=[Dismissal(1, OWNER)]), attempt=1)
+    out, model = run(blocked(dismissals=[dismissal(1, OWNER)]), attempt=1)
     assert out.exit_code == 0 and model.calls == []
 
 
 @pytest.mark.parametrize("dismissals", [
     [],
-    [Dismissal(1, BOT)],                 # another workflow, or the gate itself
-    [Dismissal(1, "agent-bot[bot]")],
-    [Dismissal(2, OWNER)],               # some other review
+    [dismissal(1, BOT)],                 # another workflow, or the gate itself
+    [dismissal(1, "agent-bot[bot]")],
+    [dismissal(2, OWNER)],               # some other review
 ])
 @pytest.mark.parametrize("attempt", [1, 2])
 def test_without_the_owners_dismissal_a_blocked_head_stays_blocked(dismissals, attempt):
@@ -558,6 +573,77 @@ def test_without_the_owners_dismissal_a_blocked_head_stays_blocked(dismissals, a
     out, model = run(gh, attempt=attempt)
     assert out.exit_code == 1 and "dismiss its review" in out.message
     assert model.calls == [] and gh.posted == []
+
+
+def override_attempts(gh_factory):
+    """Both ways to ask for an override: a re-run, and an owner toggle."""
+    for attempt in (1, 2):
+        gh = gh_factory()
+        out, model = run(gh, attempt=attempt)
+        yield out, model, gh
+
+
+def test_a_stale_dismissal_is_not_an_override_after_a_force_push_back():
+    # H blocked (1); clean H2 pushed and passed (2); owner dismisses the
+    # stale block; the writer force-pushes back to H.
+    h = own_hash_of(DIFF)
+    reviews = [gate_review("block", HEAD, h, rid=1, state="DISMISSED"),
+               gate_review("pass", OLD, "f" * 64, rid=2)]
+    tl = [posted(1), COMMIT, posted(2), dismissal(1, OWNER), REWRITE]
+    for out, model, gh in override_attempts(lambda: FakeGitHub(reviews=reviews, timeline=tl)):
+        assert out.exit_code == 1 and "dismiss its review" in out.message
+        assert model.calls == [] and gh.posted == []
+
+
+def test_a_stale_dismissal_is_not_an_override_after_a_fast_forward_back():
+    # H blocked (1); force-push back to its parent H2, which passes (2);
+    # owner dismisses the stale block; the writer fast-forwards to H again.
+    # That push is a `committed` event at H's own (earlier) date, so the
+    # rewrite after the block was posted is what must void the dismissal.
+    h = own_hash_of(DIFF)
+    reviews = [gate_review("block", HEAD, h, rid=1, state="DISMISSED"),
+               gate_review("pass", OLD, "f" * 64, rid=2)]
+    tl = [COMMIT, posted(1), REWRITE, posted(2), dismissal(1, OWNER)]
+    for out, model, gh in override_attempts(lambda: FakeGitHub(reviews=reviews, timeline=tl)):
+        assert out.exit_code == 1 and "dismiss its review" in out.message
+        assert model.calls == [] and gh.posted == []
+
+
+def test_a_dismissal_after_the_last_push_is_an_override():
+    tl = [REWRITE, COMMIT, posted(1), dismissal(1, OWNER)]
+    for out, model, _ in override_attempts(lambda: blocked(timeline=tl)):
+        assert out.exit_code == 0 and model.calls == []
+        assert out.message == "passed (owner-override)"
+
+
+def test_a_fresh_block_after_a_rewrite_can_be_overridden():
+    h = own_hash_of(DIFF)
+    reviews = [gate_review("block", HEAD, h, rid=1, state="DISMISSED"),
+               gate_review("block", HEAD, h, rid=5, state="DISMISSED")]
+    tl = [posted(1), dismissal(1, OWNER), REWRITE, posted(5), dismissal(5, OWNER)]
+    out, model = run(FakeGitHub(reviews=reviews, timeline=tl), attempt=2)
+    assert out.exit_code == 0 and model.calls == []
+
+
+def test_a_commit_after_the_dismissal_voids_it_and_carry_over_takes_over():
+    # Override, then "Update branch". The dismissal no longer counts...
+    h = own_hash_of(DIFF)
+    tl = [posted(1), dismissal(1, OWNER), COMMIT]
+    for out, model, gh in override_attempts(lambda: blocked(timeline=tl)):
+        assert out.exit_code == 1 and "dismiss its review" in out.message
+        assert model.calls == [] and gh.posted == []
+    # ...but the base-merge push carries the override pass over.
+    reviews = [gate_review("block", HEAD, h, rid=1, state="DISMISSED"),
+               gate_review("pass", HEAD, h, rid=3)]
+    gh = FakeGitHub(diff=shifted(DIFF), head=NEWER, reviews=reviews,
+                    timeline=[posted(1), dismissal(1, OWNER), posted(3), COMMIT])
+    out, model = run(gh, action="synchronize", head=NEWER)
+    assert out.exit_code == 0 and model.calls == [] and "carried over" in gh.posted[0][2]
+
+
+def test_a_dismissal_whose_block_is_not_on_the_timeline_does_not_count():
+    out, model = run(blocked(timeline=[dismissal(1, OWNER)]), attempt=2)
+    assert out.exit_code == 1 and model.calls == []
 
 
 def test_a_block_posted_as_a_comment_still_blocks_the_head():
@@ -569,7 +655,7 @@ def test_a_block_posted_as_a_comment_still_blocks_the_head():
 def test_a_dismissed_block_of_an_older_head_does_not_override_this_one():
     h = own_hash_of(DIFF)
     gh = FakeGitHub(reviews=[gate_review("block", OLD, h, rid=1, state="DISMISSED")],
-                    dismissals=[Dismissal(1, OWNER)])
+                    dismissals=[dismissal(1, OWNER)])
     out, model = run(gh, attempt=2)
     assert out.exit_code == 1 and "re-run never asks the model" in out.message
     assert model.calls == [] and gh.posted == []
@@ -593,14 +679,14 @@ def test_override_clears_path_and_binary_rules():
         "diff --git a/logo.png b/logo.png\nnew file mode 100644\n"
         "Binary files /dev/null and b/logo.png differ\n")
     gh = blocked(diff=diff, files={"logo.png": b"\x89PNG\r\n\x1a\n"},
-                 dismissals=[Dismissal(1, OWNER)])
+                 dismissals=[dismissal(1, OWNER)])
     out, model = run(gh, attempt=2)
     assert out.exit_code == 0 and model.calls == []
 
 
 def test_override_never_clears_hidden_unicode():
     diff = DIFF.replace("+    c = 4", '+    c = "\ufe01\ufe02"')
-    gh = blocked(diff=diff, dismissals=[Dismissal(1, OWNER)])
+    gh = blocked(diff=diff, dismissals=[dismissal(1, OWNER)])
     out, model = run(gh, attempt=2)
     assert out.exit_code == 1 and model.calls == []
     assert gh.posted[0][0] == "REQUEST_CHANGES" and "hidden-unicode" in gh.posted[0][2]
@@ -609,7 +695,7 @@ def test_override_never_clears_hidden_unicode():
 def test_override_never_clears_lockfile_hosts():
     diff = ("diff --git a/uv.lock b/uv.lock\n--- a/uv.lock\n+++ b/uv.lock\n@@ -1 +1 @@\n"
             '-x\n+url = "https://evil.example/p.whl"\n')
-    gh = blocked(diff=diff, dismissals=[Dismissal(1, OWNER)])
+    gh = blocked(diff=diff, dismissals=[dismissal(1, OWNER)])
     out, _ = run(gh, attempt=2)
     assert out.exit_code == 1 and "lockfile-host" in gh.posted[0][2]
 
@@ -618,7 +704,7 @@ def test_override_never_clears_a_text_file_with_binary_content():
     diff = DIFF + ("diff --git a/src/x.js b/src/x.js\nnew file mode 100644\n"
                    "Binary files /dev/null and b/src/x.js differ\n")
     gh = blocked(diff=diff, files={"src/x.js": b"run();\n// \x00 hidden\n"},
-                 dismissals=[Dismissal(1, OWNER)])
+                 dismissals=[dismissal(1, OWNER)])
     out, model = run(gh, attempt=2)
     assert out.exit_code == 1 and model.calls == []
     assert "text-binary" in gh.posted[0][2]

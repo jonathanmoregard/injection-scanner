@@ -63,9 +63,26 @@ class Review:
 
 
 @dataclass(frozen=True)
-class Dismissal:
-    review_id: int
-    actor: str         # who dismissed it; "" if GitHub omits the actor
+class TimelineEvent:
+    """One PR timeline event the owner-override rule reads:
+      reviewed   a review was submitted (review_id)
+      dismissed  a review was dismissed (review_id, actor; "" if omitted)
+      commit     a `committed` event; GitHub places it by the commit's own
+                 (writer-chosen) date, not by when it was pushed
+      rewrite    the head was force-pushed or the head branch restored
+    """
+    kind: str
+    review_id: int | None = None
+    actor: str = ""
+
+
+_REWRITES = ("head_ref_force_pushed", "head_ref_restored")
+
+
+def _int(v) -> int:
+    if type(v) is not int:
+        raise TypeError
+    return v
 
 
 class GitHub:
@@ -176,10 +193,10 @@ class GitHub:
                 return out
         raise GitHubError("list-reviews")
 
-    def review_dismissals(self, number: int) -> list[Dismissal]:
-        """Every `review_dismissed` event on the PR's timeline, oldest first.
-        The timeline, not the review, records WHO dismissed a review."""
-        out: list[Dismissal] = []
+    def timeline(self, number: int) -> list[TimelineEvent]:
+        """The PR timeline's review, dismissal and head-moving events, in
+        GitHub's order. A relevant event without its fields fails closed."""
+        out: list[TimelineEvent] = []
         for page in range(1, 31):
             items = self._json("timeline", "GET",
                                f"{self._api}/issues/{number}/timeline?per_page=100&page={page}")
@@ -187,13 +204,17 @@ class GitHub:
                 raise GitHubError("timeline")
             try:
                 for it in items:
-                    if it.get("event") != "review_dismissed":
-                        continue
-                    review_id = it["dismissed_review"]["review_id"]
-                    if type(review_id) is not int:
-                        raise TypeError
-                    out.append(Dismissal(review_id=review_id,
-                                         actor=str((it.get("actor") or {}).get("login") or "")))
+                    kind = it["event"]
+                    if kind == "reviewed":
+                        out.append(TimelineEvent("reviewed", _int(it["id"])))
+                    elif kind == "review_dismissed":
+                        out.append(TimelineEvent(
+                            "dismissed", _int(it["dismissed_review"]["review_id"]),
+                            str((it.get("actor") or {}).get("login") or "")))
+                    elif kind == "committed":
+                        out.append(TimelineEvent("commit"))
+                    elif kind in _REWRITES:
+                        out.append(TimelineEvent("rewrite"))
             except (KeyError, TypeError, AttributeError):
                 raise GitHubError("timeline") from None
             if len(items) < 100:
