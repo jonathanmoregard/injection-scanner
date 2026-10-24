@@ -115,26 +115,64 @@ def test_neutralise_keeps_ordinary_text_readable():
 
 # ----- review body ------------------------------------------------------------------
 
-def _body(result, mode="full"):
-    return v.render_body(result, head=HEAD, own_hash=HASH, threshold=25,
-                         model="claude-opus-5-5", effort="high", mode=mode)
+KEY = b"sk-ant-k"
+REPO = "o/r"
+MAC = "c" * 64
 
 
-def test_body_starts_with_a_parseable_marker():
-    r = decide(passes=[ok()])
-    body = _body(r)
-    assert v.parse_marker(body) == ("pass", HEAD, HASH)
+def _body(result, mode="full", key=KEY):
+    return v.render_body(result, key=key, repo=REPO, number=7, head=HEAD, own_hash=HASH,
+                         threshold=25, model="claude-opus-5-5", effort="high", mode=mode)
+
+
+def test_body_starts_with_a_verifiable_marker():
+    body = _body(decide(passes=[ok()]))
+    assert v.verify_marker(body, KEY, repo=REPO, number=7) == ("pass", HEAD, HASH)
 
 
 def test_block_marker():
-    r = decide(passes=[ok(suspicion=99)])
-    assert v.parse_marker(_body(r)) == ("block", HEAD, HASH)
+    body = _body(decide(passes=[ok(suspicion=99)]))
+    assert v.verify_marker(body, KEY, repo=REPO, number=7) == ("block", HEAD, HASH)
+
+
+def test_repo_in_the_mac_is_case_insensitive_like_github():
+    body = _body(decide())
+    assert v.verify_marker(body, KEY, repo="O/R", number=7) == ("pass", HEAD, HASH)
+
+
+def test_marker_does_not_verify_under_another_key_or_pr():
+    body = _body(decide())
+    assert v.verify_marker(body, b"other", repo=REPO, number=7) is None
+    assert v.verify_marker(body, KEY, repo=REPO, number=8) is None
+    assert v.verify_marker(body, KEY, repo="o/other", number=7) is None
+    assert v.verify_marker(body, b"", repo=REPO, number=7) is None
+
+
+def test_without_a_key_the_marker_is_unsigned_and_never_verifies():
+    body = _body(decide(), key=None)
+    assert f"mac={v.UNSIGNED}" in body
+    assert v.parse_marker(body) is None
+    assert v.verify_marker(body, KEY, repo=REPO, number=7) is None
+
+
+def test_body_never_contains_the_key():
+    assert KEY.decode() not in _body(decide(passes=[ok(suspicion=99)]))
+
+
+@pytest.mark.parametrize("field", ["verdict", "repo", "number", "head", "own_hash"])
+def test_every_marker_field_is_in_the_mac(field):
+    base = dict(verdict="pass", repo=REPO, number=7, head=HEAD, own_hash=HASH)
+    changed = dict(base, **{field: {"verdict": "block", "repo": "o/x", "number": 8,
+                                    "head": "e" * 40, "own_hash": "e" * 64}[field]})
+    assert v.marker_mac(KEY, **base) != v.marker_mac(KEY, **changed)
 
 
 @pytest.mark.parametrize("body", [
-    "", "hello", f"x <!-- pr-gate:v1 verdict=pass head={HEAD} hash={HASH} -->",
-    f"<!-- pr-gate:v1 verdict=maybe head={HEAD} hash={HASH} -->",
-    f"<!-- pr-gate:v1 verdict=pass head={HEAD[:-1]} hash={HASH} -->",
+    "", "hello", f"x <!-- pr-gate:v2 verdict=pass head={HEAD} hash={HASH} mac={MAC} -->",
+    f"<!-- pr-gate:v2 verdict=maybe head={HEAD} hash={HASH} mac={MAC} -->",
+    f"<!-- pr-gate:v2 verdict=pass head={HEAD[:-1]} hash={HASH} mac={MAC} -->",
+    f"<!-- pr-gate:v2 verdict=pass head={HEAD} hash={HASH} mac={MAC[:-1]} -->",
+    f"<!-- pr-gate:v1 verdict=pass head={HEAD} hash={HASH} -->",
     None,
 ])
 def test_parse_marker_rejects_anything_else(body):

@@ -59,8 +59,10 @@ it, each with the reason. Design: `docs/superpowers/specs/2026-10-24-pr-gate-des
    gets up to 400 kB of post-change contents; files past the budget are
    listed to the model as omitted. Binaries are fetched up to 25 MB.
 10. **Prior block** = a review by `github-actions[bot]` whose body starts with
-    the gate marker `verdict=block` for this head, in any state (dismissed or
-    COMMENT-fallback included).
+    a VERIFIED gate marker `verdict=block` for this head (item 24), in any
+    state (dismissed or COMMENT-fallback included). An unverifiable block
+    marker does not arm the reroll guard, so a forged one cannot force owner
+    clicks.
 11. **Owner approval** = the owner's latest APPROVED / CHANGES_REQUESTED /
     DISMISSED review on this head commit is APPROVED.
 12. **Carry-over** looks only at the NEWEST gate marker, pass or block: it
@@ -127,8 +129,20 @@ it, each with the reason. Design: `docs/superpowers/specs/2026-10-24-pr-gate-des
     characters, HTML-escaped, `://` and `www.` defanged, `GH-<n>` broken,
     bounded length. Body capped at 60 000 characters.
 24. The review body starts with a machine marker
-    `<!-- pr-gate:v1 verdict=... head=... hash=... -->` used by the reroll
-    guard and carry-over. Only reviews by `github-actions[bot]` are trusted.
+    `<!-- pr-gate:v2 verdict=... head=... hash=... mac=... -->` used by the
+    reroll guard, carry-over and the dismissal of the gate's own blocks.
+    Any workflow in the repo can post as `github-actions[bot]`, so the marker
+    carries an HMAC-SHA256 keyed by the Anthropic API key (only the gate step
+    gets that secret) over the JSON array `["pr-gate-marker", "v2", verdict,
+    repo (casefolded), PR number, head SHA, own-changes hash]`, checked with
+    `hmac.compare_digest`. Only reviews by `github-actions[bot]` whose marker
+    verifies count; anything else is treated as no marker everywhere, and
+    only verified blocks are dismissed. An empty key fails the run as a
+    config error before anything is read or posted. Key rotation invalidates
+    old markers: re-click auto-merge. Dry-run renders `mac=unsigned`, which
+    never parses. v1 markers (unsigned) are ignored. Residual: a workflow
+    with a write token can still copy or edit the gate's own review bodies
+    (same bot identity); see README Limitations.
 
 ## Packaging
 

@@ -67,7 +67,9 @@ retries; the annotation on the check says what failed.
 3. Settings → General: allow auto-merge.
 4. Secret `AI_GATE_ANTHROPIC_KEY`: a dedicated key from its own Anthropic
    Console workspace with a spend limit at or below the monthly API credit.
-   Never the subscription OAuth token.
+   Never the subscription OAuth token. The gate also uses it as the HMAC key
+   that signs its review markers; rotating it invalidates earlier gate
+   verdicts (re-click auto-merge on open PRs).
 5. The agents' GitHub App or token must **not** have the `workflows`
    permission. Otherwise a PR can add a second workflow whose job is also
    named `ai-gate` and reports a fake pass.
@@ -88,6 +90,9 @@ Org repos need their own secret and ruleset.
   (merging the base into the PR) passes on its own as long as the PR's own
   changes are unchanged; a conflict resolution or any extra edit needs the
   re-click. Closing and reopening the PR is treated like a push.
+- **Key rotation:** a new `AI_GATE_ANTHROPIC_KEY` invalidates the gate's
+  earlier verdicts (their markers no longer verify). Open PRs need a
+  re-click of auto-merge.
 - **"enable auto-merge to request the AI gate"** on a new PR is expected:
   that is the gate waiting for you.
 
@@ -141,8 +146,15 @@ their maximum suspicion.
   outside the gate.
 - The fake-check defence rests on no agent credential having the `workflows`
   permission; a host PAT with that scope defeats it.
-- A forged gate review would need a `github-actions[bot]` token, i.e. a
-  workflow, i.e. the same `workflows` permission.
+- Any workflow in the repo can post reviews as `github-actions[bot]`, so the
+  gate signs its review markers with an HMAC keyed by the Anthropic API key,
+  which only the gate step receives. A marker that does not verify counts as
+  no marker. Another workflow with a write token (e.g. CI that builds PR
+  code) therefore cannot mint a pass or a block, but it can still copy or
+  edit the gate's own review bodies (same bot identity): re-posting an
+  older genuine pass of the same changes after a later block would let a
+  base merge carry that pass over again. Keep `pull-requests: write` away
+  from workflows that run PR code.
 - Lockfile hosts outside the allowlist (e.g. a private registry) cannot be
   cleared per repo; that needs a gate change.
 - A single emoji presentation selector straight after an emoji (the usual

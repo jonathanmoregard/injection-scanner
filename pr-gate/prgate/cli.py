@@ -62,7 +62,8 @@ def _actions(env) -> int:
             payload = json.load(fh)
         pr = payload["pull_request"]
         ev = core.Event(action=str(payload["action"]), number=int(pr["number"]),
-                        head_sha=str(pr["head"]["sha"]), base_ref=str(pr["base"]["ref"]))
+                        head_sha=str(pr["head"]["sha"]), base_ref=str(pr["base"]["ref"]),
+                        repo=env.get("GITHUB_REPOSITORY", ""))
     except (KeyError, TypeError, ValueError, OSError):
         return fail("could not read the pull_request_target event")
     try:
@@ -72,6 +73,7 @@ def _actions(env) -> int:
             effort=(env.get("PR_GATE_EFFORT") or "").strip(),
             threshold=int((env.get("PR_GATE_THRESHOLD") or "").strip()),
             exceptions=checks.parse_exceptions(env.get("PR_GATE_EXCEPTIONS", "")),
+            marker_key=(env.get("ANTHROPIC_API_KEY") or "").strip().encode("utf-8"),
         ).validate()
     except ValueError as e:
         # Messages from Config.validate are gate-written; int() errors are not.
@@ -158,7 +160,9 @@ def _dry_run(args, env) -> int:
                     "findings": [{"file": f.file, "category": f.category,
                                   "severity": f.severity, "explanation": f.explanation}
                                  for f in p.findings]} for p in result.passes],
-        "review_body": verdict.render_body(result, head="0" * 40, own_hash=g.own_hash,
+        # Never signed: a dry-run marker must not be trusted by a real gate.
+        "review_body": verdict.render_body(result, key=None, repo="", number=0,
+                                           head="0" * 40, own_hash=g.own_hash,
                                            threshold=cfg.threshold, model=cfg.model,
                                            effort=cfg.effort, mode="full"),
     }

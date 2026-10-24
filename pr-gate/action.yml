@@ -28,7 +28,7 @@ inputs:
     required: false
     default: ""
   anthropic-api-key:
-    description: Anthropic API key from a dedicated, spend-capped Console workspace.
+    description: Anthropic API key from a dedicated, spend-capped Console workspace. Also the HMAC key that signs the gate's review markers.
     required: true
   github-token:
     description: Token for reading the PR and posting the review.

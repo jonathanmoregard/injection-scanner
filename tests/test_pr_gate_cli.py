@@ -70,6 +70,16 @@ def test_dry_run_with_model_uses_the_configured_model(tmp_path, capsys, monkeypa
     assert "finding: obscure (medium)" in out["reasons"]
 
 
+def test_dry_run_markers_are_never_signed(tmp_path, capsys, monkeypatch):
+    monkeypatch.setattr(cli.llm, "run_passes", lambda client, **kw: [])
+    cli.main(["--dry-run", "--diff", write(tmp_path, "d.diff", CLEAN)],
+             env={"ANTHROPIC_API_KEY": "sk-ant-dry-secret"})
+    raw = capsys.readouterr()
+    out = json.loads(raw.out)
+    assert "mac=unsigned" in out["review_body"]
+    assert "sk-ant-dry-secret" not in raw.out + raw.err
+
+
 def test_dry_run_without_key_is_a_setup_error(tmp_path, capsys):
     code = cli.main(["--dry-run", "--diff", write(tmp_path, "d.diff", CLEAN)], env={})
     assert code == 2
@@ -139,10 +149,10 @@ def test_actions_mode_maps_env_to_config_and_event(tmp_path, capsys, monkeypatch
     monkeypatch.setattr(cli.core, "run", fake_run)
     code = cli.main([], env=actions_env(tmp_path))
     assert code == 0
-    assert seen["ev"] == core.Event("auto_merge_enabled", 7, HEAD, "main")
+    assert seen["ev"] == core.Event("auto_merge_enabled", 7, HEAD, "main", "o/r")
     c = seen["cfg"]
-    assert (c.owner, c.model, c.effort, c.threshold, c.exceptions) == (
-        "jonathan", "claude-opus-5-5", "high", 25, [".claude/*"])
+    assert (c.owner, c.model, c.effort, c.threshold, c.exceptions, c.marker_key) == (
+        "jonathan", "claude-opus-5-5", "high", 25, [".claude/*"], b"sk-ant-x")
     assert "::notice::" in capsys.readouterr().out
     assert "passed" in (tmp_path / "summary.md").read_text()
 

@@ -43,6 +43,9 @@ class Config:
     effort: str
     threshold: int
     exceptions: list[str] = field(default_factory=list)
+    # The Anthropic API key, also the HMAC key for review markers. Kept out
+    # of repr so a stray print of the config cannot leak it.
+    marker_key: bytes = field(default=b"", repr=False)
 
     def validate(self) -> "Config":
         if not _LOGIN.match(self.owner or ""):
@@ -62,6 +65,7 @@ class Event:
     number: int
     head_sha: str
     base_ref: str
+    repo: str          # "owner/name", part of every marker MAC
 
 
 @dataclass
@@ -116,17 +120,19 @@ def full_review(g: Gathered, cfg: Config, review_fn: ReviewFn,
     return verdict.decide(hits, scrutiny, passes, cfg.threshold)
 
 
-def _gate_reviews(reviews: list[Review]):
+def _gate_reviews(reviews: list[Review], ev: Event, key: bytes):
+    """Reviews carrying a VERIFIED gate marker. Anything else, including a
+    github-actions[bot] review from another workflow, counts as no marker."""
     for r in reviews:
         if r.login == GATE_LOGIN:
-            m = verdict.parse_marker(r.body)
+            m = verdict.verify_marker(r.body, key, repo=ev.repo, number=ev.number)
             if m:
                 yield r, m
 
 
-def _blocked_before(reviews: list[Review], head: str) -> bool:
-    return any(m[0] == "block" and (m[1] == head or r.commit_id == head)
-               for r, m in _gate_reviews(reviews))
+def _blocked_before(reviews: list[Review], ev: Event, key: bytes) -> bool:
+    return any(m[0] == "block" and (m[1] == ev.head_sha or r.commit_id == ev.head_sha)
+               for r, m in _gate_reviews(reviews, ev, key))
 
 
 def _owner_approved(reviews: list[Review], owner: str, head: str) -> bool:
@@ -136,10 +142,10 @@ def _owner_approved(reviews: list[Review], owner: str, head: str) -> bool:
     return bool(states) and states[-1] == "APPROVED"
 
 
-def _carries_over(reviews: list[Review], own_hash: str) -> bool:
+def _carries_over(reviews: list[Review], ev: Event, key: bytes, own_hash: str) -> bool:
     """The NEWEST gate marker (pass or block) is a pass of these exact own
     changes. An older pass never outlives a later block."""
-    markers = [m for _, m in _gate_reviews(reviews)]
+    markers = [m for _, m in _gate_reviews(reviews, ev, key)]
     return bool(markers) and markers[-1][0] == "pass" and markers[-1][2] == own_hash
 
 
@@ -162,7 +168,8 @@ def _text_contents(gh, ev: Event, files: list[FileChange]) -> tuple[dict[str, st
 
 def _report(gh, ev: Event, cfg: Config, result: verdict.Result, own_hash: str,
             mode: str, reviews: list[Review]) -> Outcome:
-    body = verdict.render_body(result, head=ev.head_sha, own_hash=own_hash,
+    body = verdict.render_body(result, key=cfg.marker_key, repo=ev.repo, number=ev.number,
+                               head=ev.head_sha, own_hash=own_hash,
                                threshold=cfg.threshold, model=cfg.model,
                                effort=cfg.effort, mode=mode)
     if result.block:
@@ -173,7 +180,7 @@ def _report(gh, ev: Event, cfg: Config, result: verdict.Result, own_hash: str,
         return Outcome(1, "blocked: " + "; ".join(result.reasons))
     gh.post_review(ev.number, ev.head_sha, "COMMENT", body)
     undismissed = []
-    for r, m in _gate_reviews(reviews):
+    for r, m in _gate_reviews(reviews, ev, cfg.marker_key):
         if m[0] == "block" and r.state == "CHANGES_REQUESTED":
             try:
                 gh.dismiss_review(ev.number, r.id, "Superseded: the AI gate passed a later run.")
@@ -201,6 +208,9 @@ def _run(ev: Event, cfg: Config, gh, review_fn: ReviewFn) -> Outcome:
         return Outcome(1, "unsupported pull_request_target action; see the caller template")
     if not _SHA.match(ev.head_sha):
         return Outcome(1, "event has no valid head SHA")
+    if not cfg.marker_key:
+        return Outcome(1, "config: anthropic-api-key is empty (it also signs the gate's "
+                          "review markers)")
 
     # Step 1: owner intent and freshness.
     state = gh.pull_state(ev.number)
@@ -217,7 +227,7 @@ def _run(ev: Event, cfg: Config, gh, review_fn: ReviewFn) -> Outcome:
     # A push or a close/reopen while auto-merge stays on is not an owner
     # click: no model roll, only a carry-over of identical own changes.
     if ev.action in ("synchronize", "reopened"):
-        if not _carries_over(reviews, g.own_hash):
+        if not _carries_over(reviews, ev, cfg.marker_key, g.own_hash):
             return Outcome(1, "the PR was pushed to or reopened after auto-merge was "
                               "enabled; disable and re-enable auto-merge to re-request review")
         hits, scrutiny = checks.run_all(g.files, g.binaries, cfg.exceptions, always_on_only=True)
@@ -225,7 +235,7 @@ def _run(ev: Event, cfg: Config, gh, review_fn: ReviewFn) -> Outcome:
         return _report(gh, ev, cfg, result, g.own_hash, "carry-over", reviews)
 
     # Step 2: reroll guard / owner override.
-    if _blocked_before(reviews, ev.head_sha):
+    if _blocked_before(reviews, ev, cfg.marker_key):
         if not _owner_approved(reviews, cfg.owner, ev.head_sha):
             return Outcome(1, f"the gate already blocked {ev.head_sha}; {cfg.owner} must "
                               "approve that commit, then re-run this check")

@@ -7,7 +7,10 @@ no @mentions, no #refs, no links, no code spans, bounded length.
 """
 from __future__ import annotations
 
+import hashlib
+import hmac
 import html
+import json
 import re
 from dataclasses import dataclass, field
 
@@ -23,9 +26,14 @@ SEVERITY_ORDER = {"high": 0, "medium": 1, "low": 2}
 MAX_BODY = 60000
 MAX_FINDINGS = 40
 MAX_HITS = 40
-MARKER = "<!-- pr-gate:v1 verdict={verdict} head={head} hash={hash} -->"
+# Review-body marker, authenticated with an HMAC keyed by the Anthropic API
+# key: any workflow in the repo can post as github-actions[bot], but only the
+# gate step holds that secret. An unsigned marker (dry-run) never verifies.
+MARKER = "<!-- pr-gate:v2 verdict={verdict} head={head} hash={hash} mac={mac} -->"
+UNSIGNED = "unsigned"
 _MARKER_RE = re.compile(
-    r"\A<!-- pr-gate:v1 verdict=(pass|block) head=([0-9a-f]{40}) hash=([0-9a-f]{64}) -->"
+    r"\A<!-- pr-gate:v2 verdict=(pass|block) head=([0-9a-f]{40}) hash=([0-9a-f]{64})"
+    r" mac=([0-9a-f]{64}) -->"
 )
 
 
@@ -85,11 +93,39 @@ def neutralise(text: str, limit: int = 600) -> str:
     return text
 
 
-def parse_marker(body) -> tuple[str, str, str] | None:
+def marker_mac(key: bytes, *, verdict: str, repo: str, number: int, head: str,
+               own_hash: str) -> str:
+    """HMAC-SHA256 over a fixed JSON array: no field can bleed into another."""
+    msg = json.dumps(["pr-gate-marker", "v2", verdict, repo.casefold(), number, head, own_hash],
+                     separators=(",", ":"))
+    return hmac.new(key, msg.encode("utf-8"), hashlib.sha256).hexdigest()
+
+
+def render_marker(key: bytes | None, *, verdict: str, repo: str, number: int, head: str,
+                  own_hash: str) -> str:
+    mac = (marker_mac(key, verdict=verdict, repo=repo, number=number, head=head,
+                      own_hash=own_hash) if key else UNSIGNED)
+    return MARKER.format(verdict=verdict, head=head, hash=own_hash, mac=mac)
+
+
+def parse_marker(body) -> tuple[str, str, str, str] | None:
+    """(verdict, head, own_hash, mac), unverified."""
     if not isinstance(body, str):
         return None
     m = _MARKER_RE.match(body)
-    return (m.group(1), m.group(2), m.group(3)) if m else None
+    return (m.group(1), m.group(2), m.group(3), m.group(4)) if m else None
+
+
+def verify_marker(body, key: bytes | None, *, repo: str, number: int
+                  ) -> tuple[str, str, str] | None:
+    """(verdict, head, own_hash) if the marker's MAC checks out under `key`
+    for this repo and PR; None otherwise (treated as no marker)."""
+    m = parse_marker(body)
+    if not key or m is None:
+        return None
+    expected = marker_mac(key, verdict=m[0], repo=repo, number=number, head=m[1],
+                          own_hash=m[2])
+    return m[:3] if hmac.compare_digest(m[3], expected) else None
 
 
 _MODE_LINE = {
@@ -103,10 +139,12 @@ _MODE_LINE = {
 }
 
 
-def render_body(r: Result, *, head: str, own_hash: str, threshold: int,
-                model: str, effort: str, mode: str) -> str:
+def render_body(r: Result, *, key: bytes | None, repo: str, number: int, head: str,
+                own_hash: str, threshold: int, model: str, effort: str, mode: str) -> str:
+    """`key=None` (dry-run) renders an unsigned marker that never verifies."""
     verdict = "block" if r.block else "pass"
-    out = [MARKER.format(verdict=verdict, head=head, hash=own_hash)]
+    out = [render_marker(key, verdict=verdict, repo=repo, number=number, head=head,
+                         own_hash=own_hash)]
     out.append(f"### AI gate: {'BLOCKED' if r.block else 'passed'}")
     if _MODE_LINE[mode]:
         out.append(_MODE_LINE[mode])
