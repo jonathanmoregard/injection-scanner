@@ -258,7 +258,15 @@ def _report(gh, ev: Event, cfg: Config, result: verdict.Result, own_hash: str,
                 undismissed.append(r.id)
     msg = f"passed ({mode})"
     if undismissed:
-        msg += "; could not dismiss earlier gate reviews, dismiss them by hand"
+        # The pass stands: those blocks guard older commits only, so leaving
+        # them is the restrictive side. Never send the owner to dismiss one:
+        # a dismissal IS the override, and would count if that head returned.
+        retry = ("re-run this check (no model call)" if mode != "full" else
+                 "a re-run of this check would fail; the next auto-merge toggle "
+                 "retries, with a fresh model review")
+        msg += ("; earlier gate reviews could not be dismissed; never dismiss a gate "
+                "review by hand, a dismissal is an override. Check that GitHub Actions "
+                f"may dismiss reviews (setup step 2), then {retry}")
     return Outcome(0, msg)
 
 

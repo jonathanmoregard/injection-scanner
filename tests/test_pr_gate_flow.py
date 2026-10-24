@@ -287,6 +287,47 @@ def test_pass_dismisses_only_the_gates_own_earlier_blocks():
     assert out.exit_code == 0 and gh.dismissed == [1]
 
 
+class NoDismiss(FakeGitHub):
+    def dismiss_review(self, number, review_id, message):
+        raise GitHubError("dismiss-review", 403)
+
+
+def _undismissable(mode):
+    """A pass in `mode` while an earlier gate block (review 1, older head)
+    cannot be dismissed."""
+    old_block = gate_review("block", OLD, "0" * 64, rid=1)
+    h = own_hash_of(DIFF)
+    if mode == "full":
+        return run(NoDismiss(reviews=[old_block]))
+    if mode == "carry-over":
+        return run(NoDismiss(diff=shifted(DIFF), reviews=[old_block,
+                             gate_review("pass", OLD, h, rid=5)]), action="synchronize")
+    head_block = gate_review("block", HEAD, h, rid=2, state="DISMISSED")
+    return run(NoDismiss(reviews=[old_block, head_block], dismissals=[dismissal(2, OWNER)]),
+               attempt=2)
+
+
+@pytest.mark.parametrize("mode", ["full", "carry-over", "owner-override"])
+def test_an_undismissable_earlier_block_never_asks_for_a_manual_dismissal(mode):
+    # Dismissing a gate review IS the override: a hand dismissal of an old
+    # head's block would count if that head ever came back.
+    out, _ = _undismissable(mode)
+    assert out.exit_code == 0 and out.message.startswith(f"passed ({mode})")
+    assert "could not be dismissed" in out.message
+    assert "by hand" not in out.message.replace("never dismiss a gate review by hand", "")
+    assert "never dismiss a gate review by hand" in out.message
+
+
+@pytest.mark.parametrize("mode,retry", [
+    ("full", "a re-run of this check would fail"),
+    ("carry-over", "re-run this check"),
+    ("owner-override", "re-run this check"),
+])
+def test_an_undismissable_earlier_block_says_how_to_retry(mode, retry):
+    out, _ = _undismissable(mode)
+    assert retry in out.message
+
+
 def test_model_still_runs_when_a_deterministic_check_already_blocks():
     # Otherwise an owner override of a path hit would merge unreviewed code.
     diff = DIFF.replace("src/app.py", ".github/workflows/ci.yml")

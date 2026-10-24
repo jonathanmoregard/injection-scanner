@@ -67,6 +67,18 @@ it, each with the reason. Design: `docs/superpowers/specs/2026-10-24-pr-gate-des
    validated owner login, SHAs, bounded HTTP status codes, exception class
    names. No exception message, HTTP body or model text is printed.
 
+7a. **A pass that cannot dismiss the gate's earlier blocks still passes**
+    (exit 0). Those blocks guard older commits only, so leaving them is the
+    restrictive side. The message never tells the owner to dismiss them by
+    hand: dismissing a gate review IS the override, and a hand dismissal of
+    an old head's block would count if the PR ever returned to that commit
+    without a rewrite event. It says the reviews could not be dismissed,
+    warns against dismissing them by hand, points at the dismissal
+    permission (setup step 2), and says how to retry: re-run the check after
+    a carry-over or override pass (no model call); after a full review a
+    re-run would fail (step 5), so the retry is the next auto-merge toggle,
+    which is a fresh model review.
+
 ## Flow details
 
 8. **Model passes run even when a deterministic check already blocks.**

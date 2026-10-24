@@ -97,8 +97,9 @@ the check says what failed.
    check `ai-gate` with source **GitHub Actions**; block force pushes; **no
    bypass actors**. If offered, restrict who can dismiss reviews to the owner
    **and GitHub Actions**: the gate dismisses its own superseded blocks when
-   a later run passes, and without that you would be dismissing them by hand
-   (a dismissal by anyone else never clears a block either way).
+   a later run passes. Without that they stay on the PR; never dismiss them
+   by hand, since dismissing a gate review is the override (a dismissal by
+   anyone but `owner` never clears a block either way).
 3. Settings → General: allow auto-merge.
 4. Secret `AI_GATE_ANTHROPIC_KEY`: a dedicated key from its own Anthropic
    Console workspace with a spend limit at or below the monthly API credit.
