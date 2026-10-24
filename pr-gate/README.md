@@ -25,6 +25,19 @@ the base branch). In order, failing closed at every step:
    branch. A check result lives on the head commit, so a pass on a PR into
    another branch would otherwise count for a later PR of the same commit
    into the default branch.
+   **The merge result is what is reviewed.** Every later step reads the
+   change as GitHub's test merge of the head into the live base
+   (`base...merge`), i.e. what a merge or squash lands, never the
+   merge-base diff (`base...head`): in a criss-cross history (the head
+   merged an earlier PR's tip with `-s ours`) the merge-base diff can show
+   only a benign file while the merge silently reverts that earlier PR.
+   File contents (Monitor B, binaries, lockfiles) are read at the merge
+   commit; reviews and markers still go on the head. GitHub computes the
+   test merge in the background after a push or a base move, so the gate
+   re-reads for up to 30 s until it is the merge of exactly the live base
+   and head, then fails as infra (toggle auto-merge to retry). A PR with
+   merge conflicts fails with "the PR has merge conflicts; resolve them",
+   no model call.
 3. **Pushes or a reopen after auto-merge** (`synchronize`, `reopened`) fail,
    with no model call, unless the gate's newest verdict on this PR is a pass
    of identical own changes (a pure "Update branch" merge from the base, or a
@@ -45,7 +58,7 @@ the base branch). In order, failing closed at every step:
      (npm/yarn registries, crates.io, PyPI, github.com and NixOS release hosts
      for flakes, rubygems). JSON, TOML and YAML lockfiles (`package-lock.json`,
      `pnpm-lock.yaml`, `uv.lock`, `Cargo.lock`, `flake.lock`, `bun.lock`, yarn
-     Berry, ...) are parsed whole, at the head and at the base, and every
+     Berry, ...) are parsed whole, at the merge result and at the base, and every
      string in them is checked, so escapes, block scalars and line folding
      resolve as the package manager resolves them. Only values new relative
      to the base count. For a rename the base is the old path only if that
@@ -125,7 +138,8 @@ the check says what failed.
    a later run passes. Without that they stay on the PR; never dismiss them
    by hand, since dismissing a gate review is the override (a dismissal by
    anyone but `owner` never clears a block either way).
-3. Settings → General: allow auto-merge.
+3. Settings → General: allow auto-merge; turn off "Allow rebase merging"
+   (see Limitations).
 4. Secret `AI_GATE_ANTHROPIC_KEY`: a dedicated key from its own Anthropic
    Console workspace with a spend limit at or below the monthly API credit.
    Never the subscription OAuth token. The gate also uses it as the HMAC key
@@ -176,6 +190,9 @@ Org repos need their own secret and ruleset.
   that is the gate waiting for you.
 - **PRs must target the default branch.** Into any other branch the check
   fails with "the AI gate only reviews PRs into main".
+- **Merge conflicts** fail the check ("the PR has merge conflicts; resolve
+  them"). Resolving them is a push: it carries a pass over only if the
+  PR's own changes come out identical, otherwise re-enable auto-merge.
 
 ## Inputs
 
@@ -191,6 +208,9 @@ Org repos need their own secret and ruleset.
 There is no token input: the gate always uses the workflow's `github.token`
 (`contents: read`, `pull-requests: write`, `issues: read` in the caller), so
 its reviews come from `github-actions[bot]`, the only author it trusts.
+`contents: read` also covers the test merge commit: its parents come with
+the PR state in one GraphQL query, and its diff and file contents are read
+with the same compare and contents calls as any other commit.
 `issues: read` is for the timeline endpoint that records who dismissed a
 review; without it the owner-override path cannot see dismissals, and the
 gate fails with a config error saying so (retrying will not help).
@@ -213,15 +233,20 @@ Runs the same checks and model passes locally on a diff file and prints the
 verdict JSON (including the monitors' `analysis`). No GitHub calls.
 
 ```bash
-gh pr diff 123 > /tmp/pr123.diff        # or: git diff main...HEAD
+git fetch origin pull/123/merge         # GitHub's test merge of PR 123
+git diff FETCH_HEAD^1...FETCH_HEAD > /tmp/pr123.diff   # base...merge: what would land
 python pr-gate/gate.py --dry-run --diff /tmp/pr123.diff --no-llm       # deterministic only
 ANTHROPIC_API_KEY=... python pr-gate/gate.py --dry-run --diff /tmp/pr123.diff \
     [--files-dir CHECKOUT] [--model claude-fable-5-1] [--effort high] [--threshold 25] \
     [--exceptions-file globs.txt]
 ```
 
-`--files-dir` points at a checkout of the PR head (post-change contents for
-Monitor B and binary magic bytes). Exit 0 pass, 1 block, 2 setup error. Run it
+Dry-run reviews the diff it is given as-is and does not compute a merge
+result: feed it the diff that would land, as above (`gh pr diff` and
+`git diff main...HEAD` are merge-base diffs, which can differ in a
+criss-cross history). `--files-dir` points at a checkout of that merge
+(post-change contents for Monitor B and binary magic bytes). Exit 0 pass,
+1 block, 2 setup error. Run it
 over 20-50 past merged PRs per repo type and set the threshold just above
 their maximum suspicion.
 
@@ -248,6 +273,11 @@ their maximum suspicion.
   check fails with "the diff is too large for the gate to read; split the PR",
   and a re-run does not help. Split the PR, or merge it with an admin bypass
   outside the gate.
+- The gate reviews the tree a merge or squash lands (GitHub's test merge).
+  Rebase-merge replays the head's commits one by one onto the base, which
+  can land a different tree than the test merge in a criss-cross history.
+  Disable "Allow rebase merging" in repos using the gate (Settings →
+  General); if left on, that difference is a residual gap.
 - The fake-check defence rests on no agent credential having the `workflows`
   permission; a host PAT with that scope defeats it.
 - Any workflow in the repo can post reviews as `github-actions[bot]`, so the

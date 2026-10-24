@@ -24,7 +24,7 @@ it, each with the reason. Design: `docs/superpowers/specs/2026-10-24-pr-gate-des
    byte-identical surroundings. Follow-up idea: hash each touched region
    with wider context (e.g. the enclosing function, or N lines until the
    context is unique in the file) instead of the fixed three lines.
-2. **Binary content is in the hash** (SHA-256 of the head blob, fetched
+2. **Binary content is in the hash** (SHA-256 of the blob at the test merge, fetched
    anyway for the magic-byte check). The diff shows only "Binary files
    differ", so without it a swapped binary would ride a carried-over pass.
    File modes and renames are in the hash too. The hash reads the diff
@@ -53,10 +53,11 @@ it, each with the reason. Design: `docs/superpowers/specs/2026-10-24-pr-gate-des
 
 6. Three classes, deliberately different:
    - *Procedural* (no auto-merge, wrong enabler, stale head, base not the
-     default branch, push after auto-merge, a block on this head the owner
-     has not dismissed, a re-run, unreadable or over-5 MB diff): check
-     fails, **no review**.
-   - *Infra* (GitHub or Anthropic API errors, missing key): check fails, no
+     default branch, merge conflicts, push after auto-merge, a block on
+     this head the owner has not dismissed, a re-run, unreadable or over-5
+     MB diff): check fails, **no review**.
+   - *Infra* (GitHub or Anthropic API errors, missing key, a test merge of
+     the live base and head not computed within 30 s): check fails, no
      review. A transport error is not a verdict. The retry is an auto-merge
      toggle, since a re-run never asks the model. A model API 4xx other than
      408/409/429 (bad model name or key, prompt too long) is reported as a
@@ -171,15 +172,49 @@ it, each with the reason. Design: `docs/superpowers/specs/2026-10-24-pr-gate-des
     are by `github-actions[bot]`, the only login it trusts (`GATE_LOGIN`).
     A custom token would post reviews the next run ignores. Caller
     permissions: `contents: read`, `pull-requests: write`, `issues: read`
-    (the timeline is an issues endpoint).
+    (the timeline is an issues endpoint). The test merge (item 17a) needs
+    nothing new: its oid and parents come with the GraphQL pull state, its
+    diff and contents through the same compare and contents calls.
 16. **Always-on checks run on carry-over and override runs**: exactly the
     non-overridable hits (hidden Unicode, lockfile host, text-binary).
-17. The diff is `compare/<baseRefOid>...<head SHA>`: the base branch's
-    current tip (what "Update branch" merged) as a commit oid read live
-    from GraphQL and validated as 40-hex (else fail closed), the head pinned
-    by SHA. Never a branch name: a writer can push a tag named like the base
-    branch, and a name could resolve to it, making the reviewed diff
-    attacker-chosen.
+17. The diff is `compare/<baseRefOid>...<test merge SHA>`: the base
+    branch's current tip as a commit oid read live from GraphQL and
+    validated as 40-hex (else fail closed), against GitHub's test merge of
+    the head into it (item 17a). Never a branch name: a writer can push a
+    tag named like the base branch, and a name could resolve to it, making
+    the reviewed diff attacker-chosen.
+17a. **The merge result, not the merge-base diff** (replaces
+    `compare/<baseRefOid>...<head SHA>`). A three-dot compare against the
+    head diffs from the merge base, but with a criss-cross history git
+    merges from a virtual merge base, so what lands can differ. Reproduced:
+    a head that merged an already-landed PR's tip with `-s ours` (keeping
+    the file that PR fixed at its old content) plus a benign commit shows
+    only the benign file in `base...head`, while the real merge also
+    reverts the fix. Standard design: review the would-be merge result.
+    The GraphQL pull state now also reads `mergeable` and
+    `potentialMergeCommit { oid parents }` in the same query as head and
+    base (the REST `merge_commit_sha`, with its parents, in one consistent
+    snapshot and one call instead of two; same commit, checked on a live
+    PR). The run proceeds only when `mergeable` is `MERGEABLE` and the
+    merge's parents are exactly `[baseRefOid, head SHA]` as read in that
+    same snapshot; otherwise it re-reads after 2, 4, 8 and 16 s (GitHub
+    computes the test merge in the background after a push or base move)
+    and then fails as infra. `CONFLICTING` fails at once, procedurally:
+    "the PR has merge conflicts; resolve them". Any other `mergeable`
+    value reads as `UNKNOWN`; a malformed merge oid or parent fails the
+    pull-state read closed. Steps 1-2 run on every re-read, so a stale
+    head or a missing auto-merge never waits. Since the base is a parent
+    of the merge, `base...merge` is the merge's own two-dot diff: exactly
+    the tree change that lands. Every CONTENT read (binaries, lockfiles at
+    the PR side, Monitor B contents) uses the merge SHA; everything about
+    identity (the review's `commit_id`, markers, blocks on this head, the
+    stale check) stays on the head SHA. The own-changes hash is over this
+    diff; after "Update branch" the head already contains the base, so the
+    merge's tree is the head's and the hash matches a pass of the same own
+    changes as before. Rebase-merge replays commits and can land a
+    different tree; the README says to turn it off (a residual if left on).
+    Dry-run takes a diff file and skips this step; the README shows how to
+    produce the merge diff for it.
     Paths follow git's format: the TAB git appends to a `---`/`+++` path
     containing a space is dropped, and C-style quoted paths
     (`"b/caf\303\251.txt"`) are unquoted. A path that starts with `"` but is

@@ -6,6 +6,8 @@ annotation, exits 0 (pass) or 1 (block / failure).
 
 Dry-run mode (--dry-run): diff file in, verdict JSON out, no GitHub calls.
 For calibration against past PRs. Exit 0 pass, 1 block, 2 usage/setup error.
+It reviews the diff it is given as-is and skips the merge-result step: give
+it the diff that would land (`git diff <base>...<merge commit>`).
 """
 from __future__ import annotations
 
