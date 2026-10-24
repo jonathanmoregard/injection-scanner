@@ -331,6 +331,162 @@ def test_lockfile_lines_without_a_url_splitting_continuation_are_not_hits(path, 
     assert checks.lockfile_hosts([fc(path, [line])]) == []
 
 
+_SPLITS = [  # (first part, rest): the consumer strips the newline between them
+    ("https://files.pythonhosted.org", ".evil.example/a.whl"),
+    ("https://", "evil.example/a.whl"),
+    ("https:/", "/evil.example/a.whl"),
+    ("https", "://evil.example/a.whl"),
+]
+
+
+@pytest.mark.parametrize("head,rest", _SPLITS)
+def test_a_url_split_inside_a_toml_multiline_string_is_a_hit(head, rest):
+    # uv.lock: url = '''<head>\n<rest>''' is the URL head+rest to uv.
+    lines = ['[[package]]', 'name = "a"', f"sdist = {{ url = '''{head}", f"{rest}''' }}"]
+    hits = checks.lockfile_hosts([fc("uv.lock", lines)])
+    assert [(h.rule, h.overridable) for h in hits] == [("lockfile-host", False)]
+    assert "line 1:" in hits[0].detail and "split across lines" in hits[0].detail
+
+
+@pytest.mark.parametrize("head,rest", _SPLITS)
+def test_a_url_split_inside_a_yaml_block_scalar_is_a_hit(head, rest):
+    # YAML strips the block's indentation and keeps the newline.
+    head = head.replace("files.pythonhosted.org", "registry.npmjs.org")
+    lines = ["  a@1.0.0:", "    resolution:", "      tarball: |-",
+             f"        {head}", f"        {rest.replace('.whl', '.tgz')}"]
+    hits = checks.lockfile_hosts([fc("pnpm-lock.yaml", lines)])
+    assert [(h.rule, h.overridable) for h in hits] == [("lockfile-host", False)]
+    assert "line 1:" in hits[0].detail and "split across lines" in hits[0].detail
+
+
+def test_a_split_url_is_reported_at_the_first_line_of_its_run():
+    f = FileChange(path="uv.lock", added=[(3, 'name = "a"'), (9, "url = '''https://"),
+                                                  (10, "evil.example/a.whl'''")])
+    [hit] = checks.lockfile_hosts([f])
+    assert hit.detail.startswith("line 9:")
+
+
+def test_lines_of_different_runs_are_not_joined():
+    f = FileChange(path="uv.lock", added=[(9, "url = '''https://"),
+                                                  (11, "evil.example/a.whl'''")])
+    assert checks.lockfile_hosts([f]) == []
+
+
+def test_a_url_already_caught_on_its_line_is_not_reported_twice():
+    [hit] = checks.lockfile_hosts([fc("uv.lock", ['url = "https://evil.example/a.whl"', "x = 1"])])
+    assert "split" not in hit.detail
+
+
+@pytest.mark.parametrize("path,lines", [
+    ("package-lock.json", [
+        '    "node_modules/ws": {',
+        '      "version": "8.17.0",',
+        '      "resolved": "https://registry.npmjs.org/ws/-/ws-8.17.0.tgz",',
+        '      "integrity": "sha512-uJq6108EgZMAl20KagGkzCKfMEjxmKvZHG7Tlq0Z6nOky7YF7aq4mOx6xK8TJ/i1LeK4Qus7INktacctDgY8Ow==",',
+        '      "license": "MIT",',
+        '      "engines": {',
+        '        "node": ">=10.0.0"',
+        "      },",
+        '      "peerDependencies": {',
+        '        "bufferutil": "^4.0.1"',
+        "      }",
+        "    },",
+    ]),
+    ("uv.lock", [
+        "[[package]]",
+        'name = "anyio"',
+        'version = "4.4.0"',
+        'source = { registry = "https://pypi.org/simple" }',
+        "dependencies = [",
+        '    { name = "idna" },',
+        '    { name = "sniffio" },',
+        "]",
+        'sdist = { url = "https://files.pythonhosted.org/packages/e6/e3/anyio-4.4.0.tar.gz", '
+        'hash = "sha256:5aadc6a1bbb7cdb0bede386cac5e2940f5e2ff3aa20277e991cf028e0585ce94", '
+        "size = 173126 }",
+        "wheels = [",
+        '    { url = "https://files.pythonhosted.org/packages/7b/a2/anyio-4.4.0-py3-none-any.whl", '
+        'hash = "sha256:c1b2d8f46a8a812513012e1107cb0e68c17159a7a594208005a57dc776e1bdc7", '
+        "size = 86780 },",
+        "]",
+        "",
+        "[package.optional-dependencies]",
+        "trio = [",
+        '    { name = "trio" },',
+        "]",
+    ]),
+    ("pnpm-lock.yaml", [
+        "lockfileVersion: '9.0'",
+        "",
+        "settings:",
+        "  autoInstallPeers: true",
+        "  excludeLinksFromLockfile: false",
+        "",
+        "importers:",
+        "",
+        "  .:",
+        "    dependencies:",
+        "      ws:",
+        "        specifier: ^8.17.0",
+        "        version: 8.17.0(bufferutil@4.0.8)",
+        "      git:",
+        "        specifier: ^0.1.5",
+        "        version: 0.1.5",
+        "",
+        "packages:",
+        "",
+        "  ws@8.17.0:",
+        "    resolution: {integrity: sha512-uJq6108EgZMAl20KagGkzCKfMEjxmKvZHG7Tlq0Z6nOky7YF7aq4mOx6xK8TJ==}",
+        "    engines: {node: '>=10.0.0'}",
+        "    peerDependencies:",
+        "      bufferutil: ^4.0.1",
+        "    peerDependenciesMeta:",
+        "      bufferutil:",
+        "        optional: true",
+        "",
+        "  tar-pkg@1.0.0:",
+        "    resolution: {tarball: https://registry.npmjs.org/tar-pkg/-/tar-pkg-1.0.0.tgz}",
+        "    version: 1.0.0",
+        "",
+        "snapshots:",
+        "",
+        "  ws@8.17.0(bufferutil@4.0.8):",
+        "    optionalDependencies:",
+        "      bufferutil: 4.0.8",
+    ]),
+    ("Cargo.lock", [
+        "[[package]]",
+        'name = "anyhow"',
+        'version = "1.0.86"',
+        'source = "registry+https://github.com/rust-lang/crates.io-index"',
+        'checksum = "b3d1d046238990b9cf5bcde22a3fb3584ee5cf65fb2765f454ed428c7a0de3da"',
+        "",
+        "[[package]]",
+        'name = "dep"',
+        'version = "0.1.0"',
+        'source = "git+https://github.com/org/dep?branch=main#0123456789abcdef"',
+        "dependencies = [",
+        ' "anyhow",',
+        ' "serde",',
+        "]",
+    ]),
+    ("Gemfile.lock", [
+        "GEM",
+        "  remote: https://rubygems.org/",
+        "  specs:",
+        "    rake (13.2.1)",
+    ]),
+])
+def test_ordinary_multiline_lockfile_entries_are_not_hits(path, lines):
+    assert checks.lockfile_hosts([fc(path, lines)]) == []
+
+
+def test_requirements_lines_are_not_joined():
+    # pip has no multi-line strings: "https://pypi.org" + "requests" is two lines.
+    lines = ["--index-url https://pypi.org", "requests==2.32.3"]
+    assert checks.lockfile_hosts([fc("requirements.txt", lines)]) == []
+
+
 def test_non_lockfiles_are_not_host_checked():
     assert checks.lockfile_hosts([fc("README.md", ["https://evil.example/"])]) == []
 

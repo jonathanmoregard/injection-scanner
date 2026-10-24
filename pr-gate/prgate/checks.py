@@ -286,6 +286,26 @@ def _continues(line: str, pip: bool) -> bool:
     return n > 0 and prev != "" and not prev.isspace()
 
 
+def _bad_urls(text: str, allowed: frozenset[str], flake: bool) -> list[str]:
+    bad = []
+    for scheme, netloc in _urls(text):
+        host = _host(netloc)
+        if scheme.lower() not in _OK_SCHEMES or host not in allowed or _odd_userinfo(scheme, netloc):
+            bad.append(f"{scheme.lower()}://{host}")
+    if flake:
+        for kind in _FLAKE_TYPE.findall(text):
+            if kind not in _FLAKE_TYPES_OK:
+                bad.append(f"flake input type {kind}")
+        for host in _FLAKE_HOST.findall(text):
+            if host.lower() not in allowed:
+                bad.append(f"flake host {host}")
+    return bad
+
+
+def _indent(text: str) -> int:
+    return len(text) - len(text.lstrip(" "))
+
+
 def lockfile_hosts(files: list[FileChange]) -> list[Hit]:
     hits = []
     for f in files:
@@ -294,6 +314,7 @@ def lockfile_hosts(files: list[FileChange]) -> list[Hit]:
             continue
         flake = PurePosixPath(f.path).name == "flake.lock"
         pip = bool(_REQUIREMENTS.match(PurePosixPath(f.path).name.casefold()))
+        runs: list[list[tuple[int, str, list[str]]]] = []  # consecutive added lines
         for line_no, original in f.added:
             text, undecoded = _decode_escapes(original)
             bad = []
@@ -305,20 +326,37 @@ def lockfile_hosts(files: list[FileChange]) -> list[Hit]:
             # stripped anywhere and a backslash is a path separator, so
             # "https://evil\@registry.npmjs.org" goes to evil.
             text = re.sub(r"[\t\n\r]", "", text).replace("\\", "/")
-            for scheme, netloc in _urls(text):
-                host = _host(netloc)
-                if scheme.lower() not in _OK_SCHEMES or host not in allowed or _odd_userinfo(scheme, netloc):
-                    bad.append(f"{scheme.lower()}://{host}")
-            if flake:
-                for kind in _FLAKE_TYPE.findall(text):
-                    if kind not in _FLAKE_TYPES_OK:
-                        bad.append(f"flake input type {kind}")
-                for host in _FLAKE_HOST.findall(text):
-                    if host.lower() not in allowed:
-                        bad.append(f"flake host {host}")
+            urls = _bad_urls(text, allowed, flake)
+            bad += urls
             if bad:
                 hits.append(Hit("lockfile-host", f.path,
                                 f"line {line_no}: not allowlisted: {', '.join(bad[:4])}", False))
+            if runs and runs[-1][-1][0] == line_no - 1:
+                runs[-1].append((line_no, text, urls))
+            else:
+                runs.append([(line_no, text, urls)])
+        if pip:  # pip reads one line at a time; a continuation is caught above
+            continue
+        # A TOML multi-line string or a YAML block scalar keeps a literal
+        # newline inside a URL, and WHATWG/rust-url strip it: "https://pypi.org"
+        # + ".evil.x/a.whl" is pypi.org.evil.x to the package manager. Join
+        # each run of added lines with no separator and check again. YAML
+        # also strips a block's indentation, so a line indented like the one
+        # before it is joined without that indentation.
+        for run in runs:
+            joined, prev = "", None
+            for _, text, _ in run:
+                if prev is not None and _indent(text) == _indent(prev):
+                    joined += text.lstrip(" ")
+                else:
+                    joined += text
+                prev = text
+            seen = {b for _, _, urls in run for b in urls}
+            bad = [b for b in dict.fromkeys(_bad_urls(joined, allowed, flake)) if b not in seen]
+            if bad:
+                hits.append(Hit("lockfile-host", f.path,
+                                f"line {run[0][0]}: URL split across lines, not allowlisted: "
+                                f"{', '.join(bad[:4])}", False))
     return hits
 
 

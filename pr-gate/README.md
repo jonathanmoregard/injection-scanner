@@ -45,7 +45,10 @@ the base branch). In order, failing closed at every step:
      added lockfile line ending in a backslash continuation that could
      glue the next line onto a URL is a hit too (an odd trailing backslash
      run; in `requirements*.txt` any run not preceded by whitespace, since
-     pip joins them all).
+     pip joins them all). So is a URL split across consecutive added lines
+     inside a TOML multi-line string or a YAML block scalar
+     (`'''https://pypi.org` + `.evil.x/a.whl'''`): package managers strip
+     that newline.
      **Never overridable.**
    - a source/text file (`.js`, `.py`, `.lock`, `.md`, ...) that git treats
      as binary, e.g. because of a NUL byte, whatever its first bytes look
@@ -211,6 +214,10 @@ their maximum suspicion.
   strong as the custody of that identity.
 - A block posted as a COMMENT (GitHub refused REQUEST_CHANGES) cannot be
   dismissed, so it cannot be overridden: push a fix and re-enable auto-merge.
+- A lockfile URL split across lines is caught only when every piece is an
+  added line in one consecutive run. A split whose pieces sit on both sides
+  of an unchanged context line is not joined (the base file must already
+  hold the other piece).
 - Lockfile hosts outside the allowlist (e.g. a private registry) cannot be
   cleared per repo; that needs a gate change. Local `file:../pkg`
   references are not host-checked (the referenced path is in the diff);

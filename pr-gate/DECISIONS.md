@@ -199,9 +199,30 @@ it, each with the reason. Design: `docs/superpowers/specs/2026-10-24-pr-gate-des
     In `requirements*.txt` pip joins on any trailing run, so parity does not
     count there; instead a run preceded by whitespace is fine, which is how
     pip-compile writes its `pkg==1.0 \` / `--hash=... \` lines and which
-    cannot glue a URL together. Joining lines before checking was the
-    alternative; a per-line rule is simpler and lockfiles have no
-    legitimate need for a URL-splitting continuation.
+    cannot glue a URL together. For continuations a per-line rule is
+    simpler than joining, and lockfiles have no legitimate need for one.
+22a. **URLs split by a literal newline.** A TOML multi-line string
+    (`'''...'''`, `"""..."""`) or a YAML block scalar (`|`) keeps a raw
+    newline inside a URL, and WHATWG/rust-url strip it, so
+    `'''https://files.pythonhosted.org` + `.evil.x/a.whl'''` is host
+    `files.pythonhosted.org.evil.x` to uv (likewise `https://` + `evil.x`,
+    `https:/` + `/evil.x`, `https` + `://evil.x`). Each run of consecutive
+    added lines (consecutive post-image line numbers) is therefore also
+    joined with no separator, each line decoded and normalised as above,
+    and the URL/host/userinfo and flake checks run again over the joined
+    text. A finding no single line produced is a non-overridable hit "URL
+    split across lines" at the run's first line; findings a single line
+    already produced are not repeated. YAML strips a block scalar's
+    indentation, so a line indented exactly like the line before it is
+    joined without that indentation. A line at a different indentation (a
+    header like `tarball: |-` and its content; a key and its nested
+    mapping, such as pnpm's `ws:` + `  specifier: ...`) keeps its leading
+    spaces, which end any authority. `requirements*.txt` is not joined: pip
+    reads one line at a time, and its only joiner, the continuation, is
+    caught above. **Residual:** a split whose pieces sit on both sides of
+    an unchanged context line is not joined. It needs the base file to
+    hold the other piece; catching it would mean fetching and parsing
+    whole lockfiles.
 23. **Binary magic** table covers common images, fonts, archives, PDF, and
     executables (ELF, PE, Mach-O, wasm, `#!` scripts); executables are
     labelled. Every binary blocks either way (design option (a)). A binary
