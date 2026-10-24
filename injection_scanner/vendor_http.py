@@ -34,6 +34,7 @@ import json
 import time
 import urllib.error
 import urllib.request
+from collections.abc import Callable
 from dataclasses import dataclass
 
 from injection_scanner.http_status import bounded_status, status_suffix
@@ -166,6 +167,13 @@ def _object_without_duplicate_keys(pairs: list[tuple[str, object]]) -> dict:
     return result
 
 
+def strict_json_loads(text: str) -> object:
+    """`json.loads`, raising `DuplicateJSONKey` for a repeated key at any
+    depth. Untrusted JSON (a response, a credential file) is read through
+    this, so a second value cannot shadow the one a check looked at."""
+    return json.loads(text, object_pairs_hook=_object_without_duplicate_keys)
+
+
 def _post(
     url: str, body: bytes, headers: dict, *, timeout: float, max_bytes: int
 ) -> object:
@@ -187,9 +195,23 @@ def _post(
         raw = resp.read(max_bytes + 1)
     if len(raw) > max_bytes:
         raise ResponseTooLarge
-    return json.loads(
-        raw.decode("utf-8"),
-        object_pairs_hook=_object_without_duplicate_keys,
+    return strict_json_loads(raw.decode("utf-8"))
+
+
+def send(vendor: str, url: str, body: bytes, headers: dict) -> object:
+    """One UNPACED `_post` with `vendor`'s timeout and response cap.
+
+    For an auxiliary request on the vendor's behalf (Model Armor's OAuth
+    token exchange) that must take the same hardened path but is not a
+    classification and spends no pacing token. Raises like `_post`; the
+    caller builds its own closed reason.
+    """
+    return _post(
+        url,
+        body,
+        headers,
+        timeout=timeout_s(vendor),
+        max_bytes=max_response_bytes(vendor),
     )
 
 
@@ -258,6 +280,7 @@ def paced_post(
     headers: dict,
     *,
     max_wait_s: float | None,
+    before_send: Callable[[], VendorResult | None] | None = None,
 ) -> Reply:
     """One paced POST for `vendor`. Never raises; fails CLOSED.
 
@@ -286,6 +309,11 @@ def paced_post(
 
     `max_wait_s=None` means `INJECTION_SCANNER_<VENDOR>_MAX_WAIT_S`
     (default 0: refuse immediately).
+
+    `before_send`, if given, runs once the limiter has admitted the call and
+    before the POST; a `VendorResult` it returns is the reply and nothing is
+    sent. It is where a per-call allowance (Model Armor's monthly budget) is
+    charged, so a call the limiter refuses never spends it.
     """
     started_at = 0.0
     try:
@@ -302,15 +330,13 @@ def paced_post(
         return Reply(failure=unavailable(vendor, "service-unavailable"))
     if decision is not Decision.ALLOWED:
         return Reply(failure=unavailable(vendor, "limiter-error"))
+    if before_send is not None:
+        refusal = before_send()
+        if refusal is not None:
+            return Reply(failure=refusal)
 
     try:
-        data = _post(
-            url,
-            body,
-            headers,
-            timeout=timeout_s(vendor),
-            max_bytes=max_response_bytes(vendor),
-        )
+        data = send(vendor, url, body, headers)
     except DuplicateJSONKey:
         return Reply(failure=unavailable(vendor, "bad-response"))
     except Exception as e:  # noqa: BLE001 — any failure fails CLOSED

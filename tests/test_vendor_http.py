@@ -12,6 +12,8 @@ from __future__ import annotations
 
 from urllib.error import HTTPError, URLError
 
+import pytest
+
 from injection_scanner import vendor_http
 from injection_scanner.vendor_http import VendorResult
 
@@ -116,3 +118,75 @@ def test_duplicate_json_keys_are_a_fixed_bad_response(monkeypatch):
         ok=False, reason="model_armor_unavailable:bad-response"
     )
 
+
+
+def test_before_send_runs_after_the_limiter_admits_and_can_stop_the_post(monkeypatch):
+    """A per-call gate (Model Armor's monthly budget) must be charged only
+    for a call the limiter actually lets out — a throttled call must not
+    spend it — and a refusal there must keep the request off the network."""
+    calls = _post_returning(monkeypatch, {"ok": True})
+    refusal = VendorResult(ok=False, reason="model_armor_unavailable:throttled")
+    gate_calls: list[str] = []
+
+    def gate():
+        gate_calls.append("gate")
+        return refusal
+
+    reply = vendor_http.paced_post(
+        "model_armor", "https://vendor.invalid/", b"{}", {},
+        max_wait_s=0.0, before_send=gate,
+    )
+
+    assert reply.failure == refusal
+    assert gate_calls == ["gate"]
+    assert calls == []
+
+
+def test_before_send_returning_none_lets_the_post_through(monkeypatch):
+    calls = _post_returning(monkeypatch, {"ok": True})
+    reply = vendor_http.paced_post(
+        "model_armor", "https://vendor.invalid/", b"{}", {},
+        max_wait_s=0.0, before_send=lambda: None,
+    )
+    assert reply.data == {"ok": True}
+    assert len(calls) == 1
+
+
+def test_before_send_is_not_charged_when_the_limiter_refuses(monkeypatch, tmp_path):
+    blocked = tmp_path / "blocked"
+    blocked.write_text("not a directory", encoding="utf-8")
+    monkeypatch.setenv("INJECTION_SCANNER_CACHE_DIR", str(blocked))
+    _post_returning(monkeypatch, {"ok": True})
+    gate_calls: list[str] = []
+
+    reply = vendor_http.paced_post(
+        "model_armor", "https://vendor.invalid/", b"{}", {},
+        max_wait_s=0.0, before_send=lambda: gate_calls.append("gate"),
+    )
+
+    assert reply.failure.reason == "model_armor_unavailable:limiter-error"
+    assert gate_calls == []
+
+
+def test_send_is_the_unpaced_post_with_the_vendors_own_inputs(monkeypatch):
+    """For an auxiliary request (an OAuth token exchange) that must take the
+    same hardened path but not spend a pacing token."""
+    monkeypatch.setenv("INJECTION_SCANNER_MODEL_ARMOR_TIMEOUT", "9")
+    calls = _post_returning(monkeypatch, {"access_token": "x"})
+
+    assert vendor_http.send(
+        "model_armor", "https://vendor.invalid/token", b"a=b", {}
+    ) == {"access_token": "x"}
+    assert calls == [
+        {
+            "url": "https://vendor.invalid/token",
+            "timeout": 9.0,
+            "max_bytes": vendor_http.DEFAULT_MAX_RESPONSE_BYTES,
+        }
+    ]
+
+
+def test_strict_json_loads_rejects_duplicate_keys_at_any_depth():
+    assert vendor_http.strict_json_loads('{"a": {"b": 1}}') == {"a": {"b": 1}}
+    with pytest.raises(vendor_http.DuplicateJSONKey):
+        vendor_http.strict_json_loads('{"a": {"b": 1, "b": 2}}')
