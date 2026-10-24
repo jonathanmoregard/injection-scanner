@@ -30,6 +30,7 @@ from __future__ import annotations
 
 import asyncio
 import copy
+import importlib
 import json
 import os
 import secrets
@@ -422,13 +423,12 @@ def provider_unready(provider: str, load: Callable[[], str | None]) -> str | Non
     `_call_*` adapters below and judge's `_ask_*`, which keep their own
     inline checks so the key they send is the one they just resolved.
     """
+    if provider not in ("anthropic", "openai"):
+        return "unknown-provider"
     try:
-        if provider == "anthropic":
-            import anthropic  # type: ignore  # noqa: F401
-        elif provider == "openai":
-            from openai import OpenAI  # type: ignore  # noqa: F401
-        else:
-            return "unknown-provider"
+        # A real import, not `find_spec`: a present-but-broken SDK must read
+        # as lib-missing here exactly as it would on the call path.
+        importlib.import_module(provider)
     except ImportError:
         return f"{provider}-lib-missing"
     try:
