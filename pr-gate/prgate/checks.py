@@ -555,6 +555,20 @@ _MANIFESTS = frozenset({"package.json", "pyproject.toml", "setup.cfg", "cargo.to
                         ".gitmodules", ".npmrc", ".yarnrc", ".yarnrc.yml", "pip.conf"})
 _VENDORED_DIRS = frozenset({"dist", "vendor", "vendored", "third_party", "node_modules",
                             "generated", "build"})
+# Files a dev tool runs or obeys on its own (direnv, devcontainers, editor
+# tasks, git hooks, tool managers, cargo/pnpm/bun config).
+_AUTORUN_NAMES = frozenset({".envrc", ".pre-commit-config.yaml", "mise.toml", ".mise.toml",
+                            ".tool-versions", ".pnpmfile.cjs", "bunfig.toml", "lefthook.yml"})
+_AUTORUN_IN_DIR = frozenset({(".vscode", "tasks.json"), (".vscode", "settings.json"),
+                             (".vscode", "launch.json"), (".cargo", "config.toml"),
+                             (".cargo", "config")})
+_AUTORUN_DIRS = frozenset({".devcontainer", ".husky"})
+
+
+def _dev_autorun(p: PurePosixPath) -> bool:
+    name, parent = p.name.casefold(), p.parent.name.casefold()
+    return (name in _AUTORUN_NAMES or (parent, name) in _AUTORUN_IN_DIR
+            or any(d.casefold() in _AUTORUN_DIRS for d in p.parts[:-1]))
 
 
 def scrutiny(files: list[FileChange]) -> list[Scrutiny]:
@@ -575,6 +589,8 @@ def scrutiny(files: list[FileChange]) -> list[Scrutiny]:
             reasons.append("install-script")
         if name in _MANIFESTS:
             reasons.append("package-manifest")
+        if _dev_autorun(p):
+            reasons.append("dev-autorun")
         if ".min." in name or any(part in _VENDORED_DIRS for part in p.parts[:-1]):
             reasons.append("minified-or-vendored")
         if f.new_mode == "120000":

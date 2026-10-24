@@ -956,6 +956,20 @@ def test_scrutiny_paths(path, reason):
     assert reason in {s.reason for s in checks.scrutiny([fc(path, ["x"])])}
 
 
+@pytest.mark.parametrize("path", [
+    ".envrc", ".devcontainer/devcontainer.json", ".devcontainer/post-create.sh",
+    ".vscode/tasks.json", "web/.vscode/settings.json", ".husky/pre-commit",
+    ".cargo/config.toml", "lefthook.yml", ".pre-commit-config.yaml", "bunfig.toml",
+])
+def test_files_a_dev_tool_runs_on_its_own_are_scrutiny(path):
+    hits, scrutiny = checks.run_all([fc(path, ["x"])], {}, [], {})
+    assert "dev-autorun" in {s.reason for s in scrutiny} and hits == []
+
+
+def test_other_editor_files_are_not_dev_autorun():
+    assert checks.scrutiny([fc(".vscode/extensions.json", ["x"])]) == []
+
+
 def test_long_added_line_is_scrutiny():
     out = checks.scrutiny([fc("a.js", ["x" * 600])])
     assert [s.reason for s in out] == ["long-line"]

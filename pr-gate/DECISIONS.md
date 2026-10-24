@@ -326,7 +326,14 @@ it, each with the reason. Design: `docs/superpowers/specs/2026-10-24-pr-gate-des
     lockfiles, `build.rs`, install/setup scripts, package manifests and
     `.gitattributes`/`.gitmodules`/`.npmrc`, minified or vendored paths,
     symlinks, submodules, added lines over 500 characters,
-    exception-downgraded paths.
+    exception-downgraded paths, and (`dev-autorun`) files a dev tool runs
+    or obeys on its own: `.envrc`, `.devcontainer/**`,
+    `.vscode/{tasks,settings,launch}.json`, `.pre-commit-config.yaml`,
+    `mise.toml`, `.mise.toml`, `.tool-versions`, `.cargo/config(.toml)`,
+    `.pnpmfile.cjs`, `bunfig.toml`, `.husky/**`, `lefthook.yml`, at any
+    depth. Scrutiny only: they run on a developer's machine, not in the
+    gate or CI, and blocking every editor-settings change would train the
+    owner to dismiss.
 25. **Exception globs** use `fnmatch` semantics: `*` also matches `/`.
 
 ## Report
