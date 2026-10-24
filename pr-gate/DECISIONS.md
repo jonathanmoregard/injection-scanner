@@ -282,7 +282,14 @@ it, each with the reason. Design: `docs/superpowers/specs/2026-10-24-pr-gate-des
     regex. Findings are counted (a multiset) and only those NEW relative to
     the base are hits, so a value already on the default branch does not
     block every later lockfile change, while one more package pointing at
-    that same host does. All are non-overridable `lockfile-host` hits,
+    that same host does. A finding is keyed on the WHOLE offending value
+    (the string, or for a structural finding the JSON of the slot or flake
+    node), not on its host: keyed on the host, repointing an already-bad
+    `git+ssh://git@github.com/trusted/x` to `.../evil/x` added nothing.
+    The hit still reports only what is wrong (the host). Cost: in a repo
+    whose lockfile already uses a non-allowlisted host, every change to
+    one of those entries (a version bump) is a hit, not only a new one.
+    All are non-overridable `lockfile-host` hits,
     including "lockfile does not parse" (head only; a base that does not
     parse counts as having no findings) and "lockfile too large to check"
     (over the 25 MB fetch cap; no lockfile in this repo or its fixtures

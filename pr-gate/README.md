@@ -268,6 +268,12 @@ their maximum suspicion.
   parsers is a gap. A yarn v1 lockfile that classic yarn cannot read is read
   as YAML by yarn; the gate checks that reading only where PyYAML parses it.
   A lockfile over 25 MB cannot pass the gate.
+- The lockfile check judges hosts, not repos. Where a code host is
+  allowlisted (`github.com` for `Cargo.lock` git sources and `flake.lock`
+  inputs), a dependency on ANY repo there passes the deterministic check;
+  only the model passes see which repo and commit it is. A value already
+  on the default branch that is changed in any way (another repo or
+  commit on the same foreign host) counts as new.
 - Lockfile hosts outside the allowlist (e.g. a private registry) cannot be
   cleared per repo; that needs a gate change. Local `file:../pkg`
   references are not host-checked (the referenced path is in the diff);

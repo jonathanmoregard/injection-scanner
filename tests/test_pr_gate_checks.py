@@ -617,6 +617,40 @@ def test_a_base_that_does_not_parse_counts_as_empty():
     assert "evil.example" in hit.detail
 
 
+def _npm_git(repo):
+    return ('{"packages": {"node_modules/x": {"version": "1.0.0", "resolved": '
+            f'"git+ssh://git@github.com/{repo}/x.git#0123abc"}}}}}}')
+
+
+_REPOINTS = [
+    # (path, base, head): an already-bad value pointed at another repo or
+    # commit on the same host is a NEW value, not the old one.
+    ("package-lock.json", _npm_git("trusted"), _npm_git("evil")),
+    ("uv.lock", '[[package]]\nname = "x"\nsource = { git = "https://gitlab.com/trusted/x?rev=1#1" }\n',
+     '[[package]]\nname = "x"\nsource = { git = "https://gitlab.com/evil/x?rev=1#1" }\n'),
+    ("package-lock.json", '{"packages": {"node_modules/x": {"resolved": "trusted/x#0123abc"}}}',
+     '{"packages": {"node_modules/x": {"resolved": "evil/x#0123abc"}}}'),
+    ("flake.lock", '{"nodes": {"x": {"locked": {"type": "gitlab", "owner": "trusted", "repo": "r"}}}}',
+     '{"nodes": {"x": {"locked": {"type": "gitlab", "owner": "evil", "repo": "r"}}}}'),
+]
+
+
+@pytest.mark.parametrize("path,base,head", _REPOINTS)
+def test_repointing_an_already_bad_value_is_a_hit(path, base, head):
+    hits = lock_hits(path, head, base=base)
+    assert hits and {(h.rule, h.overridable) for h in hits} == {("lockfile-host", False)}
+
+
+@pytest.mark.parametrize("path,base,head", _REPOINTS)
+def test_an_unchanged_already_bad_value_is_not_a_hit(path, base, head):
+    assert lock_hits(path, base, base=base) == []
+
+
+def test_a_repointed_value_is_reported_by_host():
+    [hit] = lock_hits("package-lock.json", _npm_git("evil"), base=_npm_git("trusted"))
+    assert "github.com" in hit.detail and "evil/x" not in hit.detail
+
+
 _PACKAGE_LOCK = """{
   "name": "app",
   "version": "1.0.0",

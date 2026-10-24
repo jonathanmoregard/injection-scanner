@@ -625,24 +625,29 @@ def _dicts(v) -> list[dict]:
     return [x for x in v.values() if isinstance(x, dict)] if isinstance(v, dict) else []
 
 
+def _key(v) -> str:
+    """The whole offending value, as a finding's identity in the multiset."""
+    return v if isinstance(v, str) else json.dumps(v, sort_keys=True, default=str)
+
+
 def _npm_slots_bad(name: str, doc):
-    """One NOT_FETCHABLE per fetch slot that is neither https nor local."""
+    """(NOT_FETCHABLE, value) per fetch slot that is neither https nor local."""
     if not isinstance(doc, dict):
         return
     if name in ("package-lock.json", "npm-shrinkwrap.json"):
         for e in _dicts(doc.get("packages")):
             if "resolved" in e and _resolved_bad(e["resolved"], e.get("link")):
-                yield NOT_FETCHABLE
+                yield NOT_FETCHABLE, _key(e["resolved"])
         stack = [doc.get("dependencies")]  # lockfile v1: nested to any depth
         while stack:
             for e in _dicts(stack.pop()):
                 if "resolved" in e and _resolved_bad(e["resolved"]):
-                    yield NOT_FETCHABLE
+                    yield NOT_FETCHABLE, _key(e["resolved"])
                 stack.append(e.get("dependencies"))
     elif name == "pnpm-lock.yaml":
         for e in _dicts(doc.get("packages")):
             if "resolution" in e and _pnpm_resolution_bad(e["resolution"]):
-                yield NOT_FETCHABLE
+                yield NOT_FETCHABLE, _key(e["resolution"])
     elif name == "bun.lock":
         packages = doc.get("packages")
         for e in packages.values() if isinstance(packages, dict) else ():
@@ -651,13 +656,13 @@ def _npm_slots_bad(name: str, doc):
             # ["name@1.0.0", "<tarball URL, or empty for the registry>", {...}, "sha512-..."]
             if _spec_slot_bad(e[0]) or (len(e) > 1 and isinstance(e[1], str)
                                         and e[1] and not _https(e[1])):
-                yield NOT_FETCHABLE
+                yield NOT_FETCHABLE, _key(e[:2])
     elif name == "yarn.lock":
         for e in _dicts(doc):
             if "resolution" in e and _spec_slot_bad(e["resolution"]):  # Berry
-                yield NOT_FETCHABLE
+                yield NOT_FETCHABLE, _key(e["resolution"])
             if "resolved" in e and _resolved_bad(e["resolved"]):  # v1 read as YAML
-                yield NOT_FETCHABLE
+                yield NOT_FETCHABLE, _key(e["resolved"])
 
 
 _YARN_V1_RESOLVED = re.compile(r'\s+resolved\s+"?([^"]*)"?\s*$')
@@ -679,28 +684,31 @@ def _flake_bad(doc, allowed: frozenset[str]):
                 continue
             kind = ref.get("type")
             if not isinstance(kind, str) or kind not in _FLAKE_TYPES_OK:
-                yield f"flake input type {kind}"
+                yield f"flake input type {kind}", _key(ref)
             host = ref.get("host")
             if host is not None and str(host).lower() not in allowed:
-                yield f"flake host {host}"
+                yield f"flake host {host}", _key(ref)
 
 
 def _findings(name: str, data: bytes, allowed: frozenset[str]) -> Counter:
-    """Bad values in a parsed lockfile, counted. Raises if it does not parse."""
+    """Bad values in a parsed lockfile, counted as (what is wrong, the whole
+    offending value): keyed on the value, not the host, so pointing an
+    already-bad git dependency at another repo or commit on the same host
+    is a new finding. Raises if it does not parse."""
     doc = _load(name, data)
     npm = name in _NPM_LOCKS
     bad: Counter = Counter()
     for s, meta in _strings(doc, _package_entries(name, doc) if npm else frozenset()):
         if _CONTROL.search(s):
-            bad[MULTI_LINE] += 1
+            bad[MULTI_LINE, s] += 1
         if meta:
             continue  # nothing fetches from it: no URL or spec checks
         # Berry percent-encodes locators inside locators
         # (npm:1.0.0::__archiveUrl=https%3A%2F%2F...): check both forms.
         for t in dict.fromkeys((s, unquote(s))) if npm else (s,):
-            bad.update(_bad_urls(t, allowed))
+            bad.update((d, t) for d in _bad_urls(t, allowed))
             if npm:
-                bad.update(_spec_bad(t))
+                bad.update((d, t) for d in _spec_bad(t))
     if npm:
         bad.update(_npm_slots_bad(name, doc))
     if name == "flake.lock":
@@ -728,7 +736,8 @@ def _parsed_hits(f: FileChange, name: str, allowed: frozenset[str],
             base = _findings(name, lf.base, allowed)
         except _UNPARSED:
             base = Counter()  # a base that does not parse has no findings
-    new = sorted(head - base)
+    # Reported by what is wrong (the host), never the whole value.
+    new = sorted(dict.fromkeys(d for d, _ in head - base))
     if not new:
         return []
     return [Hit("lockfile-host", f.path, f"not allowlisted: {', '.join(new[:4])}", False)]
