@@ -176,8 +176,8 @@ def gate_review(verdict_, head, own_hash, state=None, rid=100, login=BOT):
     return Review(id=rid, login=login, state=state, commit_id=head, body=body)
 
 
-def own_hash_of(diff):
-    gh = FakeGitHub(diff=diff)
+def own_hash_of(diff, files=None):
+    gh = FakeGitHub(diff=diff, files=files)
     return core.gather(gh, BASE_OID, MERGE).own_hash
 
 
@@ -615,7 +615,9 @@ def test_a_forged_bot_pass_does_not_carry_over(body):
     assert out.exit_code == 1 and gh.posted == [] and model.calls == []
 
 
-@pytest.mark.parametrize("body", forged_bodies("block", HEAD, "0" * 64))
+# Forged blocks carry the real own-changes hash: a verified block of other
+# changes would not count either, and the test must show the MAC decides.
+@pytest.mark.parametrize("body", forged_bodies("block", HEAD, own_hash_of(DIFF)))
 def test_a_forged_block_marker_in_a_comment_does_not_block_the_head(body):
     review = Review(id=100, login=BOT, state="COMMENTED", commit_id=HEAD, body=body)
     gh = FakeGitHub(reviews=[review])
@@ -624,15 +626,15 @@ def test_a_forged_block_marker_in_a_comment_does_not_block_the_head(body):
 
 
 
-@pytest.mark.parametrize("body", forged_bodies("block", HEAD, "0" * 64))
+@pytest.mark.parametrize("body", forged_bodies("block", HEAD, own_hash_of(DIFF)))
 def test_an_unverified_bot_request_changes_is_not_a_gate_block(body):
     # Only a verified block guards the head. A forged or edited one gets the
     # owner's fresh review (attempt 1); a re-run never reaches the model.
-    gh = FakeGitHub(reviews=[forged("block", HEAD, "0" * 64, body)],
+    gh = FakeGitHub(reviews=[forged("block", HEAD, own_hash_of(DIFF), body)],
                     dismissals=[dismissal(100, OWNER)])
     out, model = run(gh)
     assert len(model.calls) == 1 and out.exit_code == 0
-    gh2 = FakeGitHub(reviews=[forged("block", HEAD, "0" * 64, body)],
+    gh2 = FakeGitHub(reviews=[forged("block", HEAD, own_hash_of(DIFF), body)],
                      dismissals=[dismissal(100, OWNER)])
     out2, model2 = run(gh2, attempt=2)
     assert out2.exit_code == 1 and model2.calls == [] and gh2.posted == []
@@ -894,7 +896,8 @@ def test_with_real_git_only_the_merge_result_diff_shows_the_revert(tmp_path):
 
 def blocked(**kw):
     """A verified gate block on HEAD (review 1), as the fresh review left it."""
-    kw.setdefault("reviews", [gate_review("block", HEAD, own_hash_of(kw.get("diff", DIFF)),
+    kw.setdefault("reviews", [gate_review("block", HEAD, own_hash_of(kw.get("diff", DIFF),
+                                                                     kw.get("files")),
                                           rid=1, state="DISMISSED")])
     return FakeGitHub(**kw)
 
@@ -966,6 +969,40 @@ def override_attempts(gh_factory):
         gh = gh_factory()
         out, model = run(gh, attempt=attempt)
         yield out, model, gh
+
+
+# A block guards one landed change: this head merged into the base it saw.
+# The base moving afterwards changes what would land (here: an extra edit
+# the base brings into the merge result), so neither the model nor the
+# owner has seen it.
+MOVED_BASE_DIFF = DIFF.replace("+    c = 4", "+    c = 4\n+    d = 5")
+
+
+def test_a_dismissed_block_of_another_landed_change_is_no_override_on_a_rerun():
+    gh = blocked(diff=MOVED_BASE_DIFF, reviews=[gate_review(
+        "block", HEAD, own_hash_of(DIFF), rid=1, state="DISMISSED")],
+        dismissals=[dismissal(1, OWNER)])
+    out, model = run(gh, attempt=2)
+    assert out.exit_code == 1 and model.calls == [] and gh.posted == []
+    assert out.message == core.STALE_BLOCK
+
+
+def test_a_block_of_another_landed_change_does_not_stop_a_fresh_review_on_a_toggle():
+    gh = blocked(diff=MOVED_BASE_DIFF, reviews=[gate_review(
+        "block", HEAD, own_hash_of(DIFF), rid=1, state="CHANGES_REQUESTED")])
+    out, model = run(gh)
+    assert out.exit_code == 0 and out.message == "passed (full)" and len(model.calls) == 1
+    assert gh.timeline_reads == 0 and gh.dismissed == [1]
+
+
+def test_a_base_move_that_leaves_the_landed_change_alone_keeps_the_override():
+    # The base moved elsewhere: the merge's own changes hash the same.
+    gh = blocked(diff=shifted(DIFF), reviews=[gate_review(
+        "block", HEAD, own_hash_of(DIFF), rid=1, state="DISMISSED")],
+        dismissals=[dismissal(1, OWNER)])
+    out, model = run(gh, attempt=2)
+    assert out.exit_code == 0 and out.message == "passed (owner-override)"
+    assert model.calls == []
 
 
 def test_a_stale_dismissal_is_not_an_override_after_a_force_push_back():
@@ -1095,7 +1132,8 @@ def test_a_dismissal_whose_block_is_not_on_the_timeline_does_not_count():
 
 
 def test_a_block_posted_as_a_comment_still_blocks_the_head():
-    gh = FakeGitHub(reviews=[gate_review("block", HEAD, "0" * 64, rid=1, state="COMMENTED")])
+    gh = FakeGitHub(reviews=[gate_review("block", HEAD, own_hash_of(DIFF), rid=1,
+                                         state="COMMENTED")])
     out, model = run(gh)
     assert out.exit_code == 1 and model.calls == []
     assert "must dismiss" not in out.message
@@ -1103,8 +1141,9 @@ def test_a_block_posted_as_a_comment_still_blocks_the_head():
 
 
 def test_a_dismissable_block_beside_a_comment_block_says_dismiss_it():
-    gh = FakeGitHub(reviews=[gate_review("block", HEAD, "0" * 64, rid=1, state="COMMENTED"),
-                             gate_review("block", HEAD, "0" * 64, rid=2)])
+    gh = FakeGitHub(reviews=[gate_review("block", HEAD, own_hash_of(DIFF), rid=1,
+                                         state="COMMENTED"),
+                             gate_review("block", HEAD, own_hash_of(DIFF), rid=2)])
     out, _ = run(gh)
     assert "jonathan must dismiss its review" in out.message
 

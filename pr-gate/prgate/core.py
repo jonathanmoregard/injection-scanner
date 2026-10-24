@@ -6,9 +6,10 @@
      later step reads the change as base...merge, i.e. what would land
   3. push / reopen: carry over iff the newest verified gate marker is a pass
      of these exact own changes; else fail
-  4. a verified gate block on this head: override (always-on checks only)
-     iff the OWNER dismissed that review and the head has not moved since;
-     else fail
+  4. a verified gate block on this head AND this landed change (own-changes
+     hash): override (always-on checks only) iff the OWNER dismissed that
+     review and the head has not moved since; else fail. A block of this
+     head on an older base is stale: no override, no bar to a fresh review
   5. a re-run (run attempt > 1) never asks the model: fail
   6. full review: deterministic checks + model passes
 
@@ -49,6 +50,9 @@ _SHA = re.compile(r"^[0-9a-f]{40}$")
 
 RETRY = "disable and re-enable auto-merge to retry"
 CONFLICTS = "the PR has merge conflicts; resolve them"
+STALE_BLOCK = ("the gate blocked this commit, but the base has moved since and changed what "
+               "would land, so that block and any dismissal of it no longer apply. A re-run "
+               "never asks the model: disable and re-enable auto-merge for a fresh model review")
 # GitHub computes the test merge in the background after a push or a base
 # move: re-read with these pauses (30 s in all), then give up as infra.
 MERGE_WAITS = (2, 4, 8, 16)
@@ -220,10 +224,15 @@ def _carries_over(reviews: list[Review], ev: Event, key: bytes, own_hash: str) -
     return bool(markers) and markers[-1][0] == "pass" and markers[-1][2] == own_hash
 
 
-def _blocks_on_head(reviews: list[Review], ev: Event, key: bytes) -> list[int]:
-    """Review ids of the gate's verified blocks of this exact head commit."""
+def _blocks_on_head(reviews: list[Review], ev: Event, key: bytes,
+                    own_hash: str | None) -> list[int]:
+    """Review ids of the gate's verified blocks of this exact head commit
+    and, unless own_hash is None, of this exact landed change. A block of
+    the same head on an older base guarded a different merge: the owner's
+    dismissal of it says nothing about this one."""
     return [r.id for r, m in _gate_reviews(reviews, ev, key)
-            if m[0] == "block" and m[1] == ev.head_sha]
+            if m[0] == "block" and m[1] == ev.head_sha
+            and (own_hash is None or m[2] == own_hash)]
 
 
 def _owner_dismissed(gh, ev: Event, owner: str, review_ids: list[int]) -> bool:
@@ -390,7 +399,7 @@ def _run(ev: Event, cfg: Config, gh, review_fn: ReviewFn) -> Outcome:
 
     # Step 4: the gate blocked this commit. Only the owner's dismissal of
     # that review clears it (GitHub forbids approving your own PR).
-    blocks = _blocks_on_head(reviews, ev, cfg.marker_key)
+    blocks = _blocks_on_head(reviews, ev, cfg.marker_key, g.own_hash)
     if blocks:
         if not _owner_dismissed(gh, ev, cfg.owner, blocks):
             states = {r.state for r in reviews if r.id in blocks}
@@ -413,6 +422,8 @@ def _run(ev: Event, cfg: Config, gh, review_fn: ReviewFn) -> Outcome:
     # posted, another workflow edited or removed it, and a blind toggle
     # would hand that edit a fresh model roll: send the owner to the PR.
     if ev.run_attempt > 1:
+        if _blocks_on_head(reviews, ev, cfg.marker_key, None):
+            return Outcome(1, STALE_BLOCK)
         return Outcome(1, "a re-run never asks the model again, and this commit has no "
                           "verified gate block to override. If an earlier run blocked it, "
                           "that review was edited or removed: look at the PR before "
