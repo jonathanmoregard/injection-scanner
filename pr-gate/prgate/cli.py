@@ -28,7 +28,8 @@ def escape_command(text: str) -> str:
 
 def make_review_fn(env, cfg: core.Config):
     """The model layer, bound to config. A missing key is a setup failure
-    (infra), not a verdict, so a re-run after fixing the secret reviews."""
+    (infra), not a verdict: after fixing the secret, an auto-merge toggle
+    reviews."""
     def review_fn(diff_text, contents, scrutiny, omitted) -> list[PassResult]:
         key = (env.get("ANTHROPIC_API_KEY") or "").strip()
         if not key:
@@ -63,7 +64,9 @@ def _actions(env) -> int:
         pr = payload["pull_request"]
         ev = core.Event(action=str(payload["action"]), number=int(pr["number"]),
                         head_sha=str(pr["head"]["sha"]), base_ref=str(pr["base"]["ref"]),
-                        repo=env.get("GITHUB_REPOSITORY", ""))
+                        repo=env.get("GITHUB_REPOSITORY", ""),
+                        default_branch=str(payload["repository"]["default_branch"]),
+                        run_attempt=int(env.get("GITHUB_RUN_ATTEMPT") or ""))
     except (KeyError, TypeError, ValueError, OSError):
         return fail("could not read the pull_request_target event")
     try:

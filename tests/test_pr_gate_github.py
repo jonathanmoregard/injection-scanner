@@ -9,7 +9,7 @@ import urllib.error
 
 import pytest
 
-from prgate.github import GitHub, GitHubError, TooLarge
+from prgate.github import Dismissal, GitHub, GitHubError, TooLarge
 
 TOKEN = "ghs_SECRETTOKEN"
 HEAD = "c" * 40
@@ -118,6 +118,42 @@ def test_reviews_paginate():
     assert len(reviews) == 101
     assert (reviews[-1].login, reviews[-1].body, reviews[-1].commit_id) == ("", "", None)
     assert "page=2" in op.requests[1].full_url and "per_page=100" in op.requests[1].full_url
+
+
+def dismissed(review_id, login):
+    return {"event": "review_dismissed", "actor": {"login": login},
+            "dismissed_review": {"state": "changes_requested", "review_id": review_id,
+                                 "dismissal_message": "false alarm"}}
+
+
+def test_review_dismissals_paginate_the_issue_timeline():
+    page1 = [{"event": "commented", "actor": {"login": "u"}, "body": "x"}] * 99 + [
+        dismissed(5, "jonathan")]
+    page2 = [{"event": "labeled", "actor": None}, dismissed(6, "github-actions[bot]")]
+    client, op = gh(page1, page2)
+    assert client.review_dismissals(7) == [Dismissal(5, "jonathan"),
+                                           Dismissal(6, "github-actions[bot]")]
+    first, second = op.requests
+    assert first.full_url.startswith("https://api.github.test/repos/owner/repo/issues/7/timeline?")
+    assert "page=2" in second.full_url and "per_page=100" in second.full_url
+
+
+@pytest.mark.parametrize("item", [
+    {"event": "review_dismissed", "actor": {"login": "jonathan"}},
+    {"event": "review_dismissed", "actor": {"login": "jonathan"},
+     "dismissed_review": {"review_id": "five"}},
+])
+def test_a_malformed_dismissal_fails_closed(item):
+    client, _ = gh([item])
+    with pytest.raises(GitHubError) as e:
+        client.review_dismissals(7)
+    assert e.value.op == "timeline"
+
+
+def test_a_dismissal_without_an_actor_has_an_empty_login():
+    client, _ = gh([{"event": "review_dismissed", "actor": None,
+                     "dismissed_review": {"review_id": 5}}])
+    assert client.review_dismissals(7) == [Dismissal(5, "")]
 
 
 def test_post_review_and_dismiss():

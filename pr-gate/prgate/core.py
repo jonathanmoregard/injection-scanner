@@ -1,13 +1,19 @@
-"""The gate's decision flow (design steps 1-8). Fails closed everywhere.
+"""The gate's decision flow. Fails closed everywhere.
+
+  1. auto-merge on, enabled by the owner, head not stale
+  2. the PR targets the default branch
+  3. push / reopen: carry over iff the newest verified gate marker is a pass
+     of these exact own changes; else fail
+  4. a verified gate block on this head: override (always-on checks only)
+     iff the OWNER dismissed that review; else fail
+  5. a re-run (run attempt > 1) never asks the model: fail
+  6. full review: deterministic checks + model passes
 
 Three kinds of failure, deliberately different:
-  - procedural (no auto-merge, wrong enabler, stale head, a push after
-    auto-merge, an existing block without owner approval, unreadable diff):
-    the check fails with a message and NO review is posted. In particular no
-    REQUEST_CHANGES: that would arm the reroll guard on a head that was
-    never reviewed.
-  - infra (GitHub or model API errors): the check fails, no review; a
-    re-run retries. A transport error is not a verdict on the PR.
+  - procedural (steps 1-5, unreadable diff): the check fails with a message
+    and NO review is posted.
+  - infra (GitHub or model API errors): the check fails, no review. Not a
+    verdict on the PR; an owner auto-merge toggle retries.
   - verdict: a review is posted on the head SHA. Block = REQUEST_CHANGES
     (COMMENT if refused) and exit 1; pass = COMMENT, dismiss the gate's own
     earlier blocks, exit 0.
@@ -32,6 +38,8 @@ CONTENTS_BUDGET = 400_000     # bytes of post-change file contents for Monitor B
 FILE_FETCH_CAP = 25_000_000   # per binary file (magic bytes + content hash)
 _LOGIN = re.compile(r"^[A-Za-z0-9](?:[A-Za-z0-9-]{0,38})$")
 _SHA = re.compile(r"^[0-9a-f]{40}$")
+
+RETRY = "disable and re-enable auto-merge to retry"
 
 ReviewFn = Callable[[str, dict, list, list], list[PassResult]]
 
@@ -66,6 +74,8 @@ class Event:
     head_sha: str
     base_ref: str
     repo: str          # "owner/name", part of every marker MAC
+    default_branch: str
+    run_attempt: int   # GITHUB_RUN_ATTEMPT: > 1 is a re-run, which any writer can start
 
 
 @dataclass
@@ -106,7 +116,7 @@ def gather_from(diff_bytes: bytes, fetch_binary: Callable[[str], bytes]) -> Gath
 
 def full_review(g: Gathered, cfg: Config, review_fn: ReviewFn,
                 fetch_contents: Callable[[], tuple[dict[str, str], list[str]]]) -> verdict.Result:
-    """Steps 4-7: every deterministic check, then the model passes."""
+    """Step 6: every deterministic check, then the model passes."""
     hits, scrutiny = checks.run_all(g.files, g.binaries, cfg.exceptions)
     passes: list[PassResult] = []
     if len(g.diff_bytes) > DIFF_LLM_CAP:
@@ -130,44 +140,28 @@ def _gate_reviews(reviews: list[Review], ev: Event, key: bytes):
                 yield r, m
 
 
-def _verified_block(reviews: list[Review], ev: Event, key: bytes, own_hash: str) -> bool:
-    """The gate itself blocked this head, or these exact own changes at any
-    head (an amend/rebase must not buy a fresh model roll)."""
-    return any(m[0] == "block" and (m[1] == ev.head_sha or r.commit_id == ev.head_sha
-                                    or m[2] == own_hash)
-               for r, m in _gate_reviews(reviews, ev, key))
-
-
-def _unverified_bot_block(reviews: list[Review], ev: Event, key: bytes) -> bool:
-    """A github-actions[bot] REQUEST_CHANGES on this head without a valid
-    marker: either another workflow's forgery or a real gate block whose body
-    was edited (a body can be edited, the state can't). Neither may be cleared
-    by an owner approval that skips the model, so it must be dismissed."""
-    verified = {r.id for r, _ in _gate_reviews(reviews, ev, key)}
-    return any(r.login == GATE_LOGIN and r.state == "CHANGES_REQUESTED"
-               and r.commit_id == ev.head_sha and r.id not in verified for r in reviews)
-
-
-def _owner_approved(reviews: list[Review], owner: str, head: str) -> bool:
-    states = [r.state for r in reviews
-              if r.login.casefold() == owner.casefold() and r.commit_id == head
-              and r.state in ("APPROVED", "CHANGES_REQUESTED", "DISMISSED")]
-    return bool(states) and states[-1] == "APPROVED"
-
-
-def _carries_over(reviews: list[Review], ev: Event, cfg: Config, own_hash: str) -> bool:
+def _carries_over(reviews: list[Review], ev: Event, key: bytes, own_hash: str) -> bool:
     """The NEWEST gate marker (pass or block) is a pass of these exact own
-    changes. An older pass never outlives a later block."""
-    markers = [m for _, m in _gate_reviews(reviews, ev, cfg.marker_key)]
-    if not markers or markers[-1][0] != "pass" or markers[-1][2] != own_hash:
-        return False
-    if not any(m[0] == "block" and m[2] == own_hash for m in markers):
-        return True
-    # These changes were blocked at some point. A real pass can be re-posted
-    # (replayed) after that block by another workflow running as the same
-    # bot, so the pass only carries over if the owner approved its head —
-    # which is exactly the legitimate block -> approve -> override sequence.
-    return _owner_approved(reviews, cfg.owner, markers[-1][1])
+    changes. Markers are signed, so a pass can't be minted; a replayed real
+    one only re-asserts content that was passed."""
+    markers = [m for _, m in _gate_reviews(reviews, ev, key)]
+    return bool(markers) and markers[-1][0] == "pass" and markers[-1][2] == own_hash
+
+
+def _blocks_on_head(reviews: list[Review], ev: Event, key: bytes) -> list[int]:
+    """Review ids of the gate's verified blocks of this exact head commit."""
+    return [r.id for r, m in _gate_reviews(reviews, ev, key)
+            if m[0] == "block" and m[1] == ev.head_sha]
+
+
+def _owner_dismissed(gh, ev: Event, owner: str, review_ids: list[int]) -> bool:
+    return any(d.review_id in review_ids and d.actor.casefold() == owner.casefold()
+               for d in gh.review_dismissals(ev.number))
+
+
+def _always_on(g: Gathered, cfg: Config) -> verdict.Result:
+    hits, scrutiny = checks.run_all(g.files, g.binaries, cfg.exceptions, always_on_only=True)
+    return verdict.decide(hits, scrutiny, [], cfg.threshold)
 
 
 def _text_contents(gh, ev: Event, files: list[FileChange]) -> tuple[dict[str, str], list[str]]:
@@ -217,7 +211,7 @@ def run(ev: Event, cfg: Config, gh, review_fn: ReviewFn) -> Outcome:
     try:
         return _run(ev, cfg, gh, review_fn)
     except GitHubError as e:
-        return Outcome(1, f"infra: {e}; re-run the check")
+        return Outcome(1, f"infra: {e}; {RETRY}")
     except TooLarge:
         return Outcome(1, "the diff is too large for the gate to read; split the PR")
     except DiffError:
@@ -242,35 +236,39 @@ def _run(ev: Event, cfg: Config, gh, review_fn: ReviewFn) -> Outcome:
     if state.head_sha != ev.head_sha:
         return Outcome(1, "stale: the PR head moved since this event")
 
+    # Step 2: a check result lives on the head SHA, so a pass for a PR into
+    # another branch would satisfy a later PR of the same head into main.
+    if not ev.default_branch or ev.base_ref != ev.default_branch:
+        return Outcome(1, f"the AI gate only reviews PRs into {ev.default_branch}")
+
     reviews = gh.reviews(ev.number)
     g = gather(gh, ev)
 
-    # A push or a close/reopen while auto-merge stays on is not an owner
-    # click: no model roll, only a carry-over of identical own changes.
+    # Step 3: a push or a close/reopen while auto-merge stays on is not an
+    # owner click: no model roll, only a carry-over of identical own changes.
     if ev.action in ("synchronize", "reopened"):
-        if not _carries_over(reviews, ev, cfg, g.own_hash):
+        if not _carries_over(reviews, ev, cfg.marker_key, g.own_hash):
             return Outcome(1, "the PR was pushed to or reopened after auto-merge was "
                               "enabled; disable and re-enable auto-merge to re-request review")
-        hits, scrutiny = checks.run_all(g.files, g.binaries, cfg.exceptions, always_on_only=True)
-        result = verdict.decide(hits, scrutiny, [], cfg.threshold)
-        return _report(gh, ev, cfg, result, g.own_hash, "carry-over", reviews)
+        return _report(gh, ev, cfg, _always_on(g, cfg), g.own_hash, "carry-over", reviews)
 
-    # Step 2: reroll guard / owner override.
-    if _verified_block(reviews, ev, cfg.marker_key, g.own_hash):
-        if not _owner_approved(reviews, cfg.owner, ev.head_sha):
-            return Outcome(1, f"the gate already blocked these changes; {cfg.owner} must "
-                              f"approve {ev.head_sha}, then re-run this check")
-        hits, scrutiny = checks.run_all(g.files, g.binaries, cfg.exceptions, always_on_only=True)
-        result = verdict.decide(hits, scrutiny, [], cfg.threshold)
-        return _report(gh, ev, cfg, result, g.own_hash, "owner-override", reviews)
+    # Step 4: the gate blocked this commit. Only the owner's dismissal of
+    # that review clears it (GitHub forbids approving your own PR).
+    blocks = _blocks_on_head(reviews, ev, cfg.marker_key)
+    if blocks:
+        if not _owner_dismissed(gh, ev, cfg.owner, blocks):
+            return Outcome(1, f"the gate blocked this commit; {cfg.owner} must dismiss its "
+                              "review to override, then re-run this check")
+        return _report(gh, ev, cfg, _always_on(g, cfg), g.own_hash, "owner-override", reviews)
 
-    if _unverified_bot_block(reviews, ev, cfg.marker_key):
-        return Outcome(1, "a github-actions[bot] review without a valid gate marker requests "
-                          "changes on this commit; dismiss it, then re-run this check")
+    # Step 5: any writer can re-run a check; only an owner click buys a roll.
+    if ev.run_attempt > 1:
+        return Outcome(1, "a re-run never asks the model again; dismiss the gate's review "
+                          "to override, or disable and re-enable auto-merge for a fresh review")
 
-    # Steps 3-7: full review.
+    # Step 6: full review.
     result = full_review(g, cfg, review_fn, lambda: _text_contents(gh, ev, g.files))
     if result.infra:
         return Outcome(1, "infra: model call failed (" + ", ".join(result.infra)
-                          + "); re-run the check")
+                          + f"); {RETRY}")
     return _report(gh, ev, cfg, result, g.own_hash, "full", reviews)

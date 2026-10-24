@@ -1,4 +1,4 @@
-"""pr-gate: the end-to-end decision flow (design steps 1-8) against a fake
+"""pr-gate: the end-to-end decision flow (design steps 1-6) against a fake
 GitHub layer and a fake model layer. No network."""
 from __future__ import annotations
 
@@ -7,13 +7,14 @@ import _prgate  # noqa: F401
 import pytest
 
 from prgate import core, verdict
-from prgate.github import GitHubError, PullState, Review, TooLarge
+from prgate.github import Dismissal, GitHubError, PullState, Review, TooLarge
 from prgate.llm import Finding, PassResult
 
 OWNER = "jonathan"
 BOT = "github-actions[bot]"
 HEAD = "1" * 40
 OLD = "2" * 40
+NEWER = "3" * 40
 KEY = b"sk-ant-gate-key"
 REPO = "jonathan/app"
 
@@ -37,7 +38,7 @@ def shifted(diff, delta=40):
 
 class FakeGitHub:
     def __init__(self, diff=DIFF, head=HEAD, enabled_by=OWNER, auto_merge=True,
-                 reviews=(), files=None):
+                 reviews=(), files=None, dismissals=()):
         self.state = PullState(head_sha=head, auto_merge=auto_merge, enabled_by=enabled_by)
         self.diff_text = diff
         self._reviews = list(reviews)
@@ -46,6 +47,8 @@ class FakeGitHub:
         self.dismissed: list[int] = []
         self.refuse_request_changes = False
         self.fetched: list[str] = []
+        self._dismissals = list(dismissals)
+        self.timeline_reads = 0
 
     def pull_state(self, number):
         return self.state
@@ -65,6 +68,10 @@ class FakeGitHub:
 
     def reviews(self, number):
         return list(self._reviews)
+
+    def review_dismissals(self, number):
+        self.timeline_reads += 1
+        return list(self._dismissals)
 
     def post_review(self, number, head, event, body):
         if event == "REQUEST_CHANGES" and self.refuse_request_changes:
@@ -97,13 +104,14 @@ def cfg(**kw):
     return core.Config(**base)
 
 
-def event(action="auto_merge_enabled", head=HEAD):
-    return core.Event(action=action, number=7, head_sha=head, base_ref="main", repo=REPO)
+def event(action="auto_merge_enabled", head=HEAD, base="main", attempt=1):
+    return core.Event(action=action, number=7, head_sha=head, base_ref=base, repo=REPO,
+                      default_branch="main", run_attempt=attempt)
 
 
-def run(gh, model=None, action="auto_merge_enabled", **kw):
+def run(gh, model=None, action="auto_merge_enabled", head=HEAD, base="main", attempt=1, **kw):
     model = model if model is not None else FakeModel()
-    out = core.run(event(action), cfg(**kw), gh, model)
+    out = core.run(event(action, head, base, attempt), cfg(**kw), gh, model)
     return out, model
 
 
@@ -112,10 +120,6 @@ def gate_review(verdict_, head, own_hash, state=None, rid=100, login=BOT):
     body = verdict.render_marker(KEY, verdict=verdict_, repo=REPO, number=7, head=head,
                                  own_hash=own_hash) + "\n\nbody"
     return Review(id=rid, login=login, state=state, commit_id=head, body=body)
-
-
-def owner_review(state, commit, rid=200):
-    return Review(id=rid, login=OWNER, state=state, commit_id=commit, body="")
 
 
 def own_hash_of(diff):
@@ -160,8 +164,9 @@ def test_unsupported_action_fails():
 def test_without_a_key_nothing_is_posted_or_trusted(action):
     # No key: no marker could be signed or verified.
     gh = FakeGitHub(reviews=[gate_review("pass", OLD, own_hash_of(DIFF), rid=5),
-                             owner_review("APPROVED", HEAD)])
-    out, model = run(gh, action=action, marker_key=b"")
+                             gate_review("block", HEAD, own_hash_of(DIFF), rid=6)],
+                    dismissals=[Dismissal(6, OWNER)])
+    out, model = run(gh, action=action, marker_key=b"", attempt=2)
     assert out.exit_code == 1 and "anthropic-api-key" in out.message
     assert gh.posted == [] and model.calls == []
 
@@ -206,12 +211,13 @@ def test_incomplete_model_answer_blocks_with_a_review():
     assert out.exit_code == 1 and gh.posted[0][0] == "REQUEST_CHANGES"
 
 
-def test_infra_failure_fails_without_a_review_so_a_rerun_retries():
+def test_infra_failure_fails_without_a_review_and_says_how_to_retry():
+    # A re-run never asks the model again, so the retry is an owner toggle.
     gh = FakeGitHub()
     out, _ = run(gh, FakeModel([PassResult("monitor_a", "ok", suspicion=1),
                                 PassResult("review", "infra", "api-timeout")]))
     assert out.exit_code == 1 and gh.posted == []
-    assert "api-timeout" in out.message
+    assert "api-timeout" in out.message and "re-enable auto-merge" in out.message
 
 
 def test_pass_dismisses_only_the_gates_own_earlier_blocks():
@@ -354,62 +360,32 @@ def test_synchronize_does_not_carry_a_pass_over_a_later_block_of_the_same_change
     assert model.calls == [] and gh.posted == []
 
 
-def test_a_replayed_pass_after_a_block_of_the_same_changes_does_not_carry_over():
-    # Another workflow running as github-actions[bot] can re-post a copy of a
-    # REAL pass marker after the gate blocked the same changes.
+
+def test_after_an_override_two_base_updates_in_a_row_carry_over():
+    # block -> owner dismisses -> override pass; then "Update branch" twice.
     h = own_hash_of(DIFF)
-    reviews = [gate_review("pass", OLD, h, rid=5), gate_review("block", OLD, h, rid=6),
+    reviews = [gate_review("block", OLD, h, rid=5, state="DISMISSED"),
                gate_review("pass", OLD, h, rid=7)]
-    gh = FakeGitHub(diff=shifted(DIFF), reviews=reviews)
+    gh = FakeGitHub(diff=shifted(DIFF), reviews=reviews, dismissals=[Dismissal(5, OWNER)])
     out, model = run(gh, action="synchronize")
-    assert out.exit_code == 1 and "re-enable auto-merge" in out.message
-    assert model.calls == [] and gh.posted == []
+    assert out.exit_code == 0 and model.calls == []
+    [(_, _, carried)] = gh.posted
+    assert "carried over" in carried
+    newer = Review(id=8, login=BOT, state="COMMENTED", commit_id=HEAD, body=carried)
+    gh2 = FakeGitHub(diff=shifted(DIFF, 80), head=NEWER, reviews=reviews + [newer])
+    out2, model2 = run(gh2, action="synchronize", head=NEWER)
+    assert out2.exit_code == 0 and model2.calls == []
+    assert "carried over" in gh2.posted[0][2]
 
 
-def test_a_bot_request_changes_with_its_marker_edited_away_still_guards_rerolls():
-    # The bot identity can edit a review body but not its state.
-    edited = Review(id=6, login=BOT, state="CHANGES_REQUESTED", commit_id=HEAD,
-                    body="looks fine now")
-    gh = FakeGitHub(reviews=[edited])
-    out, model = run(gh)
-    assert out.exit_code == 1 and "dismiss it" in out.message
-    assert model.calls == [] and gh.posted == []
-
-
-def test_owner_approval_cannot_clear_an_unverified_bot_block_without_a_model_review():
-    # A forged REQUEST_CHANGES plus one owner click must never merge code no
-    # model saw: only a VERIFIED gate block can be overridden by approval.
-    forged_cr = Review(id=6, login=BOT, state="CHANGES_REQUESTED", commit_id=HEAD, body="x")
-    gh = FakeGitHub(reviews=[forged_cr, owner_review("APPROVED", HEAD)])
-    out, model = run(gh)
-    assert out.exit_code == 1 and "dismiss it" in out.message
-    assert model.calls == [] and gh.posted == []
-
-
-def test_a_dismissed_unverified_bot_block_gets_a_full_model_review():
-    dismissed = Review(id=6, login=BOT, state="DISMISSED", commit_id=HEAD, body="x")
-    gh = FakeGitHub(reviews=[dismissed, owner_review("APPROVED", HEAD)])
-    out, model = run(gh)
-    assert len(model.calls) == 1 and out.exit_code == 0
-
-
-def test_a_block_of_the_same_changes_at_an_older_head_still_guards_rerolls():
-    # Amend/rebase to a new SHA with identical own changes is not a new review.
-    gh = FakeGitHub(reviews=[gate_review("block", OLD, own_hash_of(DIFF), rid=6)])
-    out, model = run(gh)
-    assert out.exit_code == 1 and "must" in out.message and "approve" in out.message
-    assert model.calls == [] and gh.posted == []
-
-
-def test_after_an_owner_override_a_base_update_carries_over():
-    # block X -> owner approves -> override pass X; then "Update branch".
+def test_the_newest_marker_decides_even_after_an_earlier_block_of_the_same_changes():
+    # Markers are signed, so a pass can't be minted; a replayed real pass
+    # only re-asserts content a model (or the owner) passed.
     h = own_hash_of(DIFF)
-    reviews = [gate_review("block", OLD, h, rid=5), owner_review("APPROVED", OLD, rid=6),
-               gate_review("pass", OLD, h, rid=7)]
+    reviews = [gate_review("block", OLD, h, rid=6), gate_review("pass", OLD, h, rid=7)]
     gh = FakeGitHub(diff=shifted(DIFF), reviews=reviews)
     out, model = run(gh, action="synchronize")
     assert out.exit_code == 0 and model.calls == []
-    assert "carried over" in gh.posted[0][2]
 
 
 def test_reopened_without_a_pass_fails_without_a_model_call():
@@ -465,20 +441,27 @@ def test_a_forged_bot_pass_does_not_carry_over(body):
 
 
 @pytest.mark.parametrize("body", forged_bodies("block", HEAD, "0" * 64))
-def test_a_forged_block_marker_in_a_comment_does_not_arm_the_reroll_guard(body):
+def test_a_forged_block_marker_in_a_comment_does_not_block_the_head(body):
     review = Review(id=100, login=BOT, state="COMMENTED", commit_id=HEAD, body=body)
     gh = FakeGitHub(reviews=[review])
     out, model = run(gh)
     assert len(model.calls) == 1 and out.exit_code == 0
 
 
+
 @pytest.mark.parametrize("body", forged_bodies("block", HEAD, "0" * 64))
-def test_any_bot_request_changes_on_the_head_arms_the_reroll_guard(body):
-    # Deliberate: state can't be edited, a marker can. A forged
-    # REQUEST_CHANGES only costs the owner an approval; it never passes code.
-    gh = FakeGitHub(reviews=[forged("block", HEAD, "0" * 64, body)])
+def test_an_unverified_bot_request_changes_is_not_a_gate_block(body):
+    # Only a verified block guards the head. A forged or edited one gets the
+    # owner's fresh review (attempt 1); a re-run never reaches the model.
+    gh = FakeGitHub(reviews=[forged("block", HEAD, "0" * 64, body)],
+                    dismissals=[Dismissal(100, OWNER)])
     out, model = run(gh)
-    assert out.exit_code == 1 and model.calls == []
+    assert len(model.calls) == 1 and out.exit_code == 0
+    gh2 = FakeGitHub(reviews=[forged("block", HEAD, "0" * 64, body)],
+                     dismissals=[Dismissal(100, OWNER)])
+    out2, model2 = run(gh2, attempt=2)
+    assert out2.exit_code == 1 and model2.calls == [] and gh2.posted == []
+
 
 
 @pytest.mark.parametrize("body", forged_bodies("block", OLD, "0" * 64))
@@ -510,79 +493,102 @@ def test_binary_content_change_breaks_carry_over():
     assert out.exit_code == 1 and gh2.posted == []
 
 
-# ----- override / reroll guard ------------------------------------------------------
+# ----- step 2: the base must be the default branch -----------------------------------
 
-def test_owner_approval_after_a_block_passes_without_model_call():
+@pytest.mark.parametrize("action", core.ACTIONS)
+def test_a_pr_into_another_branch_fails_without_review_or_model(action):
     h = own_hash_of(DIFF)
-    gh = FakeGitHub(reviews=[gate_review("block", HEAD, h, rid=1), owner_review("APPROVED", HEAD)])
-    out, model = run(gh)
+    gh = FakeGitHub(reviews=[gate_review("pass", OLD, h, rid=5)])
+    out, model = run(gh, action=action, base="release")
+    assert out.exit_code == 1 and "only reviews PRs into main" in out.message
+    assert gh.posted == [] and model.calls == []
+
+
+# ----- step 4: owner override by dismissing the gate's review ------------------------
+
+def blocked(**kw):
+    """A verified gate block on HEAD (review 1), as the fresh review left it."""
+    kw.setdefault("reviews", [gate_review("block", HEAD, own_hash_of(kw.get("diff", DIFF)),
+                                          rid=1, state="DISMISSED")])
+    return FakeGitHub(**kw)
+
+
+def test_owner_dismissal_then_rerun_is_an_override_pass_without_a_model_call():
+    gh = blocked(dismissals=[Dismissal(1, OWNER)])
+    out, model = run(gh, attempt=2)
     assert out.exit_code == 0 and model.calls == []
     [(ev, _, body)] = gh.posted
-    assert ev == "COMMENT" and "approval" in body.lower()
-    assert verdict.verify_marker(body, KEY, repo=REPO, number=7) == ("pass", HEAD, h)
-    assert gh.dismissed == [1]
+    assert ev == "COMMENT" and "dismiss" in body.lower()
+    assert verdict.verify_marker(body, KEY, repo=REPO, number=7) == ("pass", HEAD, own_hash_of(DIFF))
+    assert out.message == "passed (owner-override)"
 
 
-def test_approval_on_an_older_head_does_not_carry():
-    gh = FakeGitHub(reviews=[gate_review("block", HEAD, "0" * 64, rid=1), owner_review("APPROVED", OLD)])
-    out, model = run(gh)
-    assert out.exit_code == 1 and model.calls == [] and gh.posted == []
-    assert HEAD in out.message
+def test_owner_dismissal_compares_the_login_case_insensitively():
+    out, model = run(blocked(dismissals=[Dismissal(1, "Jonathan")]), attempt=2)
+    assert out.exit_code == 0 and model.calls == []
 
 
-def test_prior_block_without_approval_stays_blocked_without_model_call():
-    gh = FakeGitHub(reviews=[gate_review("block", HEAD, "0" * 64, rid=1)])
-    out, model = run(gh)
-    assert out.exit_code == 1 and model.calls == [] and gh.posted == []
+def test_owner_dismissal_also_overrides_on_an_auto_merge_toggle():
+    out, model = run(blocked(dismissals=[Dismissal(1, OWNER)]), attempt=1)
+    assert out.exit_code == 0 and model.calls == []
 
 
-def test_prior_block_posted_as_comment_fallback_still_counts():
+@pytest.mark.parametrize("dismissals", [
+    [],
+    [Dismissal(1, BOT)],                 # another workflow, or the gate itself
+    [Dismissal(1, "agent-bot[bot]")],
+    [Dismissal(2, OWNER)],               # some other review
+])
+@pytest.mark.parametrize("attempt", [1, 2])
+def test_without_the_owners_dismissal_a_blocked_head_stays_blocked(dismissals, attempt):
+    gh = blocked(dismissals=dismissals)
+    out, model = run(gh, attempt=attempt)
+    assert out.exit_code == 1 and "dismiss its review" in out.message
+    assert model.calls == [] and gh.posted == []
+
+
+def test_a_block_posted_as_a_comment_still_blocks_the_head():
     gh = FakeGitHub(reviews=[gate_review("block", HEAD, "0" * 64, rid=1, state="COMMENTED")])
     out, model = run(gh)
-    assert out.exit_code == 1 and model.calls == []
+    assert out.exit_code == 1 and model.calls == [] and "dismiss its review" in out.message
 
 
-def test_dismissed_prior_block_still_counts():
-    gh = FakeGitHub(reviews=[gate_review("block", HEAD, "0" * 64, rid=1, state="DISMISSED")])
+def test_a_dismissed_block_of_an_older_head_does_not_override_this_one():
+    h = own_hash_of(DIFF)
+    gh = FakeGitHub(reviews=[gate_review("block", OLD, h, rid=1, state="DISMISSED")],
+                    dismissals=[Dismissal(1, OWNER)])
+    out, model = run(gh, attempt=2)
+    assert out.exit_code == 1 and "re-run never asks the model" in out.message
+    assert model.calls == [] and gh.posted == []
+
+
+def test_a_block_of_the_same_changes_at_an_older_head_does_not_guard_an_owner_toggle():
+    # Deliberate: amend/rebase + an owner auto-merge click is a fresh review.
+    gh = FakeGitHub(reviews=[gate_review("block", OLD, own_hash_of(DIFF), rid=6)])
     out, model = run(gh)
-    assert out.exit_code == 1 and model.calls == []
+    assert len(model.calls) == 1 and out.exit_code == 0
 
 
-def test_approval_later_dismissed_does_not_override():
-    gh = FakeGitHub(reviews=[gate_review("block", HEAD, "0" * 64, rid=1),
-                             owner_review("DISMISSED", HEAD)])
-    out, _ = run(gh)
-    assert out.exit_code == 1
-
-
-def test_owner_changes_requested_after_approval_does_not_override():
-    gh = FakeGitHub(reviews=[gate_review("block", HEAD, "0" * 64, rid=1),
-                             owner_review("APPROVED", HEAD, rid=2),
-                             owner_review("CHANGES_REQUESTED", HEAD, rid=3)])
-    out, _ = run(gh)
-    assert out.exit_code == 1
-
-
-def test_approval_by_someone_else_does_not_override():
-    gh = FakeGitHub(reviews=[gate_review("block", HEAD, "0" * 64, rid=1),
-                             Review(id=9, login="agent-bot[bot]", state="APPROVED", commit_id=HEAD, body="")])
-    out, _ = run(gh)
-    assert out.exit_code == 1
+def test_the_timeline_is_read_only_when_this_head_has_a_gate_block():
+    gh = FakeGitHub()
+    run(gh)
+    assert gh.timeline_reads == 0
 
 
 def test_override_clears_path_and_binary_rules():
-    diff = DIFF.replace("src/app.py", ".github/workflows/ci.yml")
-    gh = FakeGitHub(diff=diff, reviews=[gate_review("block", HEAD, "0" * 64, rid=1),
-                                        owner_review("APPROVED", HEAD)])
-    out, _ = run(gh)
-    assert out.exit_code == 0
+    diff = DIFF.replace("src/app.py", ".github/workflows/ci.yml") + (
+        "diff --git a/logo.png b/logo.png\nnew file mode 100644\n"
+        "Binary files /dev/null and b/logo.png differ\n")
+    gh = blocked(diff=diff, files={"logo.png": b"\x89PNG\r\n\x1a\n"},
+                 dismissals=[Dismissal(1, OWNER)])
+    out, model = run(gh, attempt=2)
+    assert out.exit_code == 0 and model.calls == []
 
 
 def test_override_never_clears_hidden_unicode():
     diff = DIFF.replace("+    c = 4", '+    c = "\ufe01\ufe02"')
-    gh = FakeGitHub(diff=diff, reviews=[gate_review("block", HEAD, "0" * 64, rid=1),
-                                        owner_review("APPROVED", HEAD)])
-    out, model = run(gh)
+    gh = blocked(diff=diff, dismissals=[Dismissal(1, OWNER)])
+    out, model = run(gh, attempt=2)
     assert out.exit_code == 1 and model.calls == []
     assert gh.posted[0][0] == "REQUEST_CHANGES" and "hidden-unicode" in gh.posted[0][2]
 
@@ -590,24 +596,41 @@ def test_override_never_clears_hidden_unicode():
 def test_override_never_clears_lockfile_hosts():
     diff = ("diff --git a/uv.lock b/uv.lock\n--- a/uv.lock\n+++ b/uv.lock\n@@ -1 +1 @@\n"
             '-x\n+url = "https://evil.example/p.whl"\n')
-    gh = FakeGitHub(diff=diff, reviews=[gate_review("block", HEAD, "0" * 64, rid=1),
-                                        owner_review("APPROVED", HEAD)])
-    out, _ = run(gh)
+    gh = blocked(diff=diff, dismissals=[Dismissal(1, OWNER)])
+    out, _ = run(gh, attempt=2)
     assert out.exit_code == 1 and "lockfile-host" in gh.posted[0][2]
 
 
-def test_owner_approval_without_a_prior_block_still_gets_a_full_review():
-    gh = FakeGitHub(reviews=[owner_review("APPROVED", HEAD)])
-    _, model = run(gh)
-    assert len(model.calls) == 1
+def test_override_never_clears_a_text_file_with_binary_content():
+    diff = DIFF + ("diff --git a/src/x.js b/src/x.js\nnew file mode 100644\n"
+                   "Binary files /dev/null and b/src/x.js differ\n")
+    gh = blocked(diff=diff, files={"src/x.js": b"run();\n// \x00 hidden\n"},
+                 dismissals=[Dismissal(1, OWNER)])
+    out, model = run(gh, attempt=2)
+    assert out.exit_code == 1 and model.calls == []
+    assert "text-binary" in gh.posted[0][2]
 
 
-def test_auto_merge_toggle_does_not_reroll_a_blocked_head():
-    gh = FakeGitHub(reviews=[gate_review("block", HEAD, "0" * 64, rid=1)])
-    _, model = run(gh, action="auto_merge_enabled")
-    _, model2 = run(gh, action="reopened")
-    assert model.calls == [] and model2.calls == []
+# ----- step 5: a re-run never asks the model again --------------------------------
 
+def test_a_rerun_without_an_override_fails_without_a_model_call():
+    gh = FakeGitHub()
+    out, model = run(gh, attempt=2)
+    assert out.exit_code == 1 and "re-run never asks the model" in out.message
+    assert model.calls == [] and gh.posted == []
+
+
+def test_attempt_one_of_an_auto_merge_click_is_a_full_review():
+    gh = FakeGitHub()
+    out, model = run(gh, attempt=1)
+    assert out.exit_code == 0 and len(model.calls) == 1
+
+
+def test_a_rerun_of_a_carry_over_still_carries_over():
+    passed = gate_review("pass", OLD, own_hash_of(DIFF), rid=5)
+    gh = FakeGitHub(diff=shifted(DIFF), reviews=[passed])
+    out, model = run(gh, action="synchronize", attempt=3)
+    assert out.exit_code == 0 and model.calls == []
 
 # ----- config validation -------------------------------------------------------------
 

@@ -117,6 +117,7 @@ def test_dry_run_exceptions_file(tmp_path, capsys):
 
 def actions_env(tmp_path, **over):
     event = {"action": "auto_merge_enabled",
+             "repository": {"default_branch": "main"},
              "pull_request": {"number": 7, "head": {"sha": HEAD}, "base": {"ref": "main"}}}
     p = tmp_path / "event.json"
     p.write_text(json.dumps(event))
@@ -124,6 +125,7 @@ def actions_env(tmp_path, **over):
         "GITHUB_EVENT_NAME": "pull_request_target",
         "GITHUB_EVENT_PATH": str(p),
         "GITHUB_REPOSITORY": "o/r",
+        "GITHUB_RUN_ATTEMPT": "2",
         "GITHUB_API_URL": "https://api.github.test",
         "GITHUB_GRAPHQL_URL": "https://api.github.test/graphql",
         "PR_GATE_OWNER": "jonathan",
@@ -149,7 +151,8 @@ def test_actions_mode_maps_env_to_config_and_event(tmp_path, capsys, monkeypatch
     monkeypatch.setattr(cli.core, "run", fake_run)
     code = cli.main([], env=actions_env(tmp_path))
     assert code == 0
-    assert seen["ev"] == core.Event("auto_merge_enabled", 7, HEAD, "main", "o/r")
+    assert seen["ev"] == core.Event("auto_merge_enabled", 7, HEAD, "main", "o/r",
+                                    default_branch="main", run_attempt=2)
     c = seen["cfg"]
     assert (c.owner, c.model, c.effort, c.threshold, c.exceptions, c.marker_key) == (
         "jonathan", "claude-opus-5-5", "high", 25, [".claude/*"], b"sk-ant-x")
@@ -170,6 +173,24 @@ def test_actions_mode_refuses_other_events(tmp_path, capsys):
 def test_actions_mode_config_errors_fail(tmp_path, capsys, over):
     code = cli.main([], env=actions_env(tmp_path, **over))
     assert code == 1 and "::error::" in capsys.readouterr().out
+
+
+@pytest.mark.parametrize("over", [{"GITHUB_RUN_ATTEMPT": ""}, {"GITHUB_RUN_ATTEMPT": "x"}])
+def test_actions_mode_needs_the_run_attempt(tmp_path, capsys, monkeypatch, over):
+    monkeypatch.setattr(cli.core, "run", lambda *a: core.Outcome(0, "passed (full)"))
+    assert cli.main([], env=actions_env(tmp_path, **over)) == 1
+    assert "could not read" in capsys.readouterr().out
+
+
+def test_actions_mode_needs_the_default_branch(tmp_path, capsys, monkeypatch):
+    monkeypatch.setattr(cli.core, "run", lambda *a: core.Outcome(0, "passed (full)"))
+    env = actions_env(tmp_path)
+    p = tmp_path / "event.json"
+    payload = json.loads(p.read_text())
+    del payload["repository"]
+    p.write_text(json.dumps(payload))
+    assert cli.main([], env=env) == 1
+    assert "could not read" in capsys.readouterr().out
 
 
 def test_actions_mode_block_prints_an_error_annotation(tmp_path, capsys, monkeypatch):

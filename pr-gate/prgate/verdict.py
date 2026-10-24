@@ -130,9 +130,8 @@ def verify_marker(body, key: bytes | None, *, repo: str, number: int
 
 _MODE_LINE = {
     "full": "",
-    "owner-override": "Cleared by the owner's approval of this head commit after an "
-                      "earlier block; the model layers were not re-run. Only the "
-                      "always-on checks ran.",
+    "owner-override": "The owner dismissed the gate's block of this head commit; the "
+                      "model layers were not re-run. Only the always-on checks ran.",
     "carry-over": "The PR's own changes are identical to those of the gate's latest verdict, "
                   "a pass (a base-branch merge or a reopen), so that pass was carried over. "
                   "Only the always-on checks ran.",
@@ -160,7 +159,7 @@ def render_body(r: Result, *, key: bytes | None, repo: str, number: int, head: s
     if r.hits:
         out.append("**Deterministic checks**")
         for h in r.hits[:MAX_HITS]:
-            note = "" if h.overridable else " (not clearable by approval)"
+            note = "" if h.overridable else " (not clearable by override)"
             out.append(f"- {h.rule}{note}: {neutralise(h.path, 200)}: {neutralise(h.detail, 200)}")
         if len(r.hits) > MAX_HITS:
             out.append(f"- … and {len(r.hits) - MAX_HITS} more")
@@ -178,8 +177,8 @@ def render_body(r: Result, *, key: bytes | None, repo: str, number: int, head: s
         out += [f"- {neutralise(s.path, 200)}: {s.reason}" for s in r.scrutiny[:MAX_HITS]]
     if r.block:
         out.append(
-            f"**To clear a false alarm:** approve the PR at this head commit ({head}), "
-            "then re-run the failed ai-gate check. Hidden-Unicode and lockfile-host hits "
+            "**To clear a false alarm:** the owner dismisses this review, then re-runs the "
+            "failed ai-gate check. Hidden-Unicode, lockfile-host and text-binary hits "
             "cannot be cleared that way: fix the change instead.")
     body = "\n\n".join(out)
     if len(body) > MAX_BODY:

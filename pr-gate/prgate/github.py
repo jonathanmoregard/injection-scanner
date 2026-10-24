@@ -57,6 +57,12 @@ class Review:
     body: str
 
 
+@dataclass(frozen=True)
+class Dismissal:
+    review_id: int
+    actor: str         # who dismissed it; "" if GitHub omits the actor
+
+
 class GitHub:
     def __init__(self, token: str, repo: str, *, api_url: str, graphql_url: str,
                  urlopen=urllib.request.urlopen):
@@ -156,6 +162,30 @@ class GitHub:
             if len(items) < 100:
                 return out
         raise GitHubError("list-reviews")
+
+    def review_dismissals(self, number: int) -> list[Dismissal]:
+        """Every `review_dismissed` event on the PR's timeline, oldest first.
+        The timeline, not the review, records WHO dismissed a review."""
+        out: list[Dismissal] = []
+        for page in range(1, 31):
+            items = self._json("timeline", "GET",
+                               f"{self._api}/issues/{number}/timeline?per_page=100&page={page}")
+            if not isinstance(items, list):
+                raise GitHubError("timeline")
+            try:
+                for it in items:
+                    if it.get("event") != "review_dismissed":
+                        continue
+                    review_id = it["dismissed_review"]["review_id"]
+                    if type(review_id) is not int:
+                        raise TypeError
+                    out.append(Dismissal(review_id=review_id,
+                                         actor=str((it.get("actor") or {}).get("login") or "")))
+            except (KeyError, TypeError, AttributeError):
+                raise GitHubError("timeline") from None
+            if len(items) < 100:
+                return out
+        raise GitHubError("timeline")
 
     def post_review(self, number: int, head: str, event: str, body: str) -> None:
         self._json("post-review", "POST", f"{self._api}/pulls/{number}/reviews",

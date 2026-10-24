@@ -199,7 +199,8 @@ def test_body_lists_findings_by_severity_and_omits_analysis():
 
 def test_block_body_says_how_to_clear_it():
     body = _body(decide(passes=[ok(suspicion=80)]))
-    assert "approve" in body.lower() and HEAD in body and "re-run" in body.lower()
+    assert "dismisses this review" in body.lower() and "re-run" in body.lower()
+    assert "approve" not in body.lower()
 
 
 def test_body_reports_deterministic_hits_and_suspicion():
@@ -217,7 +218,7 @@ def test_body_is_bounded():
 
 
 def test_override_and_carry_over_modes_are_named():
-    assert "approval" in _body(decide(), mode="owner-override").lower()
+    assert "dismissed the gate's block" in _body(decide(), mode="owner-override").lower()
     assert "carried over" in _body(decide(), mode="carry-over").lower()
 
 
