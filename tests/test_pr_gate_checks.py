@@ -67,9 +67,10 @@ def test_binary_with_matching_magic_blocks_but_is_overridable():
     assert "png" in hit.detail and "mismatch" not in hit.detail
 
 
-def test_binary_magic_mismatch_is_called_out():
+def test_binary_magic_mismatch_is_called_out_and_not_overridable():
     [hit] = checks.binaries([fc("logo.png", binary=True, status="added")], {"logo.png": ELF})
     assert "mismatch" in hit.detail and "elf" in hit.detail and "executable" in hit.detail
+    assert (hit.rule, hit.overridable) == ("text-binary", False)
 
 
 def test_unknown_binary_content():
@@ -101,7 +102,7 @@ def test_a_text_file_git_treats_as_binary_is_not_overridable(path, data):
     contents = {} if data is None else {path: data}
     [hit] = checks.binaries([fc(path, binary=True)], contents)
     assert (hit.rule, hit.overridable) == ("text-binary", False)
-    assert hit.detail == "text file with binary content (e.g. NUL bytes); no reviewer can see it"
+    assert hit.detail == checks.TEXT_BINARY
 
 
 @pytest.mark.parametrize("path,data", [
@@ -160,6 +161,43 @@ def test_extensionless_or_shebang_files_are_text_binary(path, data):
 def test_real_binaries_stay_overridable(path, data):
     [hit] = checks.binaries([fc(path, binary=True)], {path: data})
     assert (hit.rule, hit.overridable) == ("binary", True)
+
+
+# Round 7: text types a text-extension list missed. Only a known binary
+# type is overridable now, so every one of these is text-binary.
+_ROUND7_TEXT_EXTS = "vbs pyw csproj props targets sln reg mdx htm jsonl el vim service mod sum fs clj".split()
+
+
+@pytest.mark.parametrize("ext", _ROUND7_TEXT_EXTS)
+def test_any_type_not_known_to_be_binary_is_text_binary(ext):
+    path = f"src/x.{ext}"
+    [hit] = checks.binaries([fc(path, binary=True)], {path: b"x = 1\n\x00 hidden\n"})
+    assert (hit.rule, hit.overridable) == ("text-binary", False)
+
+
+def test_utf16_text_is_text_binary():
+    data = "\ufeff/* strings */ \"a\" = \"b\";\n".encode("utf-16-le")
+    [hit] = checks.binaries([fc("ios/Localizable.strings", binary=True)],
+                            {"ios/Localizable.strings": data})
+    assert (hit.rule, hit.overridable) == ("text-binary", False)
+
+
+@pytest.mark.parametrize("path,data", [
+    ("logo.png", PNG), ("a.zip", b"PK\x03\x04" + b"\x00" * 20),
+    ("a-1.0-py3-none-any.whl", b"PK\x03\x04" + b"\x00" * 20),
+    ("f.woff2", b"wOF2" + b"\x00" * 20),
+    ("clip.mp4", b"\x00\x00\x00\x18ftypmp42" + b"\x00" * 20),  # no magic entry: fine
+    ("model.onnx", b"\x08\x07\x12\x00"),
+])
+def test_known_binary_types_are_overridable(path, data):
+    [hit] = checks.binaries([fc(path, binary=True)], {path: data})
+    assert (hit.rule, hit.overridable) == ("binary", True)
+
+
+@pytest.mark.parametrize("path", ["logo.png", "clip.mp4", "blob.dat"])
+def test_a_known_binary_type_starting_with_a_shebang_is_text_binary(path):
+    [hit] = checks.binaries([fc(path, binary=True)], {path: b"#!/bin/sh\n\x00echo hi\n"})
+    assert (hit.rule, hit.overridable) == ("text-binary", False)
 
 
 def test_a_deleted_text_binary_is_not_a_hit():

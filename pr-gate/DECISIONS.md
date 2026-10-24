@@ -250,25 +250,28 @@ it, each with the reason. Design: `docs/superpowers/specs/2026-10-24-pr-gate-des
     pure function over them.
 23. **Binary magic** table covers common images, fonts, archives, PDF, and
     executables (ELF, PE, Mach-O, wasm, `#!` scripts); executables are
-    labelled. Every binary blocks either way (design option (a)). A binary
-    with a source/text extension (js, py, sh, json, yaml, toml, md, lock,
-    svg, ... see `_TEXT_EXTS`) is a NON-overridable `text-binary` hit,
-    whatever its magic: git calls it binary (e.g. a NUL byte in a comment),
-    so no model, Unicode or lockfile check sees it, and an ASCII magic
-    (`MZ`, `BZh`, `GIF89a`, `#!`) is trivial to put at the top of a text
-    file. A real binary renamed to a text extension blocks the same way.
-    The same holds for a git-binary file that is text by name or shape
-    (`_text_file`): a known text file name, casefolded (`Makefile`,
-    `GNUmakefile`, `Dockerfile`, `Containerfile`, `Gemfile`, `Rakefile`,
-    `Vagrantfile`, `Jenkinsfile`, `Procfile`, `Brewfile`, `justfile`,
-    `Podfile`, `.gitattributes`, `.gitmodules`, `.gitignore`, `.npmrc`,
-    `.yarnrc`, `.editorconfig`, `.envrc`, `Dockerfile.*`, `*.dockerfile`);
-    no extension at all (scripts like `bin/run`, dotfiles); or content
-    starting with `#!`. Otherwise an owner dismissal of the overridable
-    `binary` hit would merge a Makefile or a `bin/run` nobody saw. Cost: a
-    real extensionless binary (a compiled `bin/tool`) cannot be overridden
-    either; it needs an extension or a CI build. Other git-binary files
-    (`.png`, `.zip`, `.whl`, `.dat`, ...) keep the overridable `binary` hit.
+    labelled. Every binary blocks either way (design option (a)). Which
+    git-binary files the owner may override is an ALLOWLIST (replaces the
+    round-5/6 text-extension and text-name denylists, which kept missing
+    types: `.vbs .pyw .csproj .props .targets .sln .reg .mdx .htm .jsonl
+    .el .vim .service .mod .sum .fs .clj`, and UTF-16 text is git-binary
+    whatever its name). A git-binary file gets the overridable `binary` hit
+    only if its extension is in `_KNOWN_BINARY` (`prgate/checks.py`: the
+    `_EXT_KIND` magic table's extensions plus common binary types with no
+    magic entry: more images, audio/video, `eot`, archives and packages,
+    native libraries and executables, `class`/`pyc`, databases, `mo`, data
+    and model files, legacy and OpenDocument office files, key stores,
+    `bin`, `dat`) AND its magic does not contradict it. Everything else is
+    the NON-overridable `text-binary` hit: an unknown type, no extension, a
+    `#!` start whatever the extension (an ASCII magic like `#!`, `MZ`,
+    `BZh` is trivial to put at the top of a text file whose NUL byte hides
+    the rest), and a known type whose recognised magic is a different kind
+    (`logo.png` holding ELF), which keeps the "mismatch: content is X,
+    extension says Y" detail. Unrecognised magic on a known type is not a
+    contradiction (many formats have no table entry). Cost: unknown binary
+    types are non-overridable until added to the set, and so is a binary
+    whose real kind differs from its extension's (a CFF font named `.ttf`):
+    rename it to match, build it in CI, or extend the set.
 24. **Extra scrutiny** (listed to the model, never blocks): `*.nix`,
     lockfiles, `build.rs`, install/setup scripts, package manifests and
     `.gitattributes`/`.gitmodules`/`.npmrc`, minified or vendored paths,

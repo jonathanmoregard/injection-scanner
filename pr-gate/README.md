@@ -54,14 +54,15 @@ the base branch). In order, failing closed at every step:
      whitespace, since pip joins them all). Any URL form a package manager
      accepts counts (`https:evil.x`, `https:\\evil.x`, escaped slashes, IPv6
      hosts). **Never overridable.**
-   - a source/text file that git treats as binary, e.g. because of a NUL
-     byte, whatever its first bytes look like: no model and no other check
-     can see it. That is a text extension (`.js`, `.py`, `.lock`, `.md`,
-     `.tf`, ...), a known text file name (`Makefile`, `Dockerfile`,
-     `.gitattributes`, ...), a file with no extension, or one starting with
-     `#!`. **Never overridable.**
-   - other added or modified binary files, with a magic-byte vs extension
-     check.
+   - a file git treats as binary (so no model and no other check can see
+     it) that is not a known binary type: a text file with a NUL byte (`.js`,
+     `.vbs`, `.csproj`, ...), UTF-16 text, a file with no extension, one
+     starting with `#!`, or one whose magic bytes contradict its extension.
+     The known binary types (images, audio/video, fonts, archives, packages,
+     executables and libraries, data and model files, ...) are the set
+     `_KNOWN_BINARY` in `prgate/checks.py`. **Never overridable.**
+   - other added or modified binary files (a known binary type whose magic
+     bytes match or are not recognised).
    - changes under `.github/` and to agent-instruction files (`CLAUDE.md`,
      `AGENTS.md`, `.claude/`, `.codex/`, `.mcp.json`).
    - a diff over 400 kB (too large for the model passes).
@@ -191,9 +192,11 @@ their maximum suspicion.
   get past a strong monitor roughly 40% of the time. This is a tripwire that
   forces a human look, not a guarantee.
 - Binary files are blocked, not scanned (malware scanning is a follow-up).
-  A real binary with no extension (a compiled executable such as `bin/tool`)
-  or one starting with `#!` counts as a text file git calls binary, so the
-  owner cannot override it: give it an extension, or build it in CI.
+  A binary whose type is not in `_KNOWN_BINARY` (`prgate/checks.py`),
+  including one with no extension (a compiled `bin/tool`), one starting
+  with `#!`, or one whose content contradicts its extension (a TrueType
+  font named `.otf`), cannot be overridden: give it a known, matching
+  extension, build it in CI, or add the type to the set in a gate change.
 - Carry-over compares the PR's own changes without line offsets, so base
   merges keep a pass. The price: a push that moves an added line to
   another spot with the same three context lines above and below (repeated
