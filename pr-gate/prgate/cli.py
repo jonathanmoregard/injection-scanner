@@ -19,7 +19,7 @@ from . import checks, core, llm, verdict
 from .github import GitHub
 from .llm import PassResult
 
-PASS_NAMES = ("monitor_a", "monitor_b", "review")
+PASS_NAMES = llm.PASS_NAMES
 
 
 def escape_command(text: str) -> str:
@@ -143,7 +143,8 @@ def _dry_run(args, env) -> int:
         return contents, omitted
 
     review_fn = (lambda *a: []) if args.no_llm else make_review_fn(env, cfg)
-    result = core.full_review(g, cfg, review_fn, local_contents)
+    result = core.full_review(g, cfg, review_fn, local_contents,
+                              require_passes=not args.no_llm)
     llm_state = "skipped" if args.no_llm else (
         "ran" if result.passes else "skipped: diff too large")
     out = {

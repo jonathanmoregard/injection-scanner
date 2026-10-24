@@ -189,7 +189,12 @@ it, each with the reason. Design: `docs/superpowers/specs/2026-10-24-pr-gate-des
     than `pull_request_target`, fail.
 19. The three passes run concurrently (three threads), each with a 600 s
     timeout and 2 SDK retries; `max_tokens` 16000; no temperature or thinking
-    parameters; effort always sent.
+    parameters; effort always sent. A full review fails closed unless
+    exactly the three passes (`monitor_a`, `monitor_b`, `review`) came
+    back, each with a known status (`ok`, `incomplete`, `infra`; the last
+    two block on their own): a missing, duplicated, unknown or
+    odd-status pass adds "reviewer passes missing or malformed". Only
+    dry-run `--no-llm` skips this, explicitly.
 20. Monitors return `analysis` (investigate-then-score), `suspicion`,
     `findings`. `analysis` is never posted to the PR or the log; dry-run
     prints it for calibration.

@@ -80,6 +80,14 @@ def test_dry_run_markers_are_never_signed(tmp_path, capsys, monkeypatch):
     assert "sk-ant-dry-secret" not in raw.out + raw.err
 
 
+def test_a_dry_run_with_the_model_but_no_passes_blocks(tmp_path, capsys, monkeypatch):
+    monkeypatch.setattr(cli.llm, "run_passes", lambda client, **kw: [])
+    code = cli.main(["--dry-run", "--diff", write(tmp_path, "d.diff", CLEAN)],
+                    env={"ANTHROPIC_API_KEY": "sk-ant-test"})
+    out = json.loads(capsys.readouterr().out)
+    assert code == 1 and out["verdict"] == "block"
+
+
 def test_dry_run_without_key_is_a_setup_error(tmp_path, capsys):
     code = cli.main(["--dry-run", "--diff", write(tmp_path, "d.diff", CLEAN)], env={})
     assert code == 2

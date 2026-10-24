@@ -262,6 +262,23 @@ def test_incomplete_model_answer_blocks_with_a_review():
     assert out.exit_code == 1 and gh.posted[0][0] == "REQUEST_CHANGES"
 
 
+@pytest.mark.parametrize("passes", [
+    [],
+    [PassResult("monitor_a", "ok", suspicion=1), PassResult("review", "ok")],
+    [PassResult("monitor_a", "ok", suspicion=1), PassResult("monitor_a", "ok", suspicion=1),
+     PassResult("review", "ok")],
+    [PassResult("monitor_a", "ok", suspicion=1), PassResult("monitor_b", "ok", suspicion=1),
+     PassResult("other", "ok")],
+    [PassResult("monitor_a", "ok", suspicion=1), PassResult("monitor_b", "weird", suspicion=1),
+     PassResult("review", "ok")],
+])
+def test_a_full_review_without_all_three_passes_ok_never_passes(passes):
+    gh = FakeGitHub()
+    out, _ = run(gh, FakeModel(passes))
+    assert out.exit_code == 1
+    assert [ev for ev, _, _ in gh.posted] in ([], ["REQUEST_CHANGES"])
+
+
 def test_infra_failure_fails_without_a_review_and_says_how_to_retry():
     # A re-run never asks the model again, so the retry is an owner toggle.
     gh = FakeGitHub()

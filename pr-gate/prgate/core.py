@@ -32,7 +32,7 @@ from typing import Callable
 from . import checks, verdict
 from .diffparse import DiffError, FileChange, own_changes_hash, parse
 from .github import GitHubError, Review, TooLarge
-from .llm import EFFORTS, PassResult, is_config_error
+from .llm import EFFORTS, PASS_NAMES, STATUSES, PassResult, is_config_error
 
 GATE_LOGIN = "github-actions[bot]"
 ACTIONS = ("auto_merge_enabled", "synchronize", "reopened")
@@ -164,11 +164,16 @@ def gather_from(diff_bytes: bytes, fetch_binary: Callable[[str], bytes],
 
 
 def full_review(g: Gathered, cfg: Config, review_fn: ReviewFn,
-                fetch_contents: Callable[[], tuple[dict[str, str], list[str]]]) -> verdict.Result:
-    """Step 6: every deterministic check, then the model passes."""
+                fetch_contents: Callable[[], tuple[dict[str, str], list[str]]], *,
+                require_passes: bool = True) -> verdict.Result:
+    """Step 6: every deterministic check, then the model passes. Fails
+    closed unless exactly the three passes came back, each with a known
+    status (anything but "ok" blocks in `decide`). `require_passes=False`
+    is dry-run --no-llm only."""
     hits, scrutiny = checks.run_all(g.files, g.binaries, cfg.exceptions, g.lockfiles)
     passes: list[PassResult] = []
-    if len(g.diff_bytes) > DIFF_LLM_CAP:
+    asked = len(g.diff_bytes) <= DIFF_LLM_CAP
+    if not asked:
         hits.append(checks.Hit("too-large", "(whole diff)",
                                f"diff is too large for the AI gate ({len(g.diff_bytes)} bytes, "
                                f"limit {DIFF_LLM_CAP}); human review", True))
@@ -176,7 +181,13 @@ def full_review(g: Gathered, cfg: Config, review_fn: ReviewFn,
         contents, omitted = fetch_contents()
         passes = review_fn(g.diff_text, contents,
                            [(s.path, s.reason) for s in scrutiny], omitted)
-    return verdict.decide(hits, scrutiny, passes, cfg.threshold)
+    result = verdict.decide(hits, scrutiny, passes, cfg.threshold)
+    if require_passes and asked and not (
+            sorted(p.name for p in passes) == sorted(PASS_NAMES)
+            and all(p.status in STATUSES for p in passes)):
+        result.reasons.append("reviewer passes missing or malformed")
+        result.block = True
+    return result
 
 
 def _gate_reviews(reviews: list[Review], ev: Event, key: bytes):

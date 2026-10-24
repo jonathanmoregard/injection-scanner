@@ -318,6 +318,10 @@ def call(client, name: str, *, kind: str, model: str, effort: str,
     return result
 
 
+PASS_NAMES = ("monitor_a", "monitor_b", "review")
+STATUSES = ("ok", "incomplete", "infra")
+
+
 def run_passes(client, *, model: str, effort: str, diff_text: str,
                contents: dict[str, str], scrutiny: list[tuple[str, str]],
                omitted: list[str]) -> list[PassResult]:

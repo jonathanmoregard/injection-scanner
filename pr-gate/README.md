@@ -96,8 +96,9 @@ the base branch). In order, failing closed at every step:
    comments never reach a model.
 8. **Verdict.** Block on any deterministic hit, max suspicion at or above the
    threshold, any `malicious` or `obscure` finding of medium or high severity,
-   any high `security` finding, or any pass that did not complete (refusal,
-   truncation, malformed output) or was declined by the configured model.
+   any high `security` finding, any pass that did not complete (refusal,
+   truncation, malformed output) or was declined by the configured model,
+   or a review missing any of the three passes.
    Bugs never block.
 9. **Report.** One review on the head commit. Block: REQUEST_CHANGES (COMMENT
    if GitHub refuses it), check fails. Pass: COMMENT, the gate dismisses its
