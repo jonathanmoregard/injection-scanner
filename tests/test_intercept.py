@@ -296,8 +296,8 @@ def test_quota_degradation_uses_strict_benign_arbitration(
         ("pass", "model_armor_unavailable:no-key", "model_armor_unavailable:no-key"),
         ("lakera_unavailable:throttled", "model_armor_unavailable:limiter-error",
          "model_armor_unavailable:limiter-error"),
-        ("lakera:prompt_attack", "model_armor_unavailable:not-implemented",
-         "model_armor_unavailable:not-implemented"),
+        ("lakera:prompt_attack", "model_armor_unavailable:skipped",
+         "model_armor_unavailable:skipped"),
     ],
 )
 def test_a_non_quota_shortfall_rejects_before_any_arbitration(

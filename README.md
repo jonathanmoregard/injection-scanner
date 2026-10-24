@@ -43,11 +43,40 @@ Quota-class is exact membership in `<vendor>_unavailable:HTTPError:429` and `<ve
 | Reason | Meaning |
 |---|---|
 | `model_armor:prompt_attack` | Model Armor flagged the text. |
-| `model_armor_unavailable:no-key` | `MODEL_ARMOR_CREDENTIALS_FILE` unset. |
-| `model_armor_unavailable:not-implemented` | A credential is set, but the adapter's transport is not implemented yet. |
+| `model_armor_unavailable:no-key` | No service-account key (`MODEL_ARMOR_CREDENTIALS_FILE`, `MODEL_ARMOR_CREDENTIALS`, keyring `model-armor-sa-key`). |
+| `model_armor_unavailable:key-config-error` | The key file is unreadable, or the key is not a `service_account` JSON with `token_uri` exactly `https://oauth2.googleapis.com/token` and an RSA `private_key`. |
+| `model_armor_unavailable:url-config-error` | `MODEL_ARMOR_PROJECT`, `MODEL_ARMOR_LOCATION` or `MODEL_ARMOR_TEMPLATE` missing or not a valid id. |
+| `model_armor_unavailable:too-large` | Text longer than `INJECTION_SCANNER_MODEL_ARMOR_MAX_CHARS`; not sent. |
+| `model_armor_unavailable:token-error` / `token-error:<status>` | The OAuth token exchange failed: network error or malformed token response / HTTP status (a 3xx included — redirects are refused). Hard. |
+| `model_armor_unavailable:throttled` | As for every vendor, plus: the monthly token budget is spent. Quota-class. |
+| `model_armor_unavailable:limiter-error` | As for every vendor, plus: the monthly budget ledger is unusable. Hard. |
+| `model_armor_unavailable:skipped` | The prompt-injection filter reported `EXECUTION_SKIPPED`. Hard. |
+| `model_armor_unavailable:partial-invocation` | `invocationResult` was `PARTIAL` or `FAILURE`. Hard. |
+| `model_armor_unavailable:bad-response` | Any other response shape. |
 | `<vendor>_unavailable:bad-result` | An adapter returned something outside its closed vocabulary. |
 | `l2_unavailable:unhandled:<ExcType>` | The panel machinery itself failed. |
 | `l2_arbitration:<judge reason>` | L4 arbitration after `flagged` / `degraded-quota` did not return `benign-unanimous`. |
+
+### Model Armor
+
+`modelarmor.check()` calls Google Cloud Model Armor's `sanitizeUserPrompt` and reads only the `pi_and_jailbreak` filter: `MATCH_FOUND` is `model_armor:prompt_attack`, `NO_MATCH_FOUND` is `pass`, anything else is a shortfall (see the reasons above). The whole text goes in one request; the filter accepts 65,536 tokens.
+
+| Setting | Meaning |
+|---|---|
+| `MODEL_ARMOR_CREDENTIALS_FILE` | Path to a service-account JSON key (agenix pattern). Also `MODEL_ARMOR_CREDENTIALS` (the JSON itself) or the keyring entry `app=research-agent, key=model-armor-sa-key`; same FILE > env > keyring precedence as every key. |
+| `MODEL_ARMOR_PROJECT` | GCP project id (`[a-z][a-z0-9-]{4,28}[a-z0-9]`). |
+| `MODEL_ARMOR_LOCATION` | Region (`europe-west4`) or multi-region (`eu`, `us`). |
+| `MODEL_ARMOR_TEMPLATE` | Template id (`[A-Za-z0-9_-]{1,63}`). |
+| `INJECTION_SCANNER_MODEL_ARMOR_MAX_CHARS` | Default `240000`, clamp `[1000, 262144]`. Longer text is `too-large` and never sent. |
+| `INJECTION_SCANNER_MODEL_ARMOR_MONTHLY_TOKENS` | Default `1900000`, clamp `[0, 100000000]`. Fleet-wide monthly token budget; `0` refuses every call. |
+
+The endpoint is built from the three ids, never read from the environment: `https://modelarmor.<location>.rep.googleapis.com/v1/projects/<project>/locations/<location>/templates/<template>:sanitizeUserPrompt`, then checked against that exact destination before the token is attached.
+
+**The template** should enable the prompt-injection and jailbreak filter only, at confidence `MEDIUM_AND_ABOVE`, with template logging off so report text is not written to Cloud Logging. Results of any other filter are ignored; the always-on CSAM filter is expected in the response and does not matter.
+
+**Auth.** The service account needs `roles/modelarmor.user` on the project. The scanner signs an RS256 JWT with the key (`cryptography`) and trades it at `https://oauth2.googleapis.com/token` for an access token, through the same hardened opener as every vendor call (pinned URL, no redirects, no proxy, capped read, strict 200) but without spending a limiter token. The token is cached in process until 5 minutes before it expires, keyed by the service account, and dropped on a 401. A token-endpoint 429 is reported as `model_armor_unavailable:HTTPError:429` (quota-class, like a 429 from Model Armor); every other token failure is `token-error`, hard.
+
+**Budget.** The free tier is 2M tokens a month and Google bills past it rather than refusing, so the scanner keeps its own ledger: `model_armor-budget.json` in the cache directory, `flock`ed and shared fleet-wide, reset on the UTC calendar month. Each call is charged Google's estimate (non-whitespace characters / 4, rounded up) after the limiter admits it and before it is sent, so a throttled call spends nothing. A spent budget is `throttled` (quota-class). A torn or foreign ledger is `limiter-error` rather than a silent reset, which would re-mint a month of billable calls; delete `model_armor-budget.json` to start the month over.
 
 ## Lakera rate limiting
 

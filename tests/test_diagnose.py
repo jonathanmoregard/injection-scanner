@@ -76,8 +76,44 @@ from injection_scanner.intercept import Verdict
             "model_armor: no credential (set MODEL_ARMOR_CREDENTIALS_FILE)",
         ),
         (
-            "model_armor_unavailable:not-implemented",
-            "model_armor: adapter not implemented yet",
+            "model_armor_unavailable:key-config-error",
+            "model_armor: credential configuration error (MODEL_ARMOR_CREDENTIALS_FILE "
+            "unreadable, or not a service-account key for oauth2.googleapis.com)",
+        ),
+        (
+            "model_armor_unavailable:url-config-error",
+            "model_armor: endpoint configuration error (MODEL_ARMOR_PROJECT / "
+            "MODEL_ARMOR_LOCATION / MODEL_ARMOR_TEMPLATE missing or invalid)",
+        ),
+        (
+            "model_armor_unavailable:too-large",
+            "model_armor: text over INJECTION_SCANNER_MODEL_ARMOR_MAX_CHARS, not sent",
+        ),
+        (
+            "model_armor_unavailable:skipped",
+            "model_armor: prompt-injection filter skipped (EXECUTION_SKIPPED)",
+        ),
+        (
+            "model_armor_unavailable:partial-invocation",
+            "model_armor: not every filter ran (invocationResult PARTIAL or FAILURE)",
+        ),
+        (
+            "model_armor_unavailable:token-error",
+            "model_armor: OAuth token exchange failed (network error or malformed "
+            "token response)",
+        ),
+        (
+            "model_armor_unavailable:token-error:400",
+            "model_armor: OAuth token exchange returned HTTP 400",
+        ),
+        (
+            "model_armor_unavailable:token-error:4000",
+            "model_armor: OAuth token exchange returned HTTP other",
+        ),
+        (
+            "model_armor_unavailable:limiter-error",
+            "model_armor: shared limiter or monthly budget ledger unusable (cache "
+            "directory, lock, IO error, or torn model_armor-budget.json)",
         ),
         (
             "model_armor_unavailable:HTTPError:429",
@@ -85,7 +121,8 @@ from injection_scanner.intercept import Verdict
         ),
         (
             "model_armor_unavailable:throttled",
-            "model_armor: local fleet budget exhausted or quota breaker open (throttled)",
+            "model_armor: local fleet budget or monthly token budget exhausted, or "
+            "quota breaker open (throttled)",
         ),
         (
             "model_armor_unavailable:bad-result",
@@ -178,6 +215,7 @@ def test_every_panel_vendor_has_a_diagnosis() -> None:
     from injection_scanner import l2
 
     for vendor in l2.VENDORS:
-        assert describe(f"{vendor}_unavailable:throttled") == (
-            f"{vendor}: local fleet budget exhausted or quota breaker open (throttled)"
-        )
+        # The generic fall-through renders the bare condition (`<vendor>: throttled`).
+        message = describe(f"{vendor}_unavailable:throttled")
+        assert message.startswith(f"{vendor}: ")
+        assert message.endswith("quota breaker open (throttled)")

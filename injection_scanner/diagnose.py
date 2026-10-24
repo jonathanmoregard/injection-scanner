@@ -49,8 +49,15 @@ _VENDOR_FIXED = {
     },
     "model_armor": {
         **_PANEL_FIXED,
+        "throttled": "local fleet budget or monthly token budget exhausted, or quota breaker open (throttled)",
+        "limiter-error": "shared limiter or monthly budget ledger unusable (cache directory, lock, IO error, or torn model_armor-budget.json)",
         "no-key": "no credential (set MODEL_ARMOR_CREDENTIALS_FILE)",
-        "not-implemented": "adapter not implemented yet",
+        "key-config-error": "credential configuration error (MODEL_ARMOR_CREDENTIALS_FILE unreadable, or not a service-account key for oauth2.googleapis.com)",
+        "url-config-error": "endpoint configuration error (MODEL_ARMOR_PROJECT / MODEL_ARMOR_LOCATION / MODEL_ARMOR_TEMPLATE missing or invalid)",
+        "too-large": "text over INJECTION_SCANNER_MODEL_ARMOR_MAX_CHARS, not sent",
+        "token-error": "OAuth token exchange failed (network error or malformed token response)",
+        "skipped": "prompt-injection filter skipped (EXECUTION_SKIPPED)",
+        "partial-invocation": "not every filter ran (invocationResult PARTIAL or FAILURE)",
         "bad-response": "unreadable or malformed Model Armor response",
     },
 }
@@ -136,6 +143,8 @@ def _vendor(vendor: str, rest: str) -> str:
     parts = rest.split(":")
     if parts[0] == "unhandled":
         return f"{vendor}: {_provider_signal(parts)}"
+    if parts[0] == "token-error" and len(parts) == 2:
+        return f"{vendor}: OAuth token exchange returned {_status_text(parts[1])}"
     exc = _seg(parts[0])
     if len(parts) > 1:
         return f"{vendor}: {_status_text(parts[1])} ({exc})"

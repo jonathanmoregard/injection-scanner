@@ -109,12 +109,19 @@ _SMOKE_ENV = (
     "INJECTION_SCANNER_SMOKE_LIVENESS_TTL_S",
 )
 
-# The panel floor and the Model Armor credential. Cleared so the suite always
-# measures the documented default floor (2) and a keyless Model Armor, whatever
-# the developer's shell exports.
+# The panel floor and Model Armor's credential, endpoint ids, size cap and
+# monthly budget. Cleared so the suite always measures the documented default
+# floor (2) and an unconfigured Model Armor, whatever the developer's shell
+# exports.
 _PANEL_ENV = (
     "INJECTION_SCANNER_L2_MIN_VERDICTS",
     "MODEL_ARMOR_CREDENTIALS_FILE",
+    "MODEL_ARMOR_CREDENTIALS",
+    "MODEL_ARMOR_PROJECT",
+    "MODEL_ARMOR_LOCATION",
+    "MODEL_ARMOR_TEMPLATE",
+    "INJECTION_SCANNER_MODEL_ARMOR_MAX_CHARS",
+    "INJECTION_SCANNER_MODEL_ARMOR_MONTHLY_TOKENS",
 )
 
 
