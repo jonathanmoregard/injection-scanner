@@ -91,6 +91,36 @@ def _unavailable(condition: str) -> VendorResult:
     return vendor_http.unavailable(VENDOR, condition)
 
 
+def _preflight() -> tuple[str, str] | str:
+    """`(key, url)`, or the closed condition that stops a call before anything
+    is sent: `key-config-error`, `no-key`, `url-config-error`.
+
+    The full destination is pinned before the key goes near a header; the
+    offending URL is never echoed. Shared by `check` and `ready`, so the boot
+    smoke refuses on exactly what a scan would.
+    """
+    try:
+        key = _lakera_key()
+    except KeyConfigError:
+        return "key-config-error"
+    if not key:
+        return "no-key"
+    url = os.environ.get("LAKERA_GUARD_URL") or _DEFAULT_URL
+    if not _is_trusted_endpoint(url):
+        return "url-config-error"
+    return key, url
+
+
+def ready() -> str | None:
+    """Panel readiness contract (see `l2.ready`): `None` when a call could be
+    sent, else the `lakera_unavailable:<condition>` reason `check` would
+    return before sending. No network, no limiter token."""
+    resolved = _preflight()
+    if isinstance(resolved, str):
+        return _unavailable(resolved).reason
+    return None
+
+
 def check(text: str, *, max_wait_s: float | None = None) -> VendorResult:
     """Classify `text` with Lakera Guard. FAIL-CLOSED at every step.
 
@@ -116,18 +146,10 @@ def check(text: str, *, max_wait_s: float | None = None) -> VendorResult:
     `max_wait_s` is how long this call may wait for a fleet token; `None`
     means `INJECTION_SCANNER_LAKERA_MAX_WAIT_S` (default 0).
     """
-    try:
-        key = _lakera_key()
-    except KeyConfigError:
-        return _unavailable("key-config-error")
-    if not key:
-        return _unavailable("no-key")
-
-    # The full destination is pinned before the key goes near a header; the
-    # offending URL is never echoed.
-    url = os.environ.get("LAKERA_GUARD_URL") or _DEFAULT_URL
-    if not _is_trusted_endpoint(url):
-        return _unavailable("url-config-error")
+    resolved = _preflight()
+    if isinstance(resolved, str):
+        return _unavailable(resolved)
+    key, url = resolved
 
     # Guard v2: the untrusted text as the most recent user message;
     # `breakdown: true` asks for per-detector results so the gate keys on the

@@ -9,9 +9,7 @@ from __future__ import annotations
 
 import pytest
 
-from injection_scanner import smoke
 from injection_scanner.diagnose import describe
-from injection_scanner.intercept import Verdict
 
 
 @pytest.mark.parametrize(
@@ -177,36 +175,6 @@ def test_out_of_vocabulary_segments_never_reach_the_message(reason: str) -> None
 def test_unknown_scenario_is_not_echoed() -> None:
     msg = describe("honeypot_unavailable:made_up_scenario:unavailable:no-openai-api-key")
     assert "unknown provider model unknown model" in msg
-
-
-def test_smoke_failure_names_the_honeypot_not_lakera(monkeypatch) -> None:
-    """End to end through run_smoke: the 2026-10-24 reason produces a message
-    that names the honeypot's OpenAI model and does not point at Lakera."""
-    reason = (
-        "honeypot:honeypot_unavailable:simulated_env_dump_in_history:"
-        "unavailable:openai-api-error:NotFoundError:404+skipped=2/6"
-    )
-    real = smoke._scan_via_path
-
-    def fake(payload, *, use_honeypot, use_l2=True):
-        if not use_honeypot:
-            return real(payload, use_honeypot=use_honeypot, use_l2=use_l2)
-        return Verdict(
-            ok=False,
-            reason=reason,
-            layers={"lakera": "pass", "honeypot": reason.removeprefix("honeypot:")},
-            sanitize_stats={},
-            sanitized_text=smoke._BENIGN_PROBE,
-        )
-
-    monkeypatch.setattr(smoke, "_scan_via_path", fake)
-    errors: list[str] = []
-    with pytest.raises(smoke.SmokeFailure) as excinfo:
-        smoke.run_smoke(log_info=lambda _m: None, log_error=errors.append)
-    msg = excinfo.value.reason
-    assert "honeypot: openai model gpt-4.1-mini" in msg
-    assert "HTTP 404" in msg
-    assert "LAKERA_API_KEY" not in msg
 
 
 def test_every_panel_vendor_has_a_diagnosis() -> None:

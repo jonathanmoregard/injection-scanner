@@ -45,7 +45,7 @@ import os
 from dataclasses import dataclass, field
 from typing import Literal
 
-from injection_scanner.honeypot import _seal, _with_retries
+from injection_scanner.honeypot import _seal, _with_retries, provider_unready
 from injection_scanner.http_status import status_suffix
 from injection_scanner.keyloader import KeyConfigError, load_key
 
@@ -258,6 +258,18 @@ async def _ask_one(judge: dict, sealed: str) -> JudgeVote:
     if judge["provider"] == "openai":
         return await _ask_openai(judge, sealed)
     return JudgeVote(judge["id"], "unavailable", "unknown-provider")
+
+
+def ready() -> str | None:
+    """`None` when every judge's provider could be called, else
+    `l2_arbitration:unavailable:<judge>:<signal>`: the reason a scan needing
+    arbitration would be rejected with. No call is made."""
+    loaders = {"anthropic": _anthropic_key, "openai": _openai_key}
+    for j in _JUDGES:
+        signal = provider_unready(j["provider"], loaders.get(j["provider"], lambda: None))
+        if signal is not None:
+            return f"l2_arbitration:unavailable:{j['id']}:{signal}"
+    return None
 
 
 async def _run_all(report_text: str) -> JudgeResult:

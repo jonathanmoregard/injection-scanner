@@ -32,12 +32,18 @@ another vendor's reason) across the scanner boundary.
 from __future__ import annotations
 
 import enum
+import os
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from typing import Callable, Mapping
 
 from injection_scanner import lakera, modelarmor
-from injection_scanner.throttle import env_int
+from injection_scanner.throttle import (
+    CrossProcessLimiter,
+    LimiterConfig,
+    env_int,
+    file_lock,
+)
 from injection_scanner.vendor_http import VendorResult
 
 # Fixed registry order: reasons are chosen "first in registry order", so the
@@ -200,3 +206,70 @@ def run(
         verdicts=verdicts,
         floor=floor,
     )
+
+
+# ---------- readiness: can each vendor be asked at all? ----------
+#
+# Deterministic and offline, for the boot smoke. No vendor call, no limiter
+# token, no breaker read: whether a vendor is UP is the scan path's question,
+# answered per scan, fail-closed and agent-readable. Readiness answers only
+# what refusing at boot is worth refusing on — setup errors that would fail
+# every scan.
+#
+# Adapter contract: a vendor module MAY define
+#
+#     def ready() -> str | None
+#
+# returning `None` when a call could be sent, else the closed
+# `<vendor>_unavailable:<condition>` reason its `check` would return before
+# sending (credential and endpoint/config resolution). It must not touch the
+# network. The limiter directory is checked here, once for every vendor,
+# because `vendor_http.paced_post` is shared. An adapter WITHOUT `ready` is
+# `<vendor>_unavailable:not-implemented`: readiness that cannot be vouched for
+# is not readiness.
+
+
+def _limiter_ready(vendor: str) -> str | None:
+    """The vendor's limiter state directory is usable: created or present,
+    owned and mode-safe (`file_lock` refuses otherwise), lockable within the
+    configured wait, writable, and its state file (if any) readable. Every
+    failure is the `limiter-error` a scan would hit."""
+    try:
+        limiter = CrossProcessLimiter.from_env(vendor)
+        with file_lock(limiter.lock_path, LimiterConfig.from_env(vendor).lock_wait_s):
+            if not os.access(limiter.lock_path.parent, os.W_OK | os.X_OK):
+                raise PermissionError("limiter directory not writable")
+            if limiter.state_path.exists():
+                limiter.state_path.read_bytes()
+    except Exception:  # noqa: BLE001 — any limiter fault fails the scan closed
+        return f"{vendor}_unavailable:limiter-error"
+    return None
+
+
+def _vendor_ready(vendor: str) -> str | None:
+    adapter_ready = getattr(_ADAPTERS[vendor], "ready", None)
+    if adapter_ready is None:
+        return f"{vendor}_unavailable:not-implemented"
+    try:
+        reason = adapter_ready()
+    except Exception as e:  # noqa: BLE001 — Invariant 3, as in `_run_one`
+        return f"{vendor}_unavailable:unhandled:{type(e).__name__}"
+    if reason is None:
+        return _limiter_ready(vendor)
+    if isinstance(reason, str) and reason.startswith(f"{vendor}_unavailable:"):
+        return reason
+    return f"{vendor}_unavailable:bad-result"
+
+
+def ready() -> str | None:
+    """`None` when at least `floor` vendors are ready, else the first
+    not-ready vendor's reason in registry order.
+
+    Mirrors `run`: below the floor every scan is UNAVAILABLE (no readiness
+    condition is quota-class), at or above it scans can still reach a verdict.
+    """
+    reasons = [_vendor_ready(name) for name in VENDORS]
+    not_ready = [r for r in reasons if r is not None]
+    if len(VENDORS) - len(not_ready) >= _floor(len(VENDORS)):
+        return None
+    return not_ready[0]

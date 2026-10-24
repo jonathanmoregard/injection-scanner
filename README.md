@@ -133,23 +133,21 @@ The final directory component is checked with `lstat` before every use. It must 
 
 Guard therefore screens content after the 8k mark, at least up to ~12k tokens, and no chunking is done. Larger texts (the biggest research reports reach ~95k characters, ~24k tokens) are unmeasured; re-run the same two-call probe at that size before relying on it.
 
-### The boot-smoke liveness cache
+### The boot smoke: deterministic readiness
 
-`run_smoke()` has two phases: deterministic canaries that touch no network, and one live probe that calls Lakera and the honeypot providers. Measured 2026-09-06, research-agent boot smokes alone ran **~632 per day** — one per server spawn, plus one per degraded recheck — about 19,000 a month against a 10,000-a-month quota, before a single report is scanned. Spawn frequency, not scan volume, is what exhausts the account, and one Claude Code session restore spawns six panes at once. The limiter bounds the RATE; only this reduces the DEMAND.
+`run_smoke()` makes **no network call and no vendor call**. It runs the deterministic canaries (one per detector class, through both `scan_text` and `scan(Path)`), then asks each remote layer whether a call *could* be made, and raises `SmokeFailure` naming the first layer that could not (`readiness check failed (<reason>). Failed layer — <diagnose.describe(reason)>.`):
 
-So a healthy scanner-stack probe is recorded in `smoke-liveness.json` and trusted fleet-wide for `INJECTION_SCANNER_SMOKE_LIVENESS_TTL_S` seconds: the second and every later spawn inside the TTL costs zero vendor calls. Healthy means either a full Lakera + honeypot pass, or exact quota pressure followed by a full strict honeypot pass and unanimous benign judge result. There is deliberately no single-flight, so panes that boot simultaneously — before the first probe has finished and recorded — all miss and all probe, a burst the limiter is there to bound. Recovery after an outage works the same way: degraded rechecks call `run_smoke()` too, so once one pane's recheck passes and records, every other pane's next recheck is served from the cache.
+| Layer | Checked | Reasons |
+|---|---|---|
+| L2 panel (`l2.ready()`) | per vendor: credential resolvable, endpoint/config valid (adapter `ready()`), limiter directory usable (owned, mode-safe, lockable, writable, state readable); passes while ready vendors ≥ the floor | `<vendor>_unavailable:no-key` / `key-config-error` / `url-config-error` / `limiter-error` / `not-implemented` (adapter has no `ready()`) |
+| L3 honeypot (`honeypot.ready()`) | each scenario's SDK importable and key resolvable | `honeypot_unavailable:<scenario>:unavailable:<signal>` |
+| L4 judge (`judge.ready()`) | each judge's SDK importable and key resolvable | `l2_arbitration:unavailable:<judge>:<signal>` |
 
-It is a cache in front of a probe, not a gate:
+An open breaker, quota or service, is **not** a readiness failure: it is vendor state, not setup, and reading it through the limiter would spend a token. The scan path handles it (quota fallback, or a fail-closed reject naming the outage).
 
-- Phase 1 always runs. It checks the installed scanner's own code, not the fleet's vendors.
-- A missing, corrupt, foreign-schema, unreadable or future-dated entry is a **miss** — the probe runs exactly as it did before. So is a cache directory that fails the ownership/mode policy above. An unwritable cache directory means the pass is simply not recorded. Nothing here can turn into fail-open.
-- A **failing** probe records nothing and raises as it always did, so one bad boot cannot silence the probe fleet-wide.
-- The file holds `{"schema": 1, "ok": true, "at": <epoch>}` — a boolean about the scanner stack and a timestamp, no reason string and no report bytes.
-- `0` disables it.
+Why no live probe: in research-agent the smoke is a serving gate, run on every server spawn and degraded recheck. A live probe there spent vendor quota on boots alone (measured 2026-09-06: ~632 a day against Lakera's 10,000 a month) and needed a fleet-wide liveness cache that could hide a pane-local fault behind a peer's pass. Its value was refusing early on setup errors; readiness keeps that without a call. A vendor outage surfaces at the first real scan instead: fail-closed, with the same agent-readable reason.
 
-**To force a fresh scanner-stack probe**, delete `smoke-liveness.json` from the cache directory, or set `INJECTION_SCANNER_SMOKE_LIVENESS_TTL_S=0`.
-
-What a stale cached pass can hide is an outage that began within the TTL. The server then boots "healthy" and the first real scan fails closed with the agent-readable infra reason: fail-closed and visibility are both preserved, and only the moment of discovery moves from spawn to first use. The sharper edge is that the hidden condition need not be temporal at all — a PANE-LOCAL fault, this process missing `LAKERA_API_KEY` or `ANTHROPIC_API_KEY` or running an older install, is papered over by a healthier peer's pass, because what is cached is a claim about the vendors and the reader cannot tell it apart from a claim about itself. Scans still fail closed (`lakera_unavailable:no-key` on the first one); what is lost is the boot banner that used to name the fault before any work arrived. `TTL=0` restores that per-boot diagnosis for an operator who wants it.
+Adapter contract: a panel adapter may define `ready() -> str | None`, returning `None` when a call could be sent, else the closed `<vendor>_unavailable:<condition>` reason its `check` would return before sending; no network. An exception is `<vendor>_unavailable:unhandled:<ExcType>`, an answer outside the vendor's namespace `<vendor>_unavailable:bad-result`.
 
 ### Quota fallback and fixed reasons
 
