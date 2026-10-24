@@ -63,7 +63,7 @@ def _actions(env) -> int:
             payload = json.load(fh)
         pr = payload["pull_request"]
         ev = core.Event(action=str(payload["action"]), number=int(pr["number"]),
-                        head_sha=str(pr["head"]["sha"]), base_ref=str(pr["base"]["ref"]),
+                        head_sha=str(pr["head"]["sha"]),
                         repo=env.get("GITHUB_REPOSITORY", ""),
                         default_branch=str(payload["repository"]["default_branch"]),
                         run_attempt=int(env.get("GITHUB_RUN_ATTEMPT") or ""))

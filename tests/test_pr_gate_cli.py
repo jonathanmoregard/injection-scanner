@@ -151,7 +151,7 @@ def test_actions_mode_maps_env_to_config_and_event(tmp_path, capsys, monkeypatch
     monkeypatch.setattr(cli.core, "run", fake_run)
     code = cli.main([], env=actions_env(tmp_path))
     assert code == 0
-    assert seen["ev"] == core.Event("auto_merge_enabled", 7, HEAD, "main", "o/r",
+    assert seen["ev"] == core.Event("auto_merge_enabled", 7, HEAD, "o/r",
                                     default_branch="main", run_attempt=2)
     c = seen["cfg"]
     assert (c.owner, c.model, c.effort, c.threshold, c.exceptions, c.marker_key) == (

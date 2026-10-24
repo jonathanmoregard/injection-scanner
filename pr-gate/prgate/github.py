@@ -16,12 +16,15 @@ from dataclasses import dataclass
 TIMEOUT_S = 60
 JSON_LIMIT = 20_000_000
 _REPO = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")
+_SHA = re.compile(r"^[0-9a-f]{40}$")
 
 _PULL_QUERY = """
 query($owner: String!, $name: String!, $number: Int!) {
   repository(owner: $owner, name: $name) {
     pullRequest(number: $number) {
       headRefOid
+      baseRefName
+      baseRefOid
       autoMergeRequest { enabledBy { login } }
     }
   }
@@ -46,6 +49,8 @@ class PullState:
     head_sha: str
     auto_merge: bool
     enabled_by: str | None
+    base_ref: str      # live base branch name, for the default-branch check
+    base_oid: str      # live base commit; the diff is taken against this, never a name
 
 
 @dataclass(frozen=True)
@@ -118,13 +123,21 @@ class GitHub:
             pr = data["data"]["repository"]["pullRequest"]
             amr = pr["autoMergeRequest"]
             enabled_by = (amr.get("enabledBy") or {}).get("login") if amr else None
+            base_oid = pr["baseRefOid"]
+            if not (isinstance(base_oid, str) and _SHA.match(base_oid)):
+                raise TypeError
             return PullState(head_sha=pr["headRefOid"], auto_merge=amr is not None,
-                             enabled_by=enabled_by)
+                             enabled_by=enabled_by, base_ref=str(pr["baseRefName"] or ""),
+                             base_oid=base_oid)
         except (KeyError, TypeError, AttributeError):
             raise GitHubError("pull-state") from None
 
-    def diff(self, base_ref: str, head: str, limit: int) -> bytes:
-        url = f"{self._api}/compare/{urllib.parse.quote(base_ref, safe='/')}...{head}"
+    def diff(self, base_oid: str, head: str, limit: int) -> bytes:
+        """base_oid...head. Commit oids only: a branch name could resolve to
+        a writer-pushed tag of the same name."""
+        if not (_SHA.match(base_oid or "") and _SHA.match(head or "")):
+            raise GitHubError("diff")
+        url = f"{self._api}/compare/{base_oid}...{head}"
         try:
             return self._request("diff", "GET", url, accept="application/vnd.github.diff",
                                  limit=limit)

@@ -13,6 +13,7 @@ from prgate.github import Dismissal, GitHub, GitHubError, TooLarge
 
 TOKEN = "ghs_SECRETTOKEN"
 HEAD = "c" * 40
+BASE = "b" * 40
 
 
 class Resp(io.BytesIO):
@@ -42,22 +43,38 @@ def gh(*responses):
                   graphql_url="https://api.github.test/graphql", urlopen=opener), opener
 
 
+def pull(**kw):
+    pr = {"headRefOid": HEAD, "baseRefName": "main", "baseRefOid": BASE,
+          "autoMergeRequest": {"enabledBy": {"login": "jonathan"}}}
+    pr.update(kw)
+    return {"data": {"repository": {"pullRequest": pr}}}
+
+
 def test_pull_state_from_graphql():
-    client, op = gh({"data": {"repository": {"pullRequest": {
-        "headRefOid": HEAD, "autoMergeRequest": {"enabledBy": {"login": "jonathan"}}}}}})
+    client, op = gh(pull())
     s = client.pull_state(7)
     assert (s.head_sha, s.auto_merge, s.enabled_by) == (HEAD, True, "jonathan")
+    assert (s.base_ref, s.base_oid) == ("main", BASE)
     [req] = op.requests
     assert req.get_method() == "POST" and req.full_url == "https://api.github.test/graphql"
     assert req.get_header("Authorization") == f"Bearer {TOKEN}"
     body = json.loads(req.data)
     assert body["variables"] == {"owner": "owner", "name": "repo", "number": 7}
-    assert "enabledBy" in body["query"]
+    assert "enabledBy" in body["query"] and "baseRefOid" in body["query"]
+
+
+@pytest.mark.parametrize("oid", [None, "main", "b" * 39, "B" * 40, "g" * 40, 40])
+def test_a_malformed_base_oid_fails_closed(oid):
+    # The compare call uses this oid; a branch name there could resolve to a
+    # writer-pushed tag of the same name.
+    client, _ = gh(pull(baseRefOid=oid))
+    with pytest.raises(GitHubError) as e:
+        client.pull_state(7)
+    assert e.value.op == "pull-state"
 
 
 def test_pull_state_without_auto_merge():
-    client, _ = gh({"data": {"repository": {"pullRequest": {
-        "headRefOid": HEAD, "autoMergeRequest": None}}}})
+    client, _ = gh(pull(autoMergeRequest=None))
     s = client.pull_state(7)
     assert (s.auto_merge, s.enabled_by) == (False, None)
 
@@ -69,18 +86,26 @@ def test_graphql_errors_fail_closed():
     assert "SECRET" not in str(e.value)
 
 
-def test_diff_request():
+def test_diff_compares_commit_oids():
     client, op = gh(b"diff --git a/x b/x\n")
-    assert client.diff("release/1.0", HEAD, 1000) == b"diff --git a/x b/x\n"
+    assert client.diff(BASE, HEAD, 1000) == b"diff --git a/x b/x\n"
     [req] = op.requests
-    assert req.full_url == f"https://api.github.test/repos/owner/repo/compare/release/1.0...{HEAD}"
+    assert req.full_url == f"https://api.github.test/repos/owner/repo/compare/{BASE}...{HEAD}"
     assert req.get_header("Accept") == "application/vnd.github.diff"
+
+
+@pytest.mark.parametrize("base,head", [("main", HEAD), (BASE, "main"), ("b" * 39, HEAD)])
+def test_diff_refuses_anything_but_commit_oids(base, head):
+    client, op = gh(b"x")
+    with pytest.raises(GitHubError):
+        client.diff(base, head, 1000)
+    assert op.requests == []
 
 
 def test_diff_over_limit_raises_too_large():
     client, _ = gh(b"x" * 11)
     with pytest.raises(TooLarge):
-        client.diff("main", HEAD, 10)
+        client.diff(BASE, HEAD, 10)
 
 
 def test_diff_406_means_too_large_not_a_retryable_error():
@@ -89,7 +114,7 @@ def test_diff_406_means_too_large_not_a_retryable_error():
     err = urllib.error.HTTPError("https://x", 406, "Not Acceptable", {}, io.BytesIO(b""))
     client, _ = gh(err)
     with pytest.raises(TooLarge):
-        client.diff("main", HEAD, 10)
+        client.diff(BASE, HEAD, 10)
 
 
 def test_406_from_other_endpoints_stays_a_github_error():

@@ -15,6 +15,7 @@ BOT = "github-actions[bot]"
 HEAD = "1" * 40
 OLD = "2" * 40
 NEWER = "3" * 40
+BASE_OID = "b" * 40
 KEY = b"sk-ant-gate-key"
 REPO = "jonathan/app"
 
@@ -38,8 +39,10 @@ def shifted(diff, delta=40):
 
 class FakeGitHub:
     def __init__(self, diff=DIFF, head=HEAD, enabled_by=OWNER, auto_merge=True,
-                 reviews=(), files=None, dismissals=()):
-        self.state = PullState(head_sha=head, auto_merge=auto_merge, enabled_by=enabled_by)
+                 reviews=(), files=None, dismissals=(), base_ref="main", base_oid=BASE_OID):
+        self.state = PullState(head_sha=head, auto_merge=auto_merge, enabled_by=enabled_by,
+                               base_ref=base_ref, base_oid=base_oid)
+        self.compared: list[tuple[str, str]] = []
         self.diff_text = diff
         self._reviews = list(reviews)
         self.files = files or {}
@@ -53,7 +56,8 @@ class FakeGitHub:
     def pull_state(self, number):
         return self.state
 
-    def diff(self, base_ref, head, limit):
+    def diff(self, base, head, limit):
+        self.compared.append((base, head))
         data = self.diff_text.encode()
         if len(data) > limit:
             raise TooLarge("diff")
@@ -104,14 +108,14 @@ def cfg(**kw):
     return core.Config(**base)
 
 
-def event(action="auto_merge_enabled", head=HEAD, base="main", attempt=1):
-    return core.Event(action=action, number=7, head_sha=head, base_ref=base, repo=REPO,
+def event(action="auto_merge_enabled", head=HEAD, attempt=1):
+    return core.Event(action=action, number=7, head_sha=head, repo=REPO,
                       default_branch="main", run_attempt=attempt)
 
 
-def run(gh, model=None, action="auto_merge_enabled", head=HEAD, base="main", attempt=1, **kw):
+def run(gh, model=None, action="auto_merge_enabled", head=HEAD, attempt=1, **kw):
     model = model if model is not None else FakeModel()
-    out = core.run(event(action, head, base, attempt), cfg(**kw), gh, model)
+    out = core.run(event(action, head, attempt), cfg(**kw), gh, model)
     return out, model
 
 
@@ -124,7 +128,7 @@ def gate_review(verdict_, head, own_hash, state=None, rid=100, login=BOT):
 
 def own_hash_of(diff):
     gh = FakeGitHub(diff=diff)
-    return core.gather(gh, event()).own_hash
+    return core.gather(gh, BASE_OID, event()).own_hash
 
 
 # ----- step 1: owner intent and freshness ---------------------------------------
@@ -486,7 +490,7 @@ def test_binary_content_change_breaks_carry_over():
     diff = DIFF + ("diff --git a/logo.png b/logo.png\nnew file mode 100644\n"
                    "Binary files /dev/null and b/logo.png differ\n")
     gh1 = FakeGitHub(diff=diff, files={"logo.png": b"\x89PNG\r\n\x1a\nAAAA"})
-    h1 = core.gather(gh1, event()).own_hash
+    h1 = core.gather(gh1, BASE_OID, event()).own_hash
     passed = gate_review("pass", OLD, h1, rid=5)
     gh2 = FakeGitHub(diff=shifted(diff), reviews=[passed], files={"logo.png": b"\x89PNG\r\n\x1a\nBBBB"})
     out, _ = run(gh2, action="synchronize")
@@ -497,11 +501,20 @@ def test_binary_content_change_breaks_carry_over():
 
 @pytest.mark.parametrize("action", core.ACTIONS)
 def test_a_pr_into_another_branch_fails_without_review_or_model(action):
+    # The live base, not the event payload's: a re-run replays the payload.
     h = own_hash_of(DIFF)
-    gh = FakeGitHub(reviews=[gate_review("pass", OLD, h, rid=5)])
-    out, model = run(gh, action=action, base="release")
+    gh = FakeGitHub(reviews=[gate_review("pass", OLD, h, rid=5)], base_ref="release")
+    out, model = run(gh, action=action)
     assert out.exit_code == 1 and "only reviews PRs into main" in out.message
     assert gh.posted == [] and model.calls == []
+
+
+def test_the_diff_is_taken_against_the_live_base_commit_not_a_name():
+    # A writer can push a tag named like the base branch; a name could
+    # resolve to it and make the reviewed diff attacker-chosen.
+    gh = FakeGitHub()
+    out, _ = run(gh)
+    assert out.exit_code == 0 and gh.compared == [(BASE_OID, HEAD)]
 
 
 # ----- step 4: owner override by dismissing the gate's review ------------------------

@@ -72,7 +72,6 @@ class Event:
     action: str
     number: int
     head_sha: str
-    base_ref: str
     repo: str          # "owner/name", part of every marker MAC
     default_branch: str
     run_attempt: int   # GITHUB_RUN_ATTEMPT: > 1 is a re-run, which any writer can start
@@ -93,14 +92,14 @@ class Gathered:
     own_hash: str
 
 
-def gather(gh, ev: Event) -> Gathered:
-    """Fetch and parse the base...head diff; hash the PR's own changes.
+def gather(gh, base_oid: str, ev: Event) -> Gathered:
+    """Fetch and parse the base_oid...head diff; hash the PR's own changes.
 
     Binary contents are fetched here because the hash needs them: the diff
     shows only "Binary files differ", which would let a binary change ride
     a carried-over pass.
     """
-    diff_bytes = gh.diff(ev.base_ref, ev.head_sha, DIFF_HARD_CAP)
+    diff_bytes = gh.diff(base_oid, ev.head_sha, DIFF_HARD_CAP)
     return gather_from(diff_bytes, lambda path: gh.file_content(path, ev.head_sha, FILE_FETCH_CAP))
 
 
@@ -238,11 +237,12 @@ def _run(ev: Event, cfg: Config, gh, review_fn: ReviewFn) -> Outcome:
 
     # Step 2: a check result lives on the head SHA, so a pass for a PR into
     # another branch would satisfy a later PR of the same head into main.
-    if not ev.default_branch or ev.base_ref != ev.default_branch:
+    # The live base: a re-run replays the original event payload.
+    if not ev.default_branch or state.base_ref != ev.default_branch:
         return Outcome(1, f"the AI gate only reviews PRs into {ev.default_branch}")
 
     reviews = gh.reviews(ev.number)
-    g = gather(gh, ev)
+    g = gather(gh, state.base_oid, ev)
 
     # Step 3: a push or a close/reopen while auto-merge stays on is not an
     # owner click: no model roll, only a carry-over of identical own changes.
