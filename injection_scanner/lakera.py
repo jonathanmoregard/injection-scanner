@@ -380,6 +380,16 @@ def _lakera_key() -> str | None:
 def check(text: str, *, max_wait_s: float | None = None) -> LakeraResult:
     """Classify `text` with Lakera Guard. FAIL-CLOSED at every step.
 
+    The whole text goes in ONE request, deliberately unchunked. Lakera's
+    Community plan advertises an 8k-token maximum prompt, and what Guard does
+    above it is undocumented, so this was measured on 2026-10-24 with the
+    production key and project policy: ~49k characters (~12k tokens) of benign
+    prose with one obvious injection placed at ~10k tokens came back HTTP 200
+    `prompt_attack` (flagged), and the same text with the injection swapped
+    for a benign sentence came back `pass`. So Guard screens past the 8k mark,
+    at least to ~12k tokens; sizes beyond that (the largest research reports
+    reach ~95k characters) are not measured. See README "Prompt size".
+
     Outcomes (all non-pass outcomes REJECT — the caller treats ok=False as
     quarantine):
       * key config broken (`*_FILE` set but mount botched)
