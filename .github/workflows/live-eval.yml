@@ -12,10 +12,12 @@ name: live-eval
 # per liveness TTL (smoke.py, 3600 s by default), plus every real report scan —
 # is the day-to-day canary for vendor drift, agent-readable since 2026-09-05,
 # and production is where such drift actually bites.
+#
+# 2026-10-24: the nightly schedule is gone. GitHub Actions must not put
+# recurring load on third-party scanner vendors (the nightly drew on the same
+# Lakera Community quota the production fleet exhausts). Dispatch-only until
+# the multi-vendor scanner redesign decides this workflow's future.
 on:
-  schedule:
-    # Once nightly, off the hour: GitHub's scheduler queues heavily at :00.
-    - cron: "17 3 * * *"
   # On demand, including on a branch — check a detection-quality-sensitive PR
   # with `gh workflow run live-eval.yml --ref <branch>` before merging.
   # Deliberately a human gesture, like the merge click itself.
