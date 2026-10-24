@@ -4,10 +4,13 @@ from __future__ import annotations
 
 import _prgate  # noqa: F401
 
+import io
+import json
+
 import pytest
 
 from prgate import core, verdict
-from prgate.github import GitHubError, PullState, Review, TimelineEvent, TooLarge
+from prgate.github import GitHub, GitHubError, PullState, Review, TimelineEvent, TooLarge
 from prgate.llm import Finding, PassResult
 
 OWNER = "jonathan"
@@ -41,7 +44,6 @@ def posted(review_id):
     return TimelineEvent("reviewed", review_id)
 
 
-COMMIT = TimelineEvent("commit")
 REWRITE = TimelineEvent("rewrite")
 
 
@@ -618,7 +620,7 @@ def test_a_stale_dismissal_is_not_an_override_after_a_force_push_back():
     h = own_hash_of(DIFF)
     reviews = [gate_review("block", HEAD, h, rid=1, state="DISMISSED"),
                gate_review("pass", OLD, "f" * 64, rid=2)]
-    tl = [posted(1), COMMIT, posted(2), dismissal(1, OWNER), REWRITE]
+    tl = [posted(1), posted(2), dismissal(1, OWNER), REWRITE]
     for out, model, gh in override_attempts(lambda: FakeGitHub(reviews=reviews, timeline=tl)):
         assert out.exit_code == 1 and "dismiss its review" in out.message
         assert model.calls == [] and gh.posted == []
@@ -627,19 +629,20 @@ def test_a_stale_dismissal_is_not_an_override_after_a_force_push_back():
 def test_a_stale_dismissal_is_not_an_override_after_a_fast_forward_back():
     # H blocked (1); force-push back to its parent H2, which passes (2);
     # owner dismisses the stale block; the writer fast-forwards to H again.
-    # That push is a `committed` event at H's own (earlier) date, so the
-    # rewrite after the block was posted is what must void the dismissal.
+    # That push leaves no event after the dismissal (its `committed` event
+    # sorts at H's own, earlier, date), so the rewrite after the block was
+    # posted is what must void the dismissal.
     h = own_hash_of(DIFF)
     reviews = [gate_review("block", HEAD, h, rid=1, state="DISMISSED"),
                gate_review("pass", OLD, "f" * 64, rid=2)]
-    tl = [COMMIT, posted(1), REWRITE, posted(2), dismissal(1, OWNER)]
+    tl = [posted(1), REWRITE, posted(2), dismissal(1, OWNER)]
     for out, model, gh in override_attempts(lambda: FakeGitHub(reviews=reviews, timeline=tl)):
         assert out.exit_code == 1 and "dismiss its review" in out.message
         assert model.calls == [] and gh.posted == []
 
 
 def test_a_dismissal_after_the_last_push_is_an_override():
-    tl = [REWRITE, COMMIT, posted(1), dismissal(1, OWNER)]
+    tl = [REWRITE, posted(1), dismissal(1, OWNER)]
     for out, model, _ in override_attempts(lambda: blocked(timeline=tl)):
         assert out.exit_code == 0 and model.calls == []
         assert out.message == "passed (owner-override)"
@@ -654,20 +657,50 @@ def test_a_fresh_block_after_a_rewrite_can_be_overridden():
     assert out.exit_code == 0 and model.calls == []
 
 
-def test_a_commit_after_the_dismissal_voids_it_and_carry_over_takes_over():
-    # Override, then "Update branch". The dismissal no longer counts...
+def test_update_branch_after_an_override_carries_the_override_pass_over():
+    # The merge commit is a new head with no block of its own: carry-over
+    # decides, not the dismissal.
     h = own_hash_of(DIFF)
-    tl = [posted(1), dismissal(1, OWNER), COMMIT]
-    for out, model, gh in override_attempts(lambda: blocked(timeline=tl)):
-        assert out.exit_code == 1 and "dismiss its review" in out.message
-        assert model.calls == [] and gh.posted == []
-    # ...but the base-merge push carries the override pass over.
     reviews = [gate_review("block", HEAD, h, rid=1, state="DISMISSED"),
                gate_review("pass", HEAD, h, rid=3)]
     gh = FakeGitHub(diff=shifted(DIFF), head=NEWER, reviews=reviews,
-                    timeline=[posted(1), dismissal(1, OWNER), posted(3), COMMIT])
+                    timeline=[posted(1), dismissal(1, OWNER), posted(3)])
     out, model = run(gh, action="synchronize", head=NEWER)
     assert out.exit_code == 0 and model.calls == [] and "carried over" in gh.posted[0][2]
+
+
+def raw_timeline(*items):
+    """A REST timeline page, read through the real client's parser."""
+    client = GitHub("t", REPO, api_url="https://api.github.test",
+                    graphql_url="https://api.github.test/graphql",
+                    urlopen=lambda req, timeout=None: io.BytesIO(json.dumps(list(items)).encode()))
+    return client.timeline(7)
+
+
+def test_a_future_dated_head_commit_does_not_void_the_owners_dismissal():
+    # GitHub places `committed` at the commit's own date: a head commit
+    # dated in the future (or clock skew) sorts after the dismissal.
+    tl = raw_timeline(
+        {"event": "reviewed", "id": 1},
+        {"event": "review_dismissed", "actor": {"login": OWNER},
+         "dismissed_review": {"review_id": 1}},
+        {"event": "committed", "sha": HEAD, "committer": {"date": "2099-01-01T00:00:00Z"}})
+    for out, model, _ in override_attempts(lambda: blocked(timeline=tl)):
+        assert out.exit_code == 0 and model.calls == []
+        assert out.message == "passed (owner-override)"
+
+
+def test_a_dismissal_is_void_after_a_force_push_away_and_a_push_back():
+    # Block H, owner dismisses, force-push to H's parent, fast-forward back
+    # to H (its `committed` event sorts at H's own, earlier, date).
+    tl = raw_timeline(
+        {"event": "committed", "sha": HEAD},
+        {"event": "reviewed", "id": 1},
+        {"event": "review_dismissed", "actor": {"login": OWNER},
+         "dismissed_review": {"review_id": 1}},
+        {"event": "head_ref_force_pushed"})
+    for out, model, gh in override_attempts(lambda: blocked(timeline=tl)):
+        assert out.exit_code == 1 and model.calls == [] and gh.posted == []
 
 
 def test_a_dismissal_whose_block_is_not_on_the_timeline_does_not_count():

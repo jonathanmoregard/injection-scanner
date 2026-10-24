@@ -67,9 +67,9 @@ class TimelineEvent:
     """One PR timeline event the owner-override rule reads:
       reviewed   a review was submitted (review_id)
       dismissed  a review was dismissed (review_id, actor; "" if omitted)
-      commit     a `committed` event; GitHub places it by the commit's own
-                 (writer-chosen) date, not by when it was pushed
       rewrite    the head was force-pushed or the head branch restored
+    `committed` events are left out: GitHub places them by the commit's own
+    (writer-chosen) date, not by when it was pushed.
     """
     kind: str
     review_id: int | None = None
@@ -211,8 +211,6 @@ class GitHub:
                         out.append(TimelineEvent(
                             "dismissed", _int(it["dismissed_review"]["review_id"]),
                             str((it.get("actor") or {}).get("login") or "")))
-                    elif kind == "committed":
-                        out.append(TimelineEvent("commit"))
                     elif kind in _REWRITES:
                         out.append(TimelineEvent("rewrite"))
             except (KeyError, TypeError, AttributeError):

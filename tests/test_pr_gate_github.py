@@ -165,11 +165,12 @@ def test_the_timeline_keeps_order_across_pages_and_only_what_the_override_needs(
     page2 = [{"event": "labeled", "actor": None}, {"event": "head_ref_restored"},
              dismissed(6, "github-actions[bot]"), {"event": "committed"}]
     client, op = gh(page1, page2)
+    # `committed` events are dropped: GitHub orders them by the commit's own
+    # (writer-chosen) date, so they say nothing about when the head moved.
     assert client.timeline(7) == [
-        TimelineEvent("commit"), TimelineEvent("reviewed", 5),
+        TimelineEvent("reviewed", 5),
         TimelineEvent("dismissed", 5, "jonathan"), TimelineEvent("rewrite"),
-        TimelineEvent("rewrite"), TimelineEvent("dismissed", 6, "github-actions[bot]"),
-        TimelineEvent("commit")]
+        TimelineEvent("rewrite"), TimelineEvent("dismissed", 6, "github-actions[bot]")]
     first, second = op.requests
     assert first.full_url.startswith("https://api.github.test/repos/owner/repo/issues/7/timeline?")
     assert "page=2" in second.full_url and "per_page=100" in second.full_url

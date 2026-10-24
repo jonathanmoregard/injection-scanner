@@ -158,13 +158,14 @@ def _blocks_on_head(reviews: list[Review], ev: Event, key: bytes) -> list[int]:
 
 def _owner_dismissed(gh, ev: Event, owner: str, review_ids: list[int]) -> bool:
     """The owner dismissed one of these blocks while the PR sat at this
-    head, as far as the timeline can show it, scanned in order:
-      - a force push or branch restore after a block was posted voids it:
-        the head can only return to a blocked commit by a rewrite, and the
-        later fast-forward back shows up as a `committed` event at the
-        commit's own date, not at push time;
-      - a `committed` event after the dismissal voids the dismissal.
-    A dismissal of a block the timeline never showed being posted is ignored.
+    head, as far as the timeline can show it, scanned in order. A force
+    push or branch restore after a block was posted voids it: the head can
+    only leave a blocked commit and come back to it by a rewrite. (A plain
+    push moves the head off it, so step 4 never sees that block again.)
+    `committed` events are not read: GitHub places them at the commit's
+    own, writer-chosen date, so a future-dated head would void every
+    dismissal. A dismissal of a block the timeline never showed being
+    posted is ignored.
     """
     posted: set[int] = set()
     ok = False
@@ -174,8 +175,6 @@ def _owner_dismissed(gh, ev: Event, owner: str, review_ids: list[int]) -> bool:
         elif (e.kind == "dismissed" and e.review_id in posted
               and e.actor.casefold() == owner.casefold()):
             ok = True
-        elif e.kind == "commit":
-            ok = False
         elif e.kind == "rewrite":
             posted.clear()
             ok = False

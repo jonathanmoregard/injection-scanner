@@ -91,22 +91,24 @@ it, each with the reason. Design: `docs/superpowers/specs/2026-10-24-pr-gate-des
     edited or bot-dismissed bot reviews, carry-over after an override). A
     review's state says nothing about who dismissed it; the timeline does.
 11a. **A dismissal counts only while the head stayed put.** One ordered
-    timeline scan (reviewed, review_dismissed, committed,
-    head_ref_force_pushed, head_ref_restored; a malformed relevant event
-    fails closed): the owner's dismissal of a block on this head counts iff
-    the timeline shows that block being posted, no `committed` event
-    follows the dismissal, and no force push or branch restore follows the
+    timeline scan (reviewed, review_dismissed, head_ref_force_pushed,
+    head_ref_restored; a malformed relevant event fails closed): the
+    owner's dismissal of a block on this head counts iff the timeline shows
+    that block being posted and no force push or branch restore follows the
     block's posting. Why: otherwise a stale dismissal is a permanent token
     (block H, push a clean H2 that passes, owner dismisses the stale block,
-    push back to H, re-run). The rewrite rule is needed on top of "no head
-    change after the dismissal": GitHub places a `committed` event at the
-    commit's own, writer-chosen date, not at push time, so a fast-forward
-    back to a blocked commit (after a force push to its parent) looks like
-    it happened before the dismissal. Leaving a commit and coming back to
-    it always takes a rewrite, and rewrite, review and dismissal events
-    carry server timestamps. Known cost, fail closed: a head commit dated
-    in the future (writer clock skew) sorts after the dismissal, so that
-    head needs a fresh review instead of an override.
+    push back to H, re-run). Leaving a commit and coming back to it always
+    takes a rewrite, and rewrite, review and dismissal events carry server
+    timestamps. `committed` events are not read at all: GitHub places one
+    at the commit's own, writer-chosen date, not at push time. An earlier
+    "a `committed` event after the dismissal voids it" rule protected
+    nothing: while the head is still the blocked commit H, a `committed`
+    event after the dismissal can only be one of H's own ancestry sorted
+    late by its date (anything else got there by a rewrite, which already
+    voids), and a plain push moves the head off H, so step 4 never sees
+    that block. It only let a future-dated head commit (or writer clock
+    skew) void every owner dismissal, with no fresh review either, since
+    step 4 comes before step 6.
 12. **Re-runs never ask the model** (replaces "any bot REQUEST_CHANGES arms
     the guard" and the same-own-changes reroll guard). With
     `GITHUB_RUN_ATTEMPT` > 1 and no override, the run fails with no model
