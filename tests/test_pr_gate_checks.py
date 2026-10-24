@@ -6,7 +6,7 @@ import _prgate  # noqa: F401
 import pytest
 
 from prgate import checks
-from prgate.diffparse import FileChange
+from prgate.diffparse import FileChange, parse
 
 
 def fc(path, added=(), status="modified", binary=False, old_path=None, new_mode=None):
@@ -944,8 +944,58 @@ def test_long_added_line_is_scrutiny():
 
 
 def test_symlink_and_submodule_are_scrutiny():
-    out = checks.scrutiny([fc("link", ["../../x"], new_mode="120000"), fc("sub", ["Subproject commit abc"], new_mode="160000")])
+    out = checks.scrutiny([fc("link", ["../../x"], new_mode="120000"), *parse(_GITLINK_BUMP)])
     assert sorted(s.reason for s in out) == ["submodule", "symlink"]
+
+
+_GITLINK_ADD = """\
+diff --git a/sub b/sub
+new file mode 160000
+index 0000000..1234567
+--- /dev/null
++++ b/sub
+@@ -0,0 +1 @@
++Subproject commit 1234567890123456789012345678901234567890
+"""
+# A bumped gitlink has no mode lines: the mode is only on the index line.
+_GITLINK_BUMP = """\
+diff --git a/sub b/sub
+index 1234567..89abcde 160000
+--- a/sub
++++ b/sub
+@@ -1 +1 @@
+-Subproject commit 1234567890123456789012345678901234567890
++Subproject commit 89abcde89abcde89abcde89abcde89abcde89abc
+"""
+_GITLINK_DELETE = """\
+diff --git a/sub b/sub
+deleted file mode 160000
+index 1234567..0000000
+--- a/sub
++++ /dev/null
+@@ -1 +0,0 @@
+-Subproject commit 1234567890123456789012345678901234567890
+"""
+
+
+@pytest.mark.parametrize("diff", [_GITLINK_ADD, _GITLINK_BUMP])
+def test_an_added_or_bumped_submodule_pointer_blocks_but_is_overridable(diff):
+    # Its content is a commit in another repo that no reviewer sees.
+    hits, scrutiny = checks.run_all(parse(diff), {}, [], {})
+    [hit] = hits
+    assert (hit.rule, hit.path, hit.overridable) == ("submodule", "sub", True)
+    assert "not reviewed" in hit.detail
+    assert "submodule" in {s.reason for s in scrutiny}
+
+
+def test_a_deleted_submodule_pointer_is_not_a_hit():
+    hits, _ = checks.run_all(parse(_GITLINK_DELETE), {}, [], {})
+    assert hits == []
+
+
+def test_a_submodule_pointer_is_not_an_always_on_hit():
+    hits, _ = checks.run_all(parse(_GITLINK_BUMP), {}, [], {}, always_on_only=True)
+    assert hits == []
 
 
 def test_plain_source_file_is_not_scrutiny():

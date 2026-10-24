@@ -27,6 +27,9 @@ class FileChange:
     new_mode: str | None = None
     added: list[tuple[int, str]] = field(default_factory=list)  # (new line no, text)
     removed: list[str] = field(default_factory=list)
+    # The post-image is a submodule pointer (mode 160000). Not hashed: the
+    # mode lines and the "Subproject commit" body already are.
+    gitlink: bool = False
     # Hunk bodies with "@@" headers dropped: " ctx", "+add", "-del" lines.
     body: list[str] = field(default_factory=list)
 
@@ -154,12 +157,14 @@ def parse(diff: str) -> list[FileChange]:
             new_no = int(m.group(3))
         elif line.startswith("new file mode "):
             cur.status, cur.new_mode = "added", line.split()[-1]
+            cur.gitlink = cur.new_mode == "160000"
         elif line.startswith("deleted file mode "):
             cur.status, cur.old_mode = "deleted", line.split()[-1]
         elif line.startswith("old mode "):
             cur.old_mode = line.split()[-1]
         elif line.startswith("new mode "):
             cur.new_mode = line.split()[-1]
+            cur.gitlink = cur.new_mode == "160000"
         elif line.startswith(("rename from ", "copy from ")):
             cur.old_path = _unquote(line.split(" ", 2)[2])
             cur.status = "renamed"
@@ -177,7 +182,11 @@ def parse(diff: str) -> list[FileChange]:
                 cur.path = _strip_prefix(p, "b/")
         elif line.startswith("Binary files ") or line == "GIT binary patch":
             cur.binary = True
-        elif line.startswith(("index ", "similarity index ", "dissimilarity index ")):
+        elif line.startswith("index "):
+            # "index a..b 160000": a modified gitlink has no mode lines.
+            if line.split()[-1] == "160000" and cur.status != "deleted":
+                cur.gitlink = True
+        elif line.startswith(("similarity index ", "dissimilarity index ")):
             pass
         else:
             raise DiffError("unexpected line outside hunk")

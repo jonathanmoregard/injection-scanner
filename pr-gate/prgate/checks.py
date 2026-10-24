@@ -2,9 +2,9 @@
 
 Three of them (hidden Unicode, lockfile hosts, a git-binary file that is
 not a known binary type) are ALWAYS-ON: they have no legitimate trigger, so neither the owner
-override nor the `exceptions` input can turn them off. The other binary and
-path rules are owner-overridable, and the path rule can be downgraded per
-repo to "extra scrutiny".
+override nor the `exceptions` input can turn them off. The other binary,
+submodule and path rules are owner-overridable, and the path rule can be
+downgraded per repo to "extra scrutiny".
 
 Everything here is pure: diff (and fetched contents) in, hits out.
 Fetching lives in core.py.
@@ -29,7 +29,7 @@ LONG_LINE = 500
 
 @dataclass(frozen=True)
 class Hit:
-    rule: str          # hidden-unicode | lockfile-host | text-binary | binary | sensitive-path | too-large
+    rule: str          # hidden-unicode | lockfile-host | text-binary | binary | submodule | sensitive-path | too-large
     path: str          # attacker-chosen: neutralise before display
     detail: str        # may contain attacker-chosen text (hosts): neutralise
     overridable: bool  # cleared by the owner dismissing the gate's block
@@ -148,6 +148,20 @@ def binaries(files: list[FileChange], contents: dict[str, bytes | None]) -> list
         hits.append(Hit("text-binary", f.path, detail, False) if mismatch
                     else Hit("binary", f.path, detail, True))
     return hits
+
+
+# ----- submodule pointers ----------------------------------------------------
+
+SUBMODULE = ("submodule pointer: its content is not reviewed; check the target "
+             "repo/commit before dismissing")
+
+
+def submodules(files: list[FileChange]) -> list[Hit]:
+    """An added or bumped gitlink points at a commit in another repo that no
+    reviewer sees (with a .gitmodules URL, any repo). The owner can look at
+    that commit, so it is overridable."""
+    return [Hit("submodule", f.path, SUBMODULE, True)
+            for f in files if f.gitlink and f.status != "deleted"]
 
 
 # ----- sensitive paths -------------------------------------------------------
@@ -561,7 +575,7 @@ def scrutiny(files: list[FileChange]) -> list[Scrutiny]:
             reasons.append("minified-or-vendored")
         if f.new_mode == "120000":
             reasons.append("symlink")
-        if f.new_mode == "160000":
+        if f.gitlink:
             reasons.append("submodule")
         if any(len(t) > LONG_LINE for _, t in f.added):
             reasons.append("long-line")
@@ -580,7 +594,7 @@ def run_all(files: list[FileChange], contents: dict[str, bytes | None],
     """
     path_hits, exempted = sensitive_paths(files, exceptions)
     hits = (hidden_unicode(files) + lockfile_hosts(files, lockfiles)
-            + binaries(files, contents) + path_hits)
+            + binaries(files, contents) + submodules(files) + path_hits)
     if always_on_only:
         hits = [h for h in hits if not h.overridable]
     return hits, exempted + scrutiny(files)

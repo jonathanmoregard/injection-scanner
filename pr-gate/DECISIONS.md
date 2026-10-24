@@ -304,6 +304,16 @@ it, each with the reason. Design: `docs/superpowers/specs/2026-10-24-pr-gate-des
     types are non-overridable until added to the set, and so is a binary
     whose real kind differs from its extension's (a CFF font named `.ttf`):
     rename it to match, build it in CI, or extend the set.
+23a. **An added or bumped gitlink blocks, owner-overridable** (was
+    scrutiny only). A submodule pointer names a commit in another repo,
+    with a `.gitmodules` URL possibly an attacker's: no reviewer sees that
+    content, the same argument as for a text-binary file. Unlike a
+    text-binary, the owner can inspect the target repo and commit, so the
+    `submodule` hit is overridable. A gitlink is recognised by
+    `new file mode 160000` / `new mode 160000` and by the mode on the
+    `index a..b 160000` line, which is the only place a bumped gitlink
+    shows it. Deleting a gitlink is no hit; `.gitmodules` stays in
+    scrutiny. Gitlinks are never fetched as file contents.
 24. **Extra scrutiny** (listed to the model, never blocks): `*.nix`,
     lockfiles, `build.rs`, install/setup scripts, package manifests and
     `.gitattributes`/`.gitmodules`/`.npmrc`, minified or vendored paths,

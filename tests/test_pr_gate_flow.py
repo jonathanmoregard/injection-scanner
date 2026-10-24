@@ -380,6 +380,16 @@ def test_monitor_b_gets_text_contents_but_not_binaries_or_deletions():
     assert out.exit_code == 1  # the binary blocks
 
 
+def test_a_bumped_submodule_blocks_and_is_not_fetched_as_a_file():
+    diff = DIFF + ("diff --git a/sub b/sub\nindex 1234567..89abcde 160000\n--- a/sub\n"
+                   "+++ b/sub\n@@ -1 +1 @@\n-Subproject commit " + "1" * 40 + "\n"
+                   "+Subproject commit " + "2" * 40 + "\n")
+    gh = FakeGitHub(diff=diff)
+    out, model = run(gh)
+    assert out.exit_code == 1 and "submodule" in gh.posted[0][2]
+    assert gh.fetched == ["src/app.py"]
+
+
 def test_a_path_with_a_space_is_fetched_without_gits_trailing_tab():
     diff = DIFF.replace("src/app.py", "src/my app.py").replace(
         "--- a/src/my app.py\n", "--- a/src/my app.py\t\n").replace(

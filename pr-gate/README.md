@@ -69,6 +69,9 @@ the base branch). In order, failing closed at every step:
      `_KNOWN_BINARY` in `prgate/checks.py`. **Never overridable.**
    - other added or modified binary files (a known binary type whose magic
      bytes match or are not recognised).
+   - an added or bumped submodule pointer (gitlink): the commit it points
+     at lives in another repo that no reviewer sees. Check the target repo
+     (`.gitmodules`) and commit before dismissing. Deleting one is fine.
    - changes under `.github/` and to agent-instruction files (`CLAUDE.md`,
      `AGENTS.md`, `.claude/`, `.codex/`, `.mcp.json`).
    - a diff over 400 kB (too large for the model passes).

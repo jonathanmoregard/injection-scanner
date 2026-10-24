@@ -239,7 +239,7 @@ def _text_contents(gh, ev: Event, files: list[FileChange]) -> tuple[dict[str, st
     omitted: list[str] = []
     left = CONTENTS_BUDGET
     for f in files:
-        if f.status == "deleted" or f.binary or f.new_mode in ("120000", "160000"):
+        if f.status == "deleted" or f.binary or f.gitlink or f.new_mode == "120000":
             continue
         try:
             data = gh.file_content(f.path, ev.head_sha, left)
