@@ -260,6 +260,23 @@ def test_monitor_b_gets_text_contents_but_not_binaries_or_deletions():
     assert out.exit_code == 1  # the binary blocks
 
 
+def test_a_path_with_a_space_is_fetched_without_gits_trailing_tab():
+    diff = DIFF.replace("src/app.py", "src/my app.py").replace(
+        "--- a/src/my app.py\n", "--- a/src/my app.py\t\n").replace(
+        "+++ b/src/my app.py\n", "+++ b/src/my app.py\t\n")
+    gh = FakeGitHub(diff=diff)
+    out, model = run(gh)
+    assert out.exit_code == 0 and gh.fetched == ["src/my app.py"]
+
+
+def test_an_unparseable_quoted_path_is_a_parse_failure_not_infra():
+    diff = DIFF.replace("+++ b/src/app.py", '+++ "b/src/\\377.py"')
+    gh = FakeGitHub(diff=diff)
+    out, model = run(gh)
+    assert out.exit_code == 1 and "could not parse the diff" in out.message
+    assert gh.fetched == [] and model.calls == [] and gh.posted == []
+
+
 def test_contents_budget_omission_reaches_the_model(monkeypatch):
     monkeypatch.setattr(core, "CONTENTS_BUDGET", 5)
     gh = FakeGitHub(files={"src/app.py": b"0123456789"})

@@ -69,6 +69,11 @@ it, each with the reason. Design: `docs/superpowers/specs/2026-10-24-pr-gate-des
 13. **Always-on checks run on carry-over and override runs.**
 14. The diff is `compare/<base branch>...<head SHA>`: the base branch's
     current tip (what "Update branch" merged), the head pinned by SHA.
+    Paths follow git's format: the TAB git appends to a `---`/`+++` path
+    containing a space is dropped, and C-style quoted paths
+    (`"b/caf\303\251.txt"`) are unquoted. A path that starts with `"` but is
+    not one well-formed quoted UTF-8 string fails the run as unparseable
+    (procedural, not infra), so it never reaches a file fetch.
 15. Event actions other than the three in the template, and events other
     than `pull_request_target`, fail.
 16. The three passes run concurrently (three threads), each with a 600 s

@@ -3,6 +3,8 @@ from __future__ import annotations
 
 import _prgate  # noqa: F401  (puts pr-gate/ on sys.path)
 
+import pytest
+
 from prgate import diffparse as dp
 
 
@@ -139,6 +141,61 @@ def test_quoted_paths_are_unquoted():
     assert f.path == "sp aceé.txt"
 
 
+# Verbatim `git diff` output (git 2.x): a path containing a space gets a
+# trailing TAB on its ---/+++ line; non-ASCII and `"` force C-style quoting.
+SPACES = (
+    "diff --git a/added file.txt b/added file.txt\n"
+    "new file mode 100644\nindex 0000000..587be6b\n"
+    "--- /dev/null\n+++ b/added file.txt\t\n@@ -0,0 +1 @@\n+x\n"
+    "diff --git a/my file.txt b/my other.txt\n"
+    "similarity index 66%\nrename from my file.txt\nrename to my other.txt\n"
+    "index 422c2b7..de98044 100644\n"
+    "--- a/my file.txt\t\n+++ b/my other.txt\t\n@@ -1,2 +1,3 @@\n a\n b\n+c\n"
+)
+
+QUOTED = (
+    'diff --git a/base.txt "b/caf\\303\\251 2.txt"\n'
+    "similarity index 83%\nrename from base.txt\n"
+    'rename to "caf\\303\\251 2.txt"\nindex 8a1218a..b414108 100644\n'
+    '--- a/base.txt\n+++ "b/caf\\303\\251 2.txt"\t\n@@ -3,3 +3,4 @@\n 3\n 4\n 5\n+6\n'
+    'diff --git "a/q\\"uote.txt" "b/q\\"uote.txt"\n'
+    "index 7898192..422c2b7 100644\n"
+    '--- "a/q\\"uote.txt"\n+++ "b/q\\"uote.txt"\n@@ -1 +1,2 @@\n a\n+b\n'
+)
+
+
+def test_gits_trailing_tab_after_a_path_with_spaces_is_not_part_of_the_path():
+    added, renamed = dp.parse(SPACES)
+    assert (added.path, added.status) == ("added file.txt", "added")
+    assert (renamed.path, renamed.old_path) == ("my other.txt", "my file.txt")
+
+
+def test_quoted_paths_in_headers_and_file_lines_are_unquoted():
+    renamed, quoted = dp.parse(QUOTED)
+    assert (renamed.path, renamed.old_path, renamed.status) == ("café 2.txt", "base.txt", "renamed")
+    assert renamed.added == [(6, "6")]
+    assert (quoted.path, quoted.old_path) == ('q"uote.txt', None)
+
+
+def test_deleted_file_with_a_space_keeps_its_path():
+    diff = ("diff --git a/old file.txt b/old file.txt\ndeleted file mode 100644\n"
+            "--- a/old file.txt\t\n+++ /dev/null\n@@ -1 +0,0 @@\n-bye\n")
+    [f] = dp.parse(diff)
+    assert (f.path, f.status) == ("old file.txt", "deleted")
+
+
+@pytest.mark.parametrize("line", [
+    '+++ "b/unterminated.txt\t',      # opening quote, no closing quote
+    '+++ "b/bad\\q.txt"',             # unknown escape
+    '+++ "b/\\377.txt"',              # octal bytes that are not UTF-8
+    '+++ "b/x.txt"junk',              # text after the closing quote
+])
+def test_a_path_that_cannot_be_unquoted_fails_closed(line):
+    diff = f"diff --git a/x.txt b/x.txt\n--- a/x.txt\n{line}\n@@ -1 +1 @@\n-a\n+b\n"
+    with pytest.raises(dp.DiffError):
+        dp.parse(diff)
+
+
 def test_no_newline_marker_is_ignored():
     diff = (
         "diff --git a/f b/f\n--- a/f\n+++ b/f\n@@ -1 +1 @@\n-a\n"
@@ -149,8 +206,6 @@ def test_no_newline_marker_is_ignored():
 
 
 def test_unparseable_input_raises():
-    import pytest
-
     with pytest.raises(dp.DiffError):
         dp.parse("this is not a diff\n")
 

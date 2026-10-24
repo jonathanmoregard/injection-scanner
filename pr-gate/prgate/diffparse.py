@@ -36,10 +36,21 @@ _ESCAPES = {"a": 7, "b": 8, "t": 9, "n": 10, "v": 11, "f": 12, "r": 13,
             '"': 34, "\\": 92}
 
 
+_QUOTED = re.compile(r'"(?:[^"\\]|\\.)*"')
+
+
 def _unquote(s: str) -> str:
-    """Undo git's C-style path quoting ("a/sp\\303\\251ce")."""
-    if not (len(s) >= 2 and s[0] == '"' and s[-1] == '"'):
+    """Undo git's C-style path quoting ("a/sp\\303\\251ce").
+
+    git quotes every path containing `"`, a backslash, a control or a
+    non-ASCII byte, so an unquoted path never starts with `"`. Anything that
+    does but is not exactly one well-formed quoted UTF-8 string fails closed
+    here rather than reaching a file fetch.
+    """
+    if not s.startswith('"'):
         return s
+    if not _QUOTED.fullmatch(s):
+        raise DiffError("bad quoted path")
     out = bytearray()
     i, inner = 0, s[1:-1]
     while i < len(inner):
@@ -57,7 +68,16 @@ def _unquote(s: str) -> str:
             i += 4
         else:
             raise DiffError("bad quoted path")
-    return out.decode("utf-8", errors="replace")
+    try:
+        return out.decode("utf-8")
+    except UnicodeDecodeError:
+        raise DiffError("bad quoted path") from None
+
+
+def _file_line_path(p: str) -> str:
+    """Path from a `--- ` / `+++ ` line. git ends the path with a TAB when
+    it contains a space; a TAB inside a path is always quoted as \\t."""
+    return p.split("\t", 1)[0]
 
 
 def _strip_prefix(p: str, prefix: str) -> str:
@@ -72,6 +92,10 @@ def _header_paths(rest: str) -> tuple[str, str]:
         if not m:
             raise DiffError("bad diff header")
         return _strip_prefix(m.group(1), "a/"), _strip_prefix(m.group(2), "b/")
+    if rest.endswith('"'):
+        # Unquoted a, quoted b (a rename to a path that needs quoting).
+        a, _, b = rest.partition(' "')
+        return _strip_prefix(a, "a/"), _strip_prefix('"' + b, "b/")
     # Unquoted: "a/P b/P". Same path both sides is the common case, and the
     # only one where a path containing " b/" is ambiguous.
     half = (len(rest) - 1) // 2
@@ -142,13 +166,13 @@ def parse(diff: str) -> list[FileChange]:
         elif line.startswith(("rename to ", "copy to ")):
             cur.path = _unquote(line.split(" ", 2)[2])
         elif line.startswith("--- "):
-            p = line[4:]
+            p = _file_line_path(line[4:])
             if p != "/dev/null":
                 src = _strip_prefix(p, "a/")
                 if cur.status == "deleted":
                     cur.path = src
         elif line.startswith("+++ "):
-            p = line[4:]
+            p = _file_line_path(line[4:])
             if p != "/dev/null":
                 cur.path = _strip_prefix(p, "b/")
         elif line.startswith("Binary files ") or line == "GIT binary patch":
