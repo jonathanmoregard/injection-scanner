@@ -18,13 +18,19 @@ def load(name):
 def test_action_inputs_and_defaults():
     inputs = load("action.yml")["inputs"]
     assert set(inputs) == {"owner", "model", "effort", "suspicion-threshold", "exceptions",
-                           "anthropic-api-key", "github-token"}
+                           "anthropic-api-key"}
     assert inputs["owner"]["required"] is True
     assert inputs["anthropic-api-key"]["required"] is True
     assert inputs["model"]["default"] == "claude-opus-5-5"
     assert inputs["effort"]["default"] == "high"
     assert inputs["suspicion-threshold"]["default"] == "25"
-    assert inputs["github-token"]["default"] == "${{ github.token }}"
+
+
+def test_the_gate_always_runs_as_github_actions_bot():
+    # GATE_LOGIN trusts only github-actions[bot] reviews: a custom token
+    # would post reviews the next run can't recognise.
+    [gate] = [s for s in load("action.yml")["runs"]["steps"] if s["name"] == "ai-gate"]
+    assert gate["env"]["PR_GATE_GITHUB_TOKEN"] == "${{ github.token }}"
 
 
 def test_no_expression_is_interpolated_into_a_script_body():

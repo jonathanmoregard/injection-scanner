@@ -85,7 +85,7 @@ def _actions(env) -> int:
         return fail(f"config: {msg}")
     token = (env.get("PR_GATE_GITHUB_TOKEN") or "").strip()
     if not token:
-        return fail("config: github-token is empty")
+        return fail("config: the workflow token (github.token) is empty")
     try:
         gh = GitHub(token, env.get("GITHUB_REPOSITORY", ""),
                     api_url=env.get("GITHUB_API_URL", "https://api.github.com"),

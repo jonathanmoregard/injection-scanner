@@ -6,7 +6,7 @@ description: >
 
 inputs:
   owner:
-    description: GitHub login whose auto-merge click requests the review and whose approval clears a block.
+    description: GitHub login whose auto-merge click requests the review and whose dismissal of the gate's review clears a block.
     required: true
   model:
     description: Claude model for all three passes (sensitive repos use claude-fable-5-1).
@@ -30,10 +30,6 @@ inputs:
   anthropic-api-key:
     description: Anthropic API key from a dedicated, spend-capped Console workspace. Also the HMAC key that signs the gate's review markers.
     required: true
-  github-token:
-    description: Token for reading the PR and posting the review.
-    required: false
-    default: ${{ github.token }}
 
 runs:
   using: composite
@@ -52,7 +48,8 @@ runs:
           -r "$GITHUB_ACTION_PATH/requirements.txt"
 
     # Every input reaches Python through env, never interpolated into the
-    # script. The API key is scoped to this one step.
+    # script. The API key is scoped to this one step. The token is always
+    # the workflow's own: the gate trusts only github-actions[bot] reviews.
     - name: ai-gate
       shell: bash
       env:
@@ -61,6 +58,6 @@ runs:
         PR_GATE_EFFORT: ${{ inputs.effort }}
         PR_GATE_THRESHOLD: ${{ inputs.suspicion-threshold }}
         PR_GATE_EXCEPTIONS: ${{ inputs.exceptions }}
-        PR_GATE_GITHUB_TOKEN: ${{ inputs.github-token }}
+        PR_GATE_GITHUB_TOKEN: ${{ github.token }}
         ANTHROPIC_API_KEY: ${{ inputs.anthropic-api-key }}
       run: '"$RUNNER_TEMP/pr-gate-venv/bin/python" -I "$GITHUB_ACTION_PATH/gate.py"'
