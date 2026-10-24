@@ -152,7 +152,8 @@ it, each with the reason. Design: `docs/superpowers/specs/2026-10-24-pr-gate-des
     owner clicks, so an amend/rebase to a new SHA with the same changes no
     longer needs its own guard: it fails on `synchronize` and gets a fresh
     review only when the owner toggles auto-merge.
-13. **Carry-over** looks only at the NEWEST verified gate marker, pass or
+13. **Carry-over** looks only at the NEWEST verified gate marker (by review
+    id, which grows over time, not by the order the API lists them), pass or
     block: it carries over iff that marker is a pass with an identical
     own-changes hash. Nothing else (the "ever blocked + owner approved its
     head" rule is gone): markers are HMAC-signed, so a pass can't be

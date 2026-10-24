@@ -181,8 +181,10 @@ def full_review(g: Gathered, cfg: Config, review_fn: ReviewFn,
 
 def _gate_reviews(reviews: list[Review], ev: Event, key: bytes):
     """Reviews carrying a VERIFIED gate marker. Anything else, including a
-    github-actions[bot] review from another workflow, counts as no marker."""
-    for r in reviews:
+    github-actions[bot] review from another workflow, counts as no marker.
+    Oldest first by review id (ids grow over time), whatever order the API
+    returned: callers take the last one as the newest."""
+    for r in sorted(reviews, key=lambda r: r.id):
         if r.login == GATE_LOGIN:
             m = verdict.verify_marker(r.body, key, repo=ev.repo, number=ev.number)
             if m:

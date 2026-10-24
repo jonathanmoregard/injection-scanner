@@ -514,6 +514,15 @@ def test_the_newest_marker_decides_even_after_an_earlier_block_of_the_same_chang
     assert out.exit_code == 0 and model.calls == []
 
 
+def test_the_newest_marker_is_by_review_id_not_api_order():
+    # The API returns the newer block (id 12) before the older pass (id 5).
+    h = own_hash_of(DIFF)
+    reviews = [gate_review("block", OLD, h, rid=12), gate_review("pass", OLD, h, rid=5)]
+    gh = FakeGitHub(diff=shifted(DIFF), reviews=reviews)
+    out, model = run(gh, action="synchronize")
+    assert out.exit_code == 1 and gh.posted == [] and model.calls == []
+
+
 def test_reopened_without_a_pass_fails_without_a_model_call():
     # Close/reopen must not be a free reroll while auto-merge stays on.
     gh = FakeGitHub()
