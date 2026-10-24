@@ -820,6 +820,38 @@ def test_a_dismissal_is_void_after_a_force_push_away_and_a_push_back():
         assert out.exit_code == 1 and model.calls == [] and gh.posted == []
 
 
+class NoTimeline(FakeGitHub):
+    status = 403
+
+    def timeline(self, number):
+        raise GitHubError("timeline", self.status)
+
+
+def no_timeline(status):
+    gh = NoTimeline(reviews=[gate_review("block", HEAD, own_hash_of(DIFF), rid=1,
+                                         state="DISMISSED")])
+    gh.status = status
+    return gh
+
+
+@pytest.mark.parametrize("status", [403, 404])
+def test_an_unreadable_timeline_is_a_config_error_not_a_retry(status):
+    # Without `issues: read` the timeline answers 403/404 on every run, and
+    # the fix (a workflow change) is itself a sensitive-path block whose
+    # override needs the timeline: "toggle to retry" would loop forever.
+    gh = no_timeline(status)
+    out, model = run(gh, attempt=2)
+    assert out.exit_code == 1 and gh.posted == [] and model.calls == []
+    assert out.message.startswith("config:") and "issues: read" in out.message
+    assert core.RETRY not in out.message and "will not help" in out.message
+
+
+def test_a_timeline_server_error_stays_infra():
+    gh = no_timeline(502)
+    out, _ = run(gh, attempt=2)
+    assert out.message.startswith("infra:") and core.RETRY in out.message
+
+
 def test_a_dismissal_whose_block_is_not_on_the_timeline_does_not_count():
     out, model = run(blocked(timeline=[dismissal(1, OWNER)]), attempt=2)
     assert out.exit_code == 1 and model.calls == []

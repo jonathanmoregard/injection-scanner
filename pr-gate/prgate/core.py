@@ -15,8 +15,9 @@ Three kinds of failure, deliberately different:
     and NO review is posted.
   - infra (GitHub or model API errors): the check fails, no review. Not a
     verdict on the PR; an owner auto-merge toggle retries. A model 4xx other
-    than 408/409/429 (model name, key, prompt size) is reported as a config
-    error instead: retrying the same request cannot help.
+    than 408/409/429 (model name, key, prompt size), or a timeline 403/404
+    (no `issues: read`), is reported as a config error instead: retrying
+    the same request cannot help.
   - verdict: a review is posted on the head SHA. Block = REQUEST_CHANGES
     (COMMENT if refused) and exit 1; pass = COMMENT, dismiss the gate's own
     earlier blocks, exit 0.
@@ -43,6 +44,15 @@ _LOGIN = re.compile(r"^[A-Za-z0-9](?:[A-Za-z0-9-]{0,38})$")
 _SHA = re.compile(r"^[0-9a-f]{40}$")
 
 RETRY = "disable and re-enable auto-merge to retry"
+# The timeline answers 403/404 on every run without `issues: read`, and
+# the fix is a workflow change the gate blocks, whose override needs the
+# timeline: "toggle to retry" would loop.
+NO_TIMELINE = ("config: the gate cannot read the PR timeline (who dismissed a review): "
+               "the calling workflow lacks `issues: read` (setup step 1, "
+               "caller-example.yml). Retrying will not help. The workflow fix is a "
+               ".github/ change this gate blocks, and overriding that block needs the "
+               "timeline too: land the fix through the owner's ruleset bypass, or by "
+               "removing the required ai-gate check for that one merge and restoring it")
 
 ReviewFn = Callable[[str, dict, list, list], list[PassResult]]
 
@@ -279,6 +289,8 @@ def run(ev: Event, cfg: Config, gh, review_fn: ReviewFn) -> Outcome:
     try:
         return _run(ev, cfg, gh, review_fn)
     except GitHubError as e:
+        if e.op == "timeline" and e.status in (403, 404):
+            return Outcome(1, NO_TIMELINE)
         return Outcome(1, f"infra: {e}; {RETRY}")
     except TooLarge:
         return Outcome(1, "the diff is too large for the gate to read; split the PR")

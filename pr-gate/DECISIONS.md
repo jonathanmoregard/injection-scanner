@@ -59,7 +59,12 @@ it, each with the reason. Design: `docs/superpowers/specs/2026-10-24-pr-gate-des
      *config* error with that diagnosis instead of "toggle to retry": the
      same request fails the same way every time. Still fail closed, no
      review; the reason is the closed `api-status-<code>` vocabulary, never
-     the provider's error body.
+     the provider's error body. Likewise a timeline 403/404: the caller
+     lacks `issues: read`, every run fails the same way, and the fix is a
+     workflow change the gate blocks whose override needs the timeline, so
+     "toggle to retry" would loop. The fixed message names the missing
+     permission and the way out (the owner's ruleset bypass, or removing
+     the required check for that one merge).
    - *Verdict* (including refusal, `max_tokens`, malformed or out-of-range
      output): REQUEST_CHANGES review. These are outcomes on the PR's
      content; only the owner's dismissal overrides them.

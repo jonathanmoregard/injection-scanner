@@ -166,7 +166,13 @@ There is no token input: the gate always uses the workflow's `github.token`
 (`contents: read`, `pull-requests: write`, `issues: read` in the caller), so
 its reviews come from `github-actions[bot]`, the only author it trusts.
 `issues: read` is for the timeline endpoint that records who dismissed a
-review; without it the owner-override path cannot see dismissals.
+review; without it the owner-override path cannot see dismissals, and the
+gate fails with a config error saying so (retrying will not help).
+**Recovery:** the workflow fix is itself a `.github/` change the gate
+blocks, and overriding that block needs the timeline too. Land the fix by
+temporarily removing the required `ai-gate` check from the ruleset (or
+adding the owner as a bypass actor) for that one merge, then restore the
+ruleset.
 
 ## Cost (estimate, not measured)
 
