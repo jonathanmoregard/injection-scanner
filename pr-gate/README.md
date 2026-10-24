@@ -118,7 +118,10 @@ Org repos need their own secret and ruleset.
 - **Dismissing the gate's review IS the override**, not housekeeping. It
   applies only to the commit the PR is at when you dismiss, only if `owner`
   did it, and only while the PR stays there: a later commit voids it, and so
-  does any force push after the gate posted that block. Don't dismiss a
+  does any force push after the gate posted that block. A review can be
+  dismissed only once, so a voided dismissal (or one by someone else) means
+  that commit can no longer be overridden: push a new commit, then
+  re-enable auto-merge for a fresh review. Don't dismiss a
   block of an older commit to tidy up; a passing run dismisses those itself.
 - **Re-runs never call the model.** A re-run either applies your override or
   fails with "a re-run never asks the model again". For a fresh review

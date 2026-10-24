@@ -280,6 +280,14 @@ def _run(ev: Event, cfg: Config, gh, review_fn: ReviewFn) -> Outcome:
     blocks = _blocks_on_head(reviews, ev, cfg.marker_key)
     if blocks:
         if not _owner_dismissed(gh, ev, cfg.owner, blocks):
+            # A review can be dismissed only once.
+            if all(r.state == "DISMISSED" for r in reviews if r.id in blocks):
+                return Outcome(1, "the gate blocked this commit and its review is already "
+                                  "dismissed, but that dismissal does not count: it was not "
+                                  f"by {cfg.owner}, or a force push or branch restore came "
+                                  "after the block. A review cannot be dismissed twice: push "
+                                  "a new commit to the PR, then disable and re-enable "
+                                  "auto-merge for a fresh review")
             return Outcome(1, f"the gate blocked this commit; {cfg.owner} must dismiss its "
                               "review to override, then re-run this check")
         return _report(gh, ev, cfg, _always_on(g, cfg), g.own_hash, "owner-override", reviews)

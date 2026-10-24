@@ -592,18 +592,45 @@ def test_owner_dismissal_also_overrides_on_an_auto_merge_toggle():
     assert out.exit_code == 0 and model.calls == []
 
 
+NEW_COMMIT = "push a new commit to the PR"
+
+
 @pytest.mark.parametrize("dismissals", [
-    [],
-    [dismissal(1, BOT)],                 # another workflow, or the gate itself
-    [dismissal(1, "agent-bot[bot]")],
-    [dismissal(2, OWNER)],               # some other review
+    ([], "CHANGES_REQUESTED"),
+    ([dismissal(2, OWNER)], "CHANGES_REQUESTED"),         # some other review
+    ([dismissal(1, BOT)], "DISMISSED"),                   # another workflow, or the gate itself
+    ([dismissal(1, "agent-bot[bot]")], "DISMISSED"),
 ])
 @pytest.mark.parametrize("attempt", [1, 2])
 def test_without_the_owners_dismissal_a_blocked_head_stays_blocked(dismissals, attempt):
-    gh = blocked(dismissals=dismissals)
+    dismissals, state = dismissals
+    gh = blocked(dismissals=dismissals,
+                 reviews=[gate_review("block", HEAD, own_hash_of(DIFF), rid=1, state=state)])
     out, model = run(gh, attempt=attempt)
-    assert out.exit_code == 1 and "dismiss its review" in out.message
-    assert model.calls == [] and gh.posted == []
+    assert out.exit_code == 1 and model.calls == [] and gh.posted == []
+    if state == "DISMISSED":  # the owner cannot dismiss it again
+        assert "dismiss its review" not in out.message and NEW_COMMIT in out.message
+    else:
+        assert "jonathan must dismiss its review" in out.message
+
+
+def test_an_already_dismissed_block_that_does_not_count_asks_for_a_new_commit():
+    gh = blocked(timeline=[posted(1), dismissal(1, OWNER), REWRITE])
+    out, _ = run(gh, attempt=2)
+    assert out.message == (
+        "the gate blocked this commit and its review is already dismissed, but that "
+        "dismissal does not count: it was not by jonathan, or a force push or branch "
+        "restore came after the block. A review cannot be dismissed twice: push a new "
+        "commit to the PR, then disable and re-enable auto-merge for a fresh review")
+
+
+def test_a_block_left_undismissed_still_says_the_owner_must_dismiss_it():
+    h = own_hash_of(DIFF)
+    reviews = [gate_review("block", HEAD, h, rid=1, state="DISMISSED"),
+               gate_review("block", HEAD, h, rid=5)]
+    out, _ = run(FakeGitHub(reviews=reviews, timeline=[posted(1), dismissal(1, OWNER),
+                                                        REWRITE, posted(5)]), attempt=2)
+    assert "jonathan must dismiss its review" in out.message
 
 
 def override_attempts(gh_factory):
@@ -622,7 +649,7 @@ def test_a_stale_dismissal_is_not_an_override_after_a_force_push_back():
                gate_review("pass", OLD, "f" * 64, rid=2)]
     tl = [posted(1), posted(2), dismissal(1, OWNER), REWRITE]
     for out, model, gh in override_attempts(lambda: FakeGitHub(reviews=reviews, timeline=tl)):
-        assert out.exit_code == 1 and "dismiss its review" in out.message
+        assert out.exit_code == 1 and NEW_COMMIT in out.message
         assert model.calls == [] and gh.posted == []
 
 
@@ -637,7 +664,7 @@ def test_a_stale_dismissal_is_not_an_override_after_a_fast_forward_back():
                gate_review("pass", OLD, "f" * 64, rid=2)]
     tl = [posted(1), REWRITE, posted(2), dismissal(1, OWNER)]
     for out, model, gh in override_attempts(lambda: FakeGitHub(reviews=reviews, timeline=tl)):
-        assert out.exit_code == 1 and "dismiss its review" in out.message
+        assert out.exit_code == 1 and NEW_COMMIT in out.message
         assert model.calls == [] and gh.posted == []
 
 
