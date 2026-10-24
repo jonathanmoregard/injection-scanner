@@ -197,6 +197,31 @@ def _allowlist(path: str) -> frozenset[str] | None:
     return None
 
 
+# JSON / TOML / YAML double-quoted string escapes. Package managers decode
+# these before resolving a URL, so `https:\/\/evil` is a URL to them.
+_ESCAPE = re.compile(r"\\(u[0-9A-Fa-f]{4}|U[0-9A-Fa-f]{8}|x[0-9A-Fa-f]{2}|.)")
+_SIMPLE_ESCAPES = {"/": "/", "\\": "\\", '"': '"', "'": "'", "b": "\b", "f": "\f",
+                   "n": "\n", "r": "\r", "t": "\t"}
+_SCHEMEISH = re.compile(r"[A-Za-z][A-Za-z0-9+.-]*(?::|\\)")
+
+
+def _decode_escapes(text: str) -> tuple[str, bool]:
+    """(decoded text, whether an escape was left undecoded)."""
+    unknown = False
+
+    def one(m: re.Match) -> str:
+        nonlocal unknown
+        e = m.group(1)
+        if len(e) > 1 and int(e[1:], 16) <= 0x10FFFF:
+            return chr(int(e[1:], 16))
+        if e in _SIMPLE_ESCAPES:
+            return _SIMPLE_ESCAPES[e]
+        unknown = True
+        return m.group(0)
+
+    return _ESCAPE.sub(one, text), unknown
+
+
 def _host(netloc: str) -> str:
     host = netloc.rsplit("@", 1)[-1]
     host = host.split(":", 1)[0] if not host.startswith("[") else host
@@ -210,8 +235,11 @@ def lockfile_hosts(files: list[FileChange]) -> list[Hit]:
         if allowed is None:
             continue
         flake = PurePosixPath(f.path).name == "flake.lock"
-        for line_no, text in f.added:
+        for line_no, original in f.added:
+            text, undecoded = _decode_escapes(original)
             bad = []
+            if undecoded and _SCHEMEISH.search(text):
+                bad.append("undecodable escape near a URL")
             for scheme, netloc in _URL.findall(text):
                 host = _host(netloc)
                 if scheme.lower() not in _OK_SCHEMES or host not in allowed:

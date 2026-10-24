@@ -92,6 +92,11 @@ it, each with the reason. Design: `docs/superpowers/specs/2026-10-24-pr-gate-des
     flake input types other than github/git/tarball/file/path/indirect and
     any `"host"` outside the list are hits. `Gemfile.lock`: `rubygems.org`.
     Schemes must be https-based or ssh; plain `http`/`git` are hits.
+    Each added line is checked after decoding JSON/TOML/YAML string escapes
+    (`\/`, `\uXXXX`, `\UXXXXXXXX`, `\xXX`, the one-letter ones), because
+    package managers decode them before resolving the URL. An escape the
+    decoder does not know, on a line with a scheme-like token, is a hit
+    (fail closed).
 20. **Binary magic** table covers common images, fonts, archives, PDF, and
     executables (ELF, PE, Mach-O, wasm, `#!` scripts); executables are
     labelled. Every binary blocks either way (design option (a)).

@@ -186,6 +186,34 @@ def test_foreign_lockfile_hosts_block(path, line):
     assert "line 1" in hit.detail
 
 
+@pytest.mark.parametrize("path,line", [
+    # Package managers decode string escapes before resolving the URL.
+    ("package-lock.json", r'"resolved": "https:\/\/evil.example\/a-1.0.0.tgz",'),
+    ("package-lock.json", r'"resolved": "https:\u002f\u002fevil.example/a.tgz",'),
+    ("npm-shrinkwrap.json", r'"resolved": "https\u003A//evil.example/a.tgz",'),
+    ("pnpm-lock.yaml", r'resolution: {tarball: "https:\/\/evil.example\/x.tgz"}'),
+    ("pnpm-lock.yaml", r'resolution: {tarball: "https:\x2f\x2fevil.example/x.tgz"}'),
+    ("pnpm-lock.yaml", r'resolution: {tarball: "https:\U0000002f\U0000002fevil.example/x.tgz"}'),
+    ("uv.lock", r'sdist = { url = "https:\u002f/evil.example/a.tar.gz" }'),
+    ("poetry.lock", r'url = "https:\U0000002F\U0000002Fevil.example/x.whl"'),
+    # An escape the decoder does not know, next to a URL scheme: fail closed.
+    ("package-lock.json", r'"resolved": "https:\q/evil.example/a.tgz",'),
+    ("uv.lock", r'url = "https\:\/\/evil.example/x.whl"'),
+])
+def test_escaped_lockfile_urls_are_decoded_before_the_host_check(path, line):
+    [hit] = checks.lockfile_hosts([fc(path, [line])])
+    assert (hit.rule, hit.overridable) == ("lockfile-host", False)
+
+
+@pytest.mark.parametrize("path,line", [
+    ("package-lock.json", r'"resolved": "https:\/\/registry.npmjs.org\/a\/-\/a-1.0.0.tgz",'),
+    ("uv.lock", r'url = "https:\u002f\u002ffiles.pythonhosted.org/x.whl"'),
+    ("package-lock.json", r'"description": "a \"quoted\" word\\path",'),
+])
+def test_escaped_allowlisted_lockfile_urls_still_pass(path, line):
+    assert checks.lockfile_hosts([fc(path, [line])]) == []
+
+
 def test_non_lockfiles_are_not_host_checked():
     assert checks.lockfile_hosts([fc("README.md", ["https://evil.example/"])]) == []
 
