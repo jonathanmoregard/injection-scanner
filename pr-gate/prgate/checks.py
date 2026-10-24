@@ -1,9 +1,10 @@
 """Deterministic checks. Any hit blocks.
 
-Two of them (hidden Unicode, lockfile hosts) are ALWAYS-ON: they have no
-legitimate trigger, so neither the owner override nor the `exceptions`
-input can turn them off. The binary and path rules are owner-overridable,
-and the path rule can be downgraded per repo to "extra scrutiny".
+Three of them (hidden Unicode, lockfile hosts, a text file git treats as
+binary) are ALWAYS-ON: they have no legitimate trigger, so neither the owner
+override nor the `exceptions` input can turn them off. The other binary and
+path rules are owner-overridable, and the path rule can be downgraded per
+repo to "extra scrutiny".
 
 Everything here is pure: diff in, hits out. Fetching lives in core.py.
 """
@@ -18,16 +19,15 @@ from injection_scanner.unicode_sanitize import find_hidden
 
 from .diffparse import FileChange
 
-ALWAYS_ON_RULES = frozenset({"hidden-unicode", "lockfile-host"})
 LONG_LINE = 500
 
 
 @dataclass(frozen=True)
 class Hit:
-    rule: str          # hidden-unicode | lockfile-host | binary | sensitive-path | too-large
+    rule: str          # hidden-unicode | lockfile-host | text-binary | binary | sensitive-path | too-large
     path: str          # attacker-chosen: neutralise before display
     detail: str        # may contain attacker-chosen text (hosts): neutralise
-    overridable: bool  # cleared by an owner approval of the head SHA
+    overridable: bool  # cleared by the owner dismissing the gate's block
 
 
 @dataclass(frozen=True)
@@ -82,6 +82,16 @@ _EXT_KIND = {
 }
 
 
+# Source/text extensions. Git calls such a file binary when it holds e.g. a
+# NUL byte; then no added lines reach the model or the Unicode and lockfile
+# checks, so nobody can see what it says.
+_TEXT_EXTS = frozenset("""
+    js mjs cjs ts tsx jsx py rb go rs java kt c h cc cpp hpp cs php sh bash zsh fish ps1
+    pl lua nix json yaml yml toml ini cfg conf md txt html css scss sql xml svg lock
+""".split())
+TEXT_BINARY = "text file with binary content (e.g. NUL bytes); no reviewer can see it"
+
+
 def magic_type(data: bytes) -> str | None:
     if data[:4] == b"RIFF" and data[8:12] == b"WEBP":
         return "webp"
@@ -98,19 +108,21 @@ def binaries(files: list[FileChange], contents: dict[str, bytes | None]) -> list
             continue
         data = contents.get(f.path)
         ext = PurePosixPath(f.path).suffix.lower().lstrip(".")
+        kind = None if data is None else magic_type(data)
+        if ext in _TEXT_EXTS and kind in (None, "script"):  # a shebang is text
+            hits.append(Hit("text-binary", f.path, TEXT_BINARY, False))
+            continue
         expected = _EXT_KIND.get(ext)
         if data is None:
             detail = "binary file; content not fetched"
+        elif kind is None:
+            detail = "binary file; unrecognised content type"
+        elif expected is not None and kind != expected:
+            detail = f"binary file; mismatch: content is {kind}, extension says {expected}"
         else:
-            kind = magic_type(data)
-            if kind is None:
-                detail = "binary file; unrecognised content type"
-            elif expected is not None and kind != expected:
-                detail = f"binary file; mismatch: content is {kind}, extension says {expected}"
-            else:
-                detail = f"binary file; content is {kind}"
-            if kind in _EXECUTABLE:
-                detail += " (executable)"
+            detail = f"binary file; content is {kind}"
+        if kind in _EXECUTABLE:
+            detail += " (executable)"
         hits.append(Hit("binary", f.path, detail, True))
     return hits
 
@@ -315,11 +327,11 @@ def run_all(files: list[FileChange], contents: dict[str, bytes | None],
             ) -> tuple[list[Hit], list[Scrutiny]]:
     """All deterministic hits and the extra-scrutiny list.
 
-    `always_on_only` is the owner-override run: the path and binary rules
-    were cleared by the owner's approval, the always-on ones never are.
+    `always_on_only` (owner override, carry-over) keeps only the hits no
+    override can clear.
     """
-    hits = hidden_unicode(files) + lockfile_hosts(files)
     path_hits, exempted = sensitive_paths(files, exceptions)
-    if not always_on_only:
-        hits += binaries(files, contents) + path_hits
+    hits = hidden_unicode(files) + lockfile_hosts(files) + binaries(files, contents) + path_hits
+    if always_on_only:
+        hits = [h for h in hits if not h.overridable]
     return hits, exempted + scrutiny(files)

