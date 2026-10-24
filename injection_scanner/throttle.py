@@ -1051,19 +1051,48 @@ def _utc_month(now: float) -> str:
     return datetime.fromtimestamp(now, UTC).strftime("%Y-%m")
 
 
+class Reservation:
+    """An amount held against one month of a `MonthlyBudget`.
+
+    `decision` is what `reserve` answered. `release()` gives an `ALLOWED`
+    amount back to the month it was taken from, for a call the vendor did not
+    bill. It is idempotent and never raises; a release that cannot be
+    recorded (lock or ledger unusable) keeps the charge, so a failure
+    over-counts and never mints budget.
+    """
+
+    def __init__(
+        self,
+        decision: Decision,
+        budget: MonthlyBudget | None = None,
+        month: str = "",
+        amount: int = 0,
+    ) -> None:
+        self.decision = decision
+        self._budget = budget
+        self._month = month
+        self._amount = amount
+
+    def release(self) -> None:
+        budget, self._budget = self._budget, None
+        if budget is not None:
+            budget._give_back(self._month, self._amount)
+
+
 class MonthlyBudget:
     """A fleet-wide allowance per UTC calendar month, shared through one file.
 
     For a vendor whose free tier is a monthly allowance with no server-side
     cap: past the allowance the vendor bills rather than refuses, so the only
-    thing that can stop the spend is this ledger. `charge(amount)` is called
-    BEFORE each request with the vendor's own size estimate.
+    thing that can stop the spend is this ledger. `reserve(amount)` is called
+    BEFORE each request with the vendor's own size estimate; the caller
+    releases the reservation when the vendor did not bill the call.
 
     `state_dir` holds `<name>-budget.json` and `<name>-budget.lock`, under the
     same `file_lock` discipline as the limiter (fresh fd per operation,
     bounded wait, `0700` directory refused unless owned and not group/world
     writable, `O_NOFOLLOW` opens). The lock serialises threads and processes
-    alike, so concurrent chargers can never overspend.
+    alike, so concurrent reservations can never overspend.
 
     The ledger is `{"schema", "month": "YYYY-MM", "used"}`. A missing file is
     an empty month. A charge in a LATER month than the stored one starts that
@@ -1096,12 +1125,13 @@ class MonthlyBudget:
     def state_path(self) -> Path:
         return self._state_path
 
-    def charge(self, amount: int) -> Decision:
+    def reserve(self, amount: int) -> Reservation:
         """Spend `amount` if it fits in this month's remainder. Never raises.
 
-        All-or-nothing: `ALLOWED` (spent), `THROTTLED` (would exceed the
-        limit; nothing spent) or `ERROR` (the ledger is unusable, or `amount`
-        is not a non-negative integer).
+        All-or-nothing, under the ledger lock: `ALLOWED` (spent until
+        released), `THROTTLED` (would exceed the limit; nothing spent) or
+        `ERROR` (the ledger is unusable, or `amount` is not a non-negative
+        integer).
         """
         try:
             if not isinstance(self._name, str) or not _VENDOR_NAME.match(self._name):
@@ -1114,18 +1144,28 @@ class MonthlyBudget:
                 if month > stored_month:
                     stored_month, used = month, 0
                 if used + amount > self._limit:
-                    return Decision.THROTTLED
-                atomic_write_json(
-                    self._state_path,
-                    {
-                        "schema": _BUDGET_SCHEMA,
-                        "month": stored_month,
-                        "used": used + amount,
-                    },
-                )
-                return Decision.ALLOWED
+                    return Reservation(Decision.THROTTLED)
+                self._store(stored_month, used + amount)
+                return Reservation(Decision.ALLOWED, self, stored_month, amount)
         except Exception:  # noqa: BLE001 — fails CLOSED; see the docstring
-            return Decision.ERROR
+            return Reservation(Decision.ERROR)
+
+    def _give_back(self, month: str, amount: int) -> None:
+        """`Reservation.release`: refund `amount` to `month`, if the ledger is
+        still on it. A month that has turned started at zero and owes nothing."""
+        try:
+            with file_lock(self._lock_path, self._lock_wait_s, clock=self._clock):
+                stored_month, used = self._load(month)
+                if stored_month == month:
+                    self._store(month, max(0, used - amount))
+        except Exception:  # noqa: BLE001 — keeps the charge; see Reservation
+            pass
+
+    def _store(self, month: str, used: int) -> None:
+        atomic_write_json(
+            self._state_path,
+            {"schema": _BUDGET_SCHEMA, "month": month, "used": used},
+        )
 
     def _load(self, month: str) -> tuple[str, int]:
         try:

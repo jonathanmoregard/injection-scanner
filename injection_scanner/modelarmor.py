@@ -16,8 +16,10 @@ Order, each step before anything that costs more:
      environment, and checked against the exact destination;
   3. size cap — `too-large`, never sent (unavailable, never a pass);
   4. OAuth access token, cached in process — `token-error[:<status>]`;
-  5. limiter, then the monthly budget (`vendor_http.paced_post`'s
-     `before_send`), so a call the limiter refuses spends no budget;
+  5. limiter, then a monthly-budget reservation (`vendor_http.paced_post`'s
+     `before_send`), so a call the limiter refuses spends no budget; the
+     reservation is kept only for a decoded HTTP 200 and released otherwise
+     (`_Spend`);
   6. strict parse of the `pi_and_jailbreak` filter result.
 
 Steps 1-2 are `_preflight`, shared with `ready()` (boot readiness), so boot
@@ -50,6 +52,7 @@ from injection_scanner.throttle import (
     LOCK_WAIT_RANGE,
     Decision,
     MonthlyBudget,
+    Reservation,
     cache_dir,
     env_float,
     env_int,
@@ -391,25 +394,46 @@ def ready() -> str | None:
     return prepared.reason if isinstance(prepared, VendorResult) else None
 
 
-def _charge(cost: int) -> VendorResult | None:
-    """Spend `cost` from the fleet's monthly budget, after the limiter."""
-    try:
-        budget = MonthlyBudget(
-            cache_dir(),
-            VENDOR,
-            monthly_tokens(),
-            lock_wait_s=env_float(
-                vendor_env(VENDOR, ENV_LOCK_WAIT_S), DEFAULT_LOCK_WAIT_S, LOCK_WAIT_RANGE
-            ),
-        )
-        decision = budget.charge(cost)
-    except Exception:  # noqa: BLE001 — fails CLOSED
-        decision = Decision.ERROR
-    if decision is Decision.ALLOWED:
-        return None
-    if decision is Decision.THROTTLED:
-        return _unavailable("throttled")
-    return _unavailable("limiter-error")
+class _Spend:
+    """One call's monthly-budget spend: reserve, then settle.
+
+    `reserve` runs as `paced_post`'s `before_send`, after the limiter admits
+    the call: the estimate is taken under the ledger lock, so concurrent
+    callers across the fleet cannot overshoot the month. `settle` keeps it
+    only when Model Armor answered with a decoded HTTP 200 — the outcome it
+    bills, whatever the verdict — and releases it for every other outcome, so
+    a dead or erroring endpoint cannot drain the month with zero verdicts.
+    A timeout is released too although Google may have billed it, so the
+    ledger can under-count by such calls; the default's 5% headroom covers it.
+    """
+
+    def __init__(self, cost: int) -> None:
+        self._cost = cost
+        self._held: Reservation | None = None
+
+    def reserve(self) -> VendorResult | None:
+        try:
+            budget = MonthlyBudget(
+                cache_dir(),
+                VENDOR,
+                monthly_tokens(),
+                lock_wait_s=env_float(
+                    vendor_env(VENDOR, ENV_LOCK_WAIT_S), DEFAULT_LOCK_WAIT_S, LOCK_WAIT_RANGE
+                ),
+            )
+            self._held = budget.reserve(self._cost)
+            decision = self._held.decision
+        except Exception:  # noqa: BLE001 — fails CLOSED
+            decision = Decision.ERROR
+        if decision is Decision.ALLOWED:
+            return None
+        if decision is Decision.THROTTLED:
+            return _unavailable("throttled")
+        return _unavailable("limiter-error")
+
+    def settle(self, reply: vendor_http.Reply) -> None:
+        if self._held is not None and reply.failure is not None:
+            self._held.release()
 
 
 def check(text: str, *, max_wait_s: float | None = None) -> VendorResult:
@@ -452,15 +476,16 @@ def check(text: str, *, max_wait_s: float | None = None) -> VendorResult:
     except _TokenFailure as f:
         return _unavailable(f.condition)
 
-    cost = estimate_tokens(text)
+    spend = _Spend(estimate_tokens(text))
     reply = vendor_http.paced_post(
         VENDOR,
         url,
         json.dumps({"userPromptData": {"text": text}}).encode("utf-8"),
         {"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
         max_wait_s=max_wait_s,
-        before_send=lambda: _charge(cost),
+        before_send=spend.reserve,
     )
+    spend.settle(reply)
     if reply.failure is not None:
         if reply.failure.reason == f"{VENDOR}_unavailable:HTTPError:401":
             # A revoked or expired token: the next call mints a fresh one.

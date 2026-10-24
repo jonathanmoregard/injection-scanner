@@ -784,6 +784,72 @@ def test_an_exhausted_monthly_budget_is_quota_class_and_never_sent(google, monke
     assert google.urls().count(SANITIZE_URL) == 1
 
 
+def _budget_used(tmp_path) -> int:
+    ledger = tmp_path / "cache" / "model_armor-budget.json"
+    if not ledger.exists():
+        return 0
+    return json.loads(ledger.read_text(encoding="utf-8"))["used"]
+
+
+# Every outcome where Model Armor did not hand back a decoded HTTP 200. A
+# timeout may have been billed server-side; releasing it can under-count by
+# that one call, which is accepted (see modelarmor.check).
+_UNBILLED = [
+    URLError(MARKER),
+    TimeoutError(),
+    _http_error(400),
+    _http_error(403),
+    _http_error(429),
+    _http_error(500),
+    _http_error(503),
+    vendor_http.UnexpectedHTTPStatus(),
+    vendor_http.ResponseTooLarge(),
+    vendor_http.DuplicateJSONKey(),
+    json.JSONDecodeError("bad", "{", 0),
+]
+
+
+@pytest.mark.parametrize("failure", _UNBILLED, ids=lambda e: type(e).__name__ + (
+    f"-{e.code}" if isinstance(e, HTTPError) else ""))
+def test_a_failed_call_releases_its_budget_reservation(google, tmp_path, failure):
+    google.sanitize = failure
+    for _ in range(3):
+        assert not modelarmor.check("x" * 40).ok
+    assert _budget_used(tmp_path) == 0
+
+
+def test_a_dead_endpoint_cannot_drain_the_month(google, monkeypatch):
+    """Reproduces the close-out finding: with the endpoint unreachable every
+    call used to spend its estimate, so the month ran out with zero verdicts
+    and the first live call afterwards read `throttled`."""
+    monkeypatch.setenv("INJECTION_SCANNER_MODEL_ARMOR_MONTHLY_TOKENS", "10")
+    google.sanitize = URLError(MARKER)
+    for _ in range(5):
+        assert modelarmor.check("x" * 40) == _unavailable("URLError")
+
+    google.sanitize = _verdict()
+    assert modelarmor.check("x" * 40).reason == "pass"
+
+
+@pytest.mark.parametrize(
+    "sanitize",
+    [
+        _verdict(),
+        _verdict(match="MATCH_FOUND"),
+        _verdict(execution="EXECUTION_SKIPPED"),
+        _verdict(invocation="PARTIAL"),
+        {"unexpected": "shape"},
+    ],
+    ids=["pass", "flag", "skipped", "partial", "unknown-shape"],
+)
+def test_a_decoded_200_keeps_its_budget_charge(google, tmp_path, sanitize):
+    """Model Armor answered, so it billed — whatever the verdict says."""
+    google.sanitize = sanitize
+    modelarmor.check("x" * 40)
+    modelarmor.check("x" * 40)
+    assert _budget_used(tmp_path) == 2 * modelarmor.estimate_tokens("x" * 40)
+
+
 def test_the_monthly_budget_is_clamped(monkeypatch):
     monkeypatch.setenv("INJECTION_SCANNER_MODEL_ARMOR_MONTHLY_TOKENS", "-5")
     assert modelarmor.monthly_tokens() == 0
