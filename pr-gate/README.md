@@ -21,41 +21,52 @@ the base branch). In order, failing closed at every step:
 
 1. **Owner intent.** Auto-merge must be on and enabled by `owner`; the head must
    not have moved since the event. Otherwise the check fails (no review posted).
-2. **Pushes or a reopen after auto-merge** (`synchronize`, `reopened`) fail,
-   with no model call, unless the gate's latest verdict on this PR is a pass
+2. **Default branch only.** The PR must target the repository's default
+   branch. A check result lives on the head commit, so a pass on a PR into
+   another branch would otherwise count for a later PR of the same commit
+   into the default branch.
+3. **Pushes or a reopen after auto-merge** (`synchronize`, `reopened`) fail,
+   with no model call, unless the gate's newest verdict on this PR is a pass
    of identical own changes (a pure "Update branch" merge from the base, or a
    reopen with nothing changed). Then the pass carries over.
-3. **Reroll guard.** If the gate already blocked this head, or the same own
-   changes at another head, the model is not asked again: the run passes only
-   if `owner` approved this head commit. A `github-actions[bot]`
-   REQUEST_CHANGES on the head without a valid gate marker must be dismissed
-   instead; an approval never clears it.
-4. **Deterministic checks** (any hit blocks):
+4. **Override.** If the gate blocked this head commit, the model is not asked
+   again: the run passes (always-on checks only) once `owner` has dismissed
+   that review; until then it fails.
+5. **Re-runs never ask the model.** Any other re-run of the check fails with
+   no model call. A fresh review takes an auto-merge toggle.
+6. **Deterministic checks** (any hit blocks):
    - hidden Unicode in added lines or file paths (`unicode_sanitize` strict
      `profile="code"`: invisible, bidi, tag, variation-selector, private-use,
-     soft-hyphen, line-separator characters). **Never clearable by approval.**
+     soft-hyphen, line-separator characters). **Never overridable.**
    - lockfile entries resolving to a host outside the per-ecosystem allowlist
      (npm/yarn registries, crates.io, PyPI, github.com and NixOS release hosts
-     for flakes, rubygems). **Never clearable by approval.**
-   - added or modified binary files, with a magic-byte vs extension check.
+     for flakes, rubygems). Any URL form a package manager accepts counts
+     (`https:evil.x`, `https:\\evil.x`, escaped slashes, IPv6 hosts).
+     **Never overridable.**
+   - a source/text file (`.js`, `.py`, `.lock`, `.md`, ...) that git treats
+     as binary, e.g. because of a NUL byte, and has no known binary magic:
+     no model and no other check can see it. **Never overridable.**
+   - other added or modified binary files, with a magic-byte vs extension
+     check.
    - changes under `.github/` and to agent-instruction files (`CLAUDE.md`,
      `AGENTS.md`, `.claude/`, `.codex/`, `.mcp.json`).
    - a diff over 400 kB (too large for the model passes).
-5. **Model passes** on the configured model: Monitor A (hostile-author prompt,
+7. **Model passes** on the configured model: Monitor A (hostile-author prompt,
    diff only), Monitor B (same prompt, diff plus post-change file contents),
    and a security/correctness review. The PR title, body, commit messages and
    comments never reach a model.
-6. **Verdict.** Block on any deterministic hit, max suspicion at or above the
+8. **Verdict.** Block on any deterministic hit, max suspicion at or above the
    threshold, any `malicious` or `obscure` finding of medium or high severity,
    any high `security` finding, or any pass that did not complete (refusal,
    truncation, malformed output) or was declined by the configured model.
    Bugs never block.
-7. **Report.** One review on the head commit. Block: REQUEST_CHANGES (COMMENT
+9. **Report.** One review on the head commit. Block: REQUEST_CHANGES (COMMENT
    if GitHub refuses it), check fails. Pass: COMMENT, the gate dismisses its
    own earlier REQUEST_CHANGES reviews, check passes.
 
-API or network errors fail the check without posting a review, so a re-run
-retries; the annotation on the check says what failed.
+API or network errors fail the check without posting a review; since a
+re-run never asks the model, retry by disabling and re-enabling auto-merge.
+The annotation on the check says what failed.
 
 ## Setup checklist (per consuming repo, once)
 
@@ -66,7 +77,9 @@ retries; the annotation on the check says what failed.
    counts as passing).
 2. Ruleset on the default branch: require a pull request; require status
    check `ai-gate` with source **GitHub Actions**; block force pushes; **no
-   bypass actors**. If offered, restrict who can dismiss reviews to the owner.
+   bypass actors**. If offered, restrict who can dismiss reviews to the owner
+   (a dismissal by anyone else never clears a block, but this keeps the
+   REQUEST_CHANGES visible).
 3. Settings → General: allow auto-merge.
 4. Secret `AI_GATE_ANTHROPIC_KEY`: a dedicated key from its own Anthropic
    Console workspace with a spend limit at or below the monthly API credit.
@@ -83,13 +96,15 @@ Org repos need their own secret and ruleset.
 
 - **Request a review:** enable auto-merge. Nothing runs before that, so
   drafts cost nothing.
-- **Clear a block** (false alarm): read the findings, **approve the PR at the
-  blocked head commit**, then **re-run** the failed `ai-gate` check. The
-  re-run sees the approval and passes without a model call. Hidden-Unicode
-  and lockfile-host hits cannot be cleared this way: fix the change. An
-  approval of an older commit does not count. If the check says a bot review
-  "without a valid gate marker requests changes", dismiss that review and
-  re-run: the gate then does a full model review.
+- **Clear a block** (false alarm): read the findings, **dismiss the gate's
+  review**, then **re-run** the failed `ai-gate` check. The re-run sees your
+  dismissal and passes without a model call. This works on your own PRs too
+  (GitHub won't let you approve those). Hidden-Unicode, lockfile-host and
+  text-binary hits cannot be cleared this way: fix the change. A dismissal
+  counts only for the commit the gate blocked, and only if `owner` did it.
+- **Re-runs never call the model.** A re-run either applies your override or
+  fails with "a re-run never asks the model again". For a fresh review
+  (after an infra error, say), disable and re-enable auto-merge.
 - **Pushes:** any push while auto-merge is on fails the gate. Disable and
   re-enable auto-merge to request a fresh review. Exception: "Update branch"
   (merging the base into the PR) passes on its own as long as the PR's own
@@ -100,18 +115,23 @@ Org repos need their own secret and ruleset.
   re-click of auto-merge.
 - **"enable auto-merge to request the AI gate"** on a new PR is expected:
   that is the gate waiting for you.
+- **PRs must target the default branch.** Into any other branch the check
+  fails with "the AI gate only reviews PRs into main".
 
 ## Inputs
 
 | Input | Default | Notes |
 |---|---|---|
-| `owner` | (required) | Login whose auto-merge click and approval count. Not `github.repository_owner` (that is the org for org repos). |
+| `owner` | (required) | Login whose auto-merge click and review dismissal count. Not `github.repository_owner` (that is the org for org repos). |
 | `model` | `claude-opus-5-5` | Use `claude-fable-5-1` for sensitive repos (klaffat, nixos-config, `.claude`). Set in the caller file, which the gate itself protects; never a repo variable. |
 | `effort` | `high` | `low`, `medium`, `high`, `xhigh`, `max`. |
 | `suspicion-threshold` | `25` | Calibrate on past honest PRs (below). |
 | `exceptions` | empty | Newline-separated globs (`*` crosses `/`) whose sensitive-path rule becomes extra scrutiny instead of a block, e.g. `.claude/*` for the `.claude` repo. Never covers `.github/workflows/`, `.github/actions/`, hidden Unicode or lockfile hosts. |
 | `anthropic-api-key` | (required) | `${{ secrets.AI_GATE_ANTHROPIC_KEY }}`. Reaches only the gate step's env. |
-| `github-token` | `${{ github.token }}` | Needs `contents: read`, `pull-requests: write`. |
+
+There is no token input: the gate always uses the workflow's `github.token`
+(`contents: read`, `pull-requests: write` in the caller), so its reviews come
+from `github-actions[bot]`, the only author it trusts.
 
 ## Cost (estimate, not measured)
 
@@ -155,22 +175,25 @@ their maximum suspicion.
   gate signs its review markers with an HMAC keyed by the Anthropic API key,
   which only the gate step receives. A marker that does not verify counts as
   no marker. Another workflow with a write token (e.g. CI that builds PR
-  code) therefore cannot mint a pass or a block. It can still copy or edit
-  the gate's own review bodies (same bot identity), which the gate defuses:
-  a re-posted old pass of changes that were later blocked only carries over
-  if the owner approved that pass's head; and a `github-actions[bot]`
-  REQUEST_CHANGES on the head without a valid marker (forged, or a real block
-  whose body was edited) must be dismissed by the owner, after which the
-  gate runs a full model review. An owner approval only clears a VERIFIED
-  gate block, so no forgery plus one click can merge code no model saw.
-  Still, keep `pull-requests: write` away from workflows that run PR code.
+  code) therefore cannot mint a pass or a block. It can still copy, edit or
+  dismiss the gate's own reviews (same bot identity), which buys nothing: a
+  re-posted real pass only re-asserts content that was passed, an edited
+  block is no longer a block but a re-run never asks the model, and only the
+  owner's dismissal clears a block. Still, keep `pull-requests: write` away
+  from workflows that run PR code.
+- Anyone acting as `owner` (including an agent with the owner's token) can
+  enable auto-merge and dismiss the gate's review, so the gate is only as
+  strong as the custody of that identity.
+- A block posted as a COMMENT (GitHub refused REQUEST_CHANGES) cannot be
+  dismissed, so it cannot be overridden: push a fix and re-enable auto-merge.
 - Lockfile hosts outside the allowlist (e.g. a private registry) cannot be
-  cleared per repo; that needs a gate change.
+  cleared per repo; that needs a gate change. The same goes for `file:`
+  references in a lockfile (`file:../pkg`), which are always hits.
 - A single emoji presentation selector straight after an emoji (the usual
   spelling of a warning-sign emoji) is allowed. Anything else with variation
   selectors, zero-width joiners or other invisible characters (including
   emoji ZWJ sequences such as family emoji) trips the hidden-Unicode check and
-  cannot be approved through; rewrite the text without it.
+  cannot be overridden; rewrite the text without it.
 - Things to verify on the first pilot are listed in the design doc ("Must be
   verified empirically"), notably whether the REQUEST_CHANGES review from
   `github-actions[bot]` is accepted on personal repos and whether

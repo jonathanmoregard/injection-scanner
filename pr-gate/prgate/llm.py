@@ -7,9 +7,10 @@ reason but `end_turn`, and any exception fails closed.
 Two failure classes, kept apart on purpose:
   - "incomplete": the model answered but not usably (refusal, max_tokens,
     bad JSON, out-of-range values). That is an outcome on the PR's content,
-    so it is a BLOCK verdict like any other and the reroll guard applies.
+    so it is a BLOCK verdict like any other; only the owner overrides it.
   - "infra": the call itself failed (timeout, connection, HTTP status,
-    SDK error). No verdict; the check fails and a re-run retries.
+    SDK error). No verdict; the check fails and an auto-merge toggle
+    retries.
 Reasons are a closed vocabulary. Exception messages and HTTP bodies can
 echo the request, so they are never kept.
 """
