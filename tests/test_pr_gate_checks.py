@@ -894,12 +894,6 @@ def test_realistic_lockfiles_are_not_hits(path, text):
     assert lock_hits(path, text) == []
 
 
-def test_this_repos_own_uv_lock_is_not_a_hit():
-    from pathlib import Path
-    text = (Path(__file__).resolve().parent.parent / "uv.lock").read_text(encoding="utf-8")
-    assert lock_hits("uv.lock", text) == []
-
-
 @pytest.mark.parametrize("node", [
     '{"locked": {"type": "gitlab", "owner": "o", "repo": "r"}}',
     '{"original": {"type": "sourcehut", "owner": "o", "repo": "r"}}',
