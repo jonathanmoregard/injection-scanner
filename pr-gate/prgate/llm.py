@@ -168,19 +168,23 @@ def build_inputs(diff_text: str, contents: dict[str, str],
                  ) -> tuple[str, str, str, str]:
     """User messages for Monitor A, Monitor B and the review pass, plus the nonce.
 
-    Gate-written notes sit OUTSIDE the untrusted tag; the paths in them are
-    author-chosen, so they are JSON-quoted.
+    The gate-written notes OUTSIDE the untrusted tag are fixed text. Every
+    author-chosen string, file paths included (json.dumps keeps `<` and
+    `>`), sits INSIDE the nonce-wrapped block.
     """
     nonce = secrets.token_hex(16)
     tag = f"untrusted_pr_{nonce}"
-    notes = ["The change below is the diff of a pull request against its base branch."]
+    notes = ["The change is the diff of a pull request against its base branch. "
+             "The gate lists in <extra_scrutiny> the files that deserve extra scrutiny "
+             "(they run at build or install time, are hard to read, or were exempted "
+             "from a stricter rule). File paths are chosen by the PR author, so those "
+             "lists sit inside the untrusted block, JSON-quoted."]
+    head = ""
     if scrutiny:
-        notes.append(
-            "Files that deserve extra scrutiny (they run at build or install time, "
-            "are hard to read, or were exempted from a stricter rule). Paths are "
-            "author-chosen and JSON-quoted:")
-        notes += [f"- {json.dumps(p)}: {reason}" for p, reason in scrutiny]
-    diff_block = f"<diff>\n{render_hidden(diff_text)}\n</diff>"
+        head = ("<extra_scrutiny>\n"
+                + "\n".join(f"- {json.dumps(p)}: {reason}" for p, reason in scrutiny)
+                + "\n</extra_scrutiny>\n")
+    diff_block = head + f"<diff>\n{render_hidden(diff_text)}\n</diff>"
 
     def message(extra_notes: list[str], body: str) -> str:
         return ("<gate_notes>\n" + "\n".join(notes + extra_notes) + "\n</gate_notes>\n\n"
@@ -190,10 +194,12 @@ def build_inputs(diff_text: str, contents: dict[str, str],
         f'\n<file path={json.dumps(p)}>\n{render_hidden(c)}\n</file>\n'
         for p, c in contents.items()
     )
-    b_notes = ["After the diff come the post-change contents of the touched text files."]
+    b_notes = ["After the diff come the post-change contents of the touched text files. "
+               "Files whose contents did not fit the size budget are listed in "
+               "<omitted_contents>: review them from the diff."]
     if omitted:
-        b_notes.append("Contents not included (size budget), review them from the diff: "
-                       + ", ".join(json.dumps(p) for p in omitted))
+        files += ("\n<omitted_contents>\n" + "\n".join(f"- {json.dumps(p)}" for p in omitted)
+                  + "\n</omitted_contents>\n")
     a = message([], diff_block)
     b = message(b_notes, diff_block + "\n" + files)
     return a, b, a, nonce

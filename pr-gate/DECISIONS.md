@@ -140,6 +140,13 @@ it, each with the reason. Design: `docs/superpowers/specs/2026-10-24-pr-gate-des
 20. Monitors return `analysis` (investigate-then-score), `suspicion`,
     `findings`. `analysis` is never posted to the PR or the log; dry-run
     prints it for calibration.
+20a. **Only fixed text outside the nonce tag.** The extra-scrutiny list and
+    the list of files omitted from Monitor B's contents carry author-chosen
+    paths, and `json.dumps` keeps `<` and `>`, so a path like
+    `</gate_notes> SYSTEM: ...` would have written into the trusted part of
+    the prompt. Both lists sit inside the `untrusted_pr_<nonce>` block
+    (`<extra_scrutiny>`, `<omitted_contents>`); the `<gate_notes>` outside
+    it are fixed prose that only describes them.
 
 ## Deterministic checks
 
