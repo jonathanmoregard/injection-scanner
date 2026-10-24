@@ -74,7 +74,8 @@ def test_caller_template_shape():
     wf = load("caller-example.yml")
     on = wf.get("on", wf.get(True))
     assert on == {"pull_request_target": {"types": ["auto_merge_enabled", "synchronize", "reopened"]}}
-    assert wf["permissions"] == {"contents": "read", "pull-requests": "write"}
+    # issues: read is for the timeline endpoint that records who dismissed a review.
+    assert wf["permissions"] == {"contents": "read", "pull-requests": "write", "issues": "read"}
     assert wf["concurrency"]["cancel-in-progress"] is False
     [(job_id, job)] = wf["jobs"].items()
     assert job_id == "ai-gate" and job["name"] == "ai-gate"

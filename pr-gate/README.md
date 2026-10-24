@@ -31,7 +31,7 @@ the base branch). In order, failing closed at every step:
    reopen with nothing changed). Then the pass carries over.
 4. **Override.** If the gate blocked this head commit, the model is not asked
    again: the run passes (always-on checks only) once `owner` has dismissed
-   that review; until then it fails.
+   that review while the PR sat at this commit; until then it fails.
 5. **Re-runs never ask the model.** Any other re-run of the check fails with
    no model call. A fresh review takes an auto-merge toggle.
 6. **Deterministic checks** (any hit blocks):
@@ -78,8 +78,9 @@ The annotation on the check says what failed.
 2. Ruleset on the default branch: require a pull request; require status
    check `ai-gate` with source **GitHub Actions**; block force pushes; **no
    bypass actors**. If offered, restrict who can dismiss reviews to the owner
-   (a dismissal by anyone else never clears a block, but this keeps the
-   REQUEST_CHANGES visible).
+   **and GitHub Actions**: the gate dismisses its own superseded blocks when
+   a later run passes, and without that you would be dismissing them by hand
+   (a dismissal by anyone else never clears a block either way).
 3. Settings → General: allow auto-merge.
 4. Secret `AI_GATE_ANTHROPIC_KEY`: a dedicated key from its own Anthropic
    Console workspace with a spend limit at or below the monthly API credit.
@@ -100,8 +101,12 @@ Org repos need their own secret and ruleset.
   review**, then **re-run** the failed `ai-gate` check. The re-run sees your
   dismissal and passes without a model call. This works on your own PRs too
   (GitHub won't let you approve those). Hidden-Unicode, lockfile-host and
-  text-binary hits cannot be cleared this way: fix the change. A dismissal
-  counts only for the commit the gate blocked, and only if `owner` did it.
+  text-binary hits cannot be cleared this way: fix the change.
+- **Dismissing the gate's review IS the override**, not housekeeping. It
+  applies only to the commit the PR is at when you dismiss, only if `owner`
+  did it, and only while the PR stays there: a later commit voids it, and so
+  does any force push after the gate posted that block. Don't dismiss a
+  block of an older commit to tidy up; a passing run dismisses those itself.
 - **Re-runs never call the model.** A re-run either applies your override or
   fails with "a re-run never asks the model again". For a fresh review
   (after an infra error, say), disable and re-enable auto-merge.
@@ -130,8 +135,10 @@ Org repos need their own secret and ruleset.
 | `anthropic-api-key` | (required) | `${{ secrets.AI_GATE_ANTHROPIC_KEY }}`. Reaches only the gate step's env. |
 
 There is no token input: the gate always uses the workflow's `github.token`
-(`contents: read`, `pull-requests: write` in the caller), so its reviews come
-from `github-actions[bot]`, the only author it trusts.
+(`contents: read`, `pull-requests: write`, `issues: read` in the caller), so
+its reviews come from `github-actions[bot]`, the only author it trusts.
+`issues: read` is for the timeline endpoint that records who dismissed a
+review; without it the owner-override path cannot see dismissals.
 
 ## Cost (estimate, not measured)
 

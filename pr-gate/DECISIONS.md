@@ -68,12 +68,30 @@ it, each with the reason. Design: `docs/superpowers/specs/2026-10-24-pr-gate-des
     if the issue timeline has a `review_dismissed` event whose
     `actor.login` is the owner (casefolded) and whose
     `dismissed_review.review_id` is one of the blocks on this head
-    (paginated, fail closed). Why: GitHub forbids approving your own PR, so
+    (paginated, fail closed), and the head has provably not moved since
+    (item 11a). Why: GitHub forbids approving your own PR, so
     approval could never clear a block on a PR authored as the owner, which
     is common when agents act as the owner; and three review rounds kept
     finding holes in the review-state guard (approval ordering, forged,
     edited or bot-dismissed bot reviews, carry-over after an override). A
     review's state says nothing about who dismissed it; the timeline does.
+11a. **A dismissal counts only while the head stayed put.** One ordered
+    timeline scan (reviewed, review_dismissed, committed,
+    head_ref_force_pushed, head_ref_restored; a malformed relevant event
+    fails closed): the owner's dismissal of a block on this head counts iff
+    the timeline shows that block being posted, no `committed` event
+    follows the dismissal, and no force push or branch restore follows the
+    block's posting. Why: otherwise a stale dismissal is a permanent token
+    (block H, push a clean H2 that passes, owner dismisses the stale block,
+    push back to H, re-run). The rewrite rule is needed on top of "no head
+    change after the dismissal": GitHub places a `committed` event at the
+    commit's own, writer-chosen date, not at push time, so a fast-forward
+    back to a blocked commit (after a force push to its parent) looks like
+    it happened before the dismissal. Leaving a commit and coming back to
+    it always takes a rewrite, and rewrite, review and dismissal events
+    carry server timestamps. Known cost, fail closed: a head commit dated
+    in the future (writer clock skew) sorts after the dismissal, so that
+    head needs a fresh review instead of an override.
 12. **Re-runs never ask the model** (replaces "any bot REQUEST_CHANGES arms
     the guard" and the same-own-changes reroll guard). With
     `GITHUB_RUN_ATTEMPT` > 1 and no override, the run fails with no model
@@ -91,17 +109,24 @@ it, each with the reason. Design: `docs/superpowers/specs/2026-10-24-pr-gate-des
     and carry-over passes also record their hash, so repeated "Update
     branch" clicks after an override keep carrying over. `reopened` is
     handled exactly like `synchronize`.
-14. **Base = default branch** (from the event's `repository.default_branch`).
-    A check result is attached to the head SHA; a pass on a PR into another
-    branch would otherwise satisfy a later PR of the same head into the
-    default branch.
+14. **Base = default branch** (from the event's `repository.default_branch`),
+    compared to the PR's LIVE `baseRefName` from the GraphQL pull state, not
+    the event payload (a re-run replays the payload). A check result is
+    attached to the head SHA; a pass on a PR into another branch would
+    otherwise satisfy a later PR of the same head into the default branch.
 15. **No token input.** The gate always uses `github.token`, so its reviews
     are by `github-actions[bot]`, the only login it trusts (`GATE_LOGIN`).
-    A custom token would post reviews the next run ignores.
+    A custom token would post reviews the next run ignores. Caller
+    permissions: `contents: read`, `pull-requests: write`, `issues: read`
+    (the timeline is an issues endpoint).
 16. **Always-on checks run on carry-over and override runs**: exactly the
     non-overridable hits (hidden Unicode, lockfile host, text-binary).
-17. The diff is `compare/<base branch>...<head SHA>`: the base branch's
-    current tip (what "Update branch" merged), the head pinned by SHA.
+17. The diff is `compare/<baseRefOid>...<head SHA>`: the base branch's
+    current tip (what "Update branch" merged) as a commit oid read live
+    from GraphQL and validated as 40-hex (else fail closed), the head pinned
+    by SHA. Never a branch name: a writer can push a tag named like the base
+    branch, and a name could resolve to it, making the reviewed diff
+    attacker-chosen.
     Paths follow git's format: the TAB git appends to a `---`/`+++` path
     containing a space is dropped, and C-style quoted paths
     (`"b/caf\303\251.txt"`) are unquoted. A path that starts with `"` but is

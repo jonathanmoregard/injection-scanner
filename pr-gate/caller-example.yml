@@ -17,6 +17,9 @@ on:
 permissions:
   contents: read
   pull-requests: write
+  # The timeline endpoint that records WHO dismissed a review is an issues
+  # endpoint (/issues/{n}/timeline), so the owner-override path needs this.
+  issues: read
 
 # One run per PR at a time. Not cancel-in-progress: a review that is already
 # running finishes and records its pass, so a following "Update branch"
