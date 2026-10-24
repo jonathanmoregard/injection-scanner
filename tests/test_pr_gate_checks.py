@@ -646,6 +646,35 @@ def test_an_unchanged_already_bad_value_is_not_a_hit(path, base, head):
     assert lock_hits(path, base, base=base) == []
 
 
+@pytest.mark.parametrize("path,text", [
+    # git's scp-like remote syntax, user@host:path: no scheme, no slashes.
+    ("Gemfile.lock", "GIT\n  remote: git@evil.example:o/r.git\n  revision: 0123abc\n"),
+    ("Cargo.lock", '[[package]]\nname = "x"\nsource = "git@evil.example:o/r.git"\n'),
+    ("Cargo.lock", '[[package]]\nname = "x"\nsource = "deploy@github.com:o/r.git"\n'),  # odd user
+    ("Cargo.lock", '[[package]]\nname = "x"\nsource = "git@10.0.0.7:o/r.git"\n'),
+    ("Cargo.lock", '[[package]]\nname = "x"\nsource = "git@1password.example:o/r.git"\n'),
+    ("flake.lock", '{"nodes": {"x": {"locked": {"type": "git", "url": "git@evil.example:o/r"}}}}'),
+    ("requirements.txt", "-e git@evil.example:o/r.git#egg=x\n"),
+])
+def test_an_scp_like_git_remote_is_host_checked(path, text):
+    hits = lock_hits(path, text)
+    assert hits and {(h.rule, h.overridable) for h in hits} == {("lockfile-host", False)}
+    assert any("ssh://" in h.detail for h in hits)
+
+
+@pytest.mark.parametrize("path,text", [
+    ("Cargo.lock", '[[package]]\nname = "x"\nsource = "git@github.com:o/r.git"\n'),
+    ("flake.lock", '{"nodes": {"x": {"locked": {"type": "git", "url": "git@github.com:o/r"}}}}'),
+    # name@version: a version is no host.
+    ("yarn.lock", '# yarn lockfile v1\n\n\nx@1.0.0-rc.1:\n  version "1.0.0-rc.1"\n'),
+    ("yarn.lock", '# yarn lockfile v1\n\n\nx@1.0.0-alpha.beta:\n  version "1.0.0-alpha.beta"\n'),
+    ("yarn.lock", '# yarn lockfile v1\n\n\n"x@1.0.0-alpha.beta", x@^1.0.0-alpha.beta:\n  version "1"\n'),
+    ("yarn.lock", '"git@npm:^0.1.5":\n  version: 0.1.5\n  resolution: "git@npm:0.1.5"\n'),
+])
+def test_allowlisted_or_not_scp_like_values_are_not_hits(path, text):
+    assert lock_hits(path, text) == []
+
+
 def test_a_repointed_value_is_reported_by_host():
     [hit] = lock_hits("package-lock.json", _npm_git("evil"), base=_npm_git("trusted"))
     assert "github.com" in hit.detail and "evil/x" not in hit.detail

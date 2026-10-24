@@ -375,6 +375,17 @@ def _continues(line: str, pip: bool) -> bool:
     return n > 0 and prev != "" and not prev.isspace()
 
 
+# git's scp-like remote, user@host:path (no scheme, no slashes): an ssh
+# fetch from host. The host must look like one (dotted with a top label
+# starting with a letter, IPv4, or [IPv6]) and a path must follow the ":",
+# so "git@npm:^1" and a yarn v1 key line "x@1.0.0-alpha.beta:" are not
+# remotes. A user preceded by "/", ":" or "@" is inside a URL, which the
+# URL check reads.
+_SCP = re.compile(r"(?<![A-Za-z0-9+./@:-])([A-Za-z0-9._-]+)@("
+                  r"(?:[A-Za-z0-9][A-Za-z0-9-]*\.)+[A-Za-z][A-Za-z0-9-]*\.?"
+                  r"|\d{1,3}(?:\.\d{1,3}){3}|\[[^\]/]*\]):(?=[^\s\"'])")
+
+
 def _bad_urls(text: str, allowed: frozenset[str]) -> list[str]:
     # Parse the way npm/Node (WHATWG URL) does: tab/newline are stripped
     # anywhere and a backslash is a path separator, so
@@ -385,6 +396,10 @@ def _bad_urls(text: str, allowed: frozenset[str]) -> list[str]:
         host = _host(netloc)
         if scheme.lower() not in _OK_SCHEMES or host not in allowed or _odd_userinfo(scheme, netloc):
             bad.append(f"{scheme.lower()}://{host}")
+    for user, host in _SCP.findall(text):
+        host = host.lower().rstrip(".")
+        if host not in allowed or user != "git":
+            bad.append(f"ssh://{host}")
     return bad
 
 

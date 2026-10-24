@@ -231,6 +231,16 @@ it, each with the reason. Design: `docs/superpowers/specs/2026-10-24-pr-gate-des
     otherwise read as the WebSocket scheme. No consumer fetches a URL that
     starts mid-path.
     Bracketed IPv6 hosts reach the host check (never allowlisted).
+    git's scp-like remote `user@host:path` (no scheme, no slashes, as in a
+    Gemfile.lock `remote: git@evil.x:o/r.git`) is an ssh fetch too: its
+    host is checked against the same allowlist and the user must be `git`
+    (`git@github.com:o/r` passes where github.com is allowlisted). To keep
+    `name@version` and `git@npm:^1` out, the host must be dotted with a
+    top label starting with a letter, IPv4 or `[IPv6]`, a path must
+    follow the `:` (so a yarn v1 key line `x@1.0.0-alpha.beta:` is not
+    one), and a user right after `/ : @` is inside a URL, which the URL
+    check reads. **Residual:** an scp remote to a dotless host
+    (`git@intranet:o/r`) is not recognised.
     Per-line formats (below) decode JSON/TOML/YAML string escapes (`\/`,
     `\uXXXX`, `\UXXXXXXXX`, `\xXX`, the one-letter ones) before the check;
     an escape the decoder does not know, on a line with a scheme-like
