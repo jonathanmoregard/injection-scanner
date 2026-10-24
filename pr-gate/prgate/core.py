@@ -134,9 +134,17 @@ def gather_from(diff_bytes: bytes, fetch_binary: Callable[[str], bytes],
     diff_text = diff_bytes.decode("utf-8", errors="replace")
     files = parse(diff_text)
     binaries = {f.path: fetch_binary(f.path) for f in files if f.binary and f.status != "deleted"}
-    digests = {p: hashlib.sha256(b).hexdigest() for p, b in binaries.items()}
     lockfiles = {f.path: fetch_lockfile(f) for f in files if checks.parsed_lockfile(f)}
-    return Gathered(diff_bytes, diff_text, files, binaries, own_changes_hash(files, digests),
+    # The hash reads the diff with every invalid byte kept distinct
+    # (surrogateescape); "replace" maps them all to U+FFFD, so swapping one
+    # for another would ride a carried-over pass. Same files, same order:
+    # only the characters differ.
+    exact = parse(diff_bytes.decode("utf-8", errors="surrogateescape"))
+    if len(exact) != len(files):
+        raise DiffError("diff parses differently")
+    digests = {e.path: hashlib.sha256(binaries[f.path]).hexdigest()
+               for f, e in zip(files, exact) if f.path in binaries}
+    return Gathered(diff_bytes, diff_text, files, binaries, own_changes_hash(exact, digests),
                     lockfiles)
 
 

@@ -542,6 +542,45 @@ def test_carry_over_still_runs_the_always_on_checks():
     assert out.exit_code == 1 and gh.posted[0][0] == "REQUEST_CHANGES"
 
 
+def _hash_of_bytes(diff_bytes, files=None):
+    files = files or {}
+    return core.gather_from(diff_bytes, lambda p: files.get(p, b""), lambda f: None).own_hash
+
+
+def test_diffs_differing_only_in_invalid_utf8_hash_differently():
+    # Decoded with errors="replace", both bytes become U+FFFD: a push
+    # swapping one for the other would ride a carried-over pass.
+    a = DIFF.encode().replace(b"c = 4", b"c = '\xff'")
+    b = DIFF.encode().replace(b"c = 4", b"c = '\xfe'")
+    assert _hash_of_bytes(a) != _hash_of_bytes(b)
+
+
+def test_invalid_utf8_in_a_binary_path_still_hashes_its_content():
+    diff = (b"diff --git a/x\xff.png b/x\xff.png\nnew file mode 100644\n"
+            b"Binary files /dev/null and b/x\xff.png differ\n")
+    path = diff.decode("utf-8", errors="replace").split("\n")[0].split(" b/")[1]
+    assert (_hash_of_bytes(diff, {path: b"\x89PNG\r\n\x1a\nA"})
+            != _hash_of_bytes(diff, {path: b"\x89PNG\r\n\x1a\nB"}))
+
+
+@pytest.mark.parametrize("diff,expected", [
+    # Own-changes hashes of valid UTF-8 diffs as computed before the
+    # surrogateescape change: carry-over of existing passes must not break.
+    (DIFF, "a3ea9398ea44d9e3baad90f573a4e39c5bd3095724c8383d78c4165c949f009d"),
+    (DIFF.replace("c = 4", 'c = "caf\u00e9 \u4e2d \u2705"'),
+     "78a565352875188065f5db37b53ccfb8e2f626359a9062280f479bbb03bf8664"),
+])
+def test_valid_utf8_diffs_hash_as_before(diff, expected):
+    assert _hash_of_bytes(diff.encode()) == expected
+
+
+def test_the_model_still_gets_replacement_decoded_text():
+    diff = DIFF.encode().replace(b"c = 4", b"c = '\xff'")
+    g = core.gather_from(diff, lambda p: b"", lambda f: None)
+    assert "\ufffd" in g.diff_text and "\udcff" not in g.diff_text
+    assert all("\udcff" not in t for f in g.files for _, t in f.added)
+
+
 def test_binary_content_change_breaks_carry_over():
     diff = DIFF + ("diff --git a/logo.png b/logo.png\nnew file mode 100644\n"
                    "Binary files /dev/null and b/logo.png differ\n")

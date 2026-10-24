@@ -27,7 +27,12 @@ it, each with the reason. Design: `docs/superpowers/specs/2026-10-24-pr-gate-des
 2. **Binary content is in the hash** (SHA-256 of the head blob, fetched
    anyway for the magic-byte check). The diff shows only "Binary files
    differ", so without it a swapped binary would ride a carried-over pass.
-   File modes and renames are in the hash too.
+   File modes and renames are in the hash too. The hash reads the diff
+   bytes decoded with `surrogateescape`, so every invalid UTF-8 byte stays
+   distinct (JSON with `ensure_ascii` keeps the surrogates apart); the
+   model and the checks get the `replace`-decoded text, where any invalid
+   byte is U+FFFD and a swap of one for another would look identical.
+   Valid UTF-8 decodes the same both ways, so existing hashes are unchanged.
 3. **A declined pass blocks.** The server-side refusal fallback is enabled
    (`fallbacks: "default"`), but if the configured model declines and a
    fallback model answers, the run blocks ("reviewer declined (policy)").
