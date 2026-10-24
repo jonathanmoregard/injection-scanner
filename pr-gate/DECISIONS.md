@@ -173,10 +173,11 @@ it, each with the reason. Design: `docs/superpowers/specs/2026-10-24-pr-gate-des
     executables (ELF, PE, Mach-O, wasm, `#!` scripts); executables are
     labelled. Every binary blocks either way (design option (a)). A binary
     with a source/text extension (js, py, sh, json, yaml, toml, md, lock,
-    svg, ... see `_TEXT_EXTS`) and no known magic is a NON-overridable
-    `text-binary` hit: git calls it binary (e.g. a NUL byte in a comment),
-    so no model, Unicode or lockfile check sees it. A `#!` shebang counts as
-    text here, not as a magic.
+    svg, ... see `_TEXT_EXTS`) is a NON-overridable `text-binary` hit,
+    whatever its magic: git calls it binary (e.g. a NUL byte in a comment),
+    so no model, Unicode or lockfile check sees it, and an ASCII magic
+    (`MZ`, `BZh`, `GIF89a`, `#!`) is trivial to put at the top of a text
+    file. A real binary renamed to a text extension blocks the same way.
 24. **Extra scrutiny** (listed to the model, never blocks): `*.nix`,
     lockfiles, `build.rs`, install/setup scripts, package manifests and
     `.gitattributes`/`.gitmodules`/`.npmrc`, minified or vendored paths,

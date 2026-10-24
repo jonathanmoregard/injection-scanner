@@ -85,6 +85,7 @@ _EXT_KIND = {
 # Source/text extensions. Git calls such a file binary when it holds e.g. a
 # NUL byte; then no added lines reach the model or the Unicode and lockfile
 # checks, so nobody can see what it says.
+# Such a file is a text-binary hit whatever its content looks like.
 _TEXT_EXTS = frozenset("""
     js mjs cjs ts tsx jsx py rb go rs java kt c h cc cpp hpp cs php sh bash zsh fish ps1
     pl lua nix json yaml yml toml ini cfg conf md txt html css scss sql xml svg lock
@@ -109,7 +110,9 @@ def binaries(files: list[FileChange], contents: dict[str, bytes | None]) -> list
         data = contents.get(f.path)
         ext = PurePosixPath(f.path).suffix.lower().lstrip(".")
         kind = None if data is None else magic_type(data)
-        if ext in _TEXT_EXTS and kind in (None, "script"):  # a shebang is text
+        # Whatever its magic: an ASCII one ("MZ", "BZh", "GIF89a") is easy
+        # to type at the top of a text file whose NUL byte hides the rest.
+        if ext in _TEXT_EXTS:
             hits.append(Hit("text-binary", f.path, TEXT_BINARY, False))
             continue
         expected = _EXT_KIND.get(ext)

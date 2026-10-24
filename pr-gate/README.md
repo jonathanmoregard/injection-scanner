@@ -44,8 +44,8 @@ the base branch). In order, failing closed at every step:
      (`https:evil.x`, `https:\\evil.x`, escaped slashes, IPv6 hosts).
      **Never overridable.**
    - a source/text file (`.js`, `.py`, `.lock`, `.md`, ...) that git treats
-     as binary, e.g. because of a NUL byte, and has no known binary magic:
-     no model and no other check can see it. **Never overridable.**
+     as binary, e.g. because of a NUL byte, whatever its first bytes look
+     like: no model and no other check can see it. **Never overridable.**
    - other added or modified binary files, with a magic-byte vs extension
      check.
    - changes under `.github/` and to agent-instruction files (`CLAUDE.md`,

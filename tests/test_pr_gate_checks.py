@@ -104,9 +104,17 @@ def test_a_text_file_git_treats_as_binary_is_not_overridable(path, data):
     assert hit.detail == "text file with binary content (e.g. NUL bytes); no reviewer can see it"
 
 
-def test_a_text_extension_with_real_binary_content_stays_overridable():
-    [hit] = checks.binaries([fc("data.json", binary=True)], {"data.json": b"\x1f\x8b\x08\x00"})
-    assert (hit.rule, hit.overridable) == ("binary", True)
+@pytest.mark.parametrize("path,data", [
+    # An ASCII magic is easy to type at the top of a text file whose NUL
+    # byte further down hides it from every reviewer.
+    ("src/app.js", b"MZ = 1;\n// \x00 nobody sees this\n"),
+    ("notes.md", b"BZh is a heading\n\x00"),
+    ("conf.yaml", b"GIF89a: true\n\x00"),
+    ("data.json", b"\x1f\x8b\x08\x00"),  # even real binary content: no override
+])
+def test_a_text_extension_is_text_binary_whatever_its_magic(path, data):
+    [hit] = checks.binaries([fc(path, binary=True)], {path: data})
+    assert (hit.rule, hit.overridable) == ("text-binary", False)
 
 
 def test_a_deleted_text_binary_is_not_a_hit():
