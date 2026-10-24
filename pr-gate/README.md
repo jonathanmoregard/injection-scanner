@@ -50,9 +50,12 @@ the base branch). In order, failing closed at every step:
      (`'''https://pypi.org` + `.evil.x/a.whl'''`): package managers strip
      that newline.
      **Never overridable.**
-   - a source/text file (`.js`, `.py`, `.lock`, `.md`, ...) that git treats
-     as binary, e.g. because of a NUL byte, whatever its first bytes look
-     like: no model and no other check can see it. **Never overridable.**
+   - a source/text file that git treats as binary, e.g. because of a NUL
+     byte, whatever its first bytes look like: no model and no other check
+     can see it. That is a text extension (`.js`, `.py`, `.lock`, `.md`,
+     `.tf`, ...), a known text file name (`Makefile`, `Dockerfile`,
+     `.gitattributes`, ...), a file with no extension, or one starting with
+     `#!`. **Never overridable.**
    - other added or modified binary files, with a magic-byte vs extension
      check.
    - changes under `.github/` and to agent-instruction files (`CLAUDE.md`,
@@ -181,6 +184,9 @@ their maximum suspicion.
   get past a strong monitor roughly 40% of the time. This is a tripwire that
   forces a human look, not a guarantee.
 - Binary files are blocked, not scanned (malware scanning is a follow-up).
+  A real binary with no extension (a compiled executable such as `bin/tool`)
+  or one starting with `#!` counts as a text file git calls binary, so the
+  owner cannot override it: give it an extension, or build it in CI.
 - Carry-over compares the PR's own changes without line offsets, so base
   merges keep a pass. The price: a push that moves an added line to
   another spot with the same three context lines above and below (repeated

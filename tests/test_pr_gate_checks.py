@@ -117,6 +117,51 @@ def test_a_text_extension_is_text_binary_whatever_its_magic(path, data):
     assert (hit.rule, hit.overridable) == ("text-binary", False)
 
 
+_NEW_TEXT_EXTS = """tf hcl tfvars mk cmake gradle kts groovy scala swift m mm vue svelte r ex
+    exs erl hs ml dart bat cmd psm1 psd1 csv tsv rst adoc tex graphql gql proto env
+    properties tpl j2 jinja erb ejs hbs mustache rake gemspec podspec bzl bazel star cue
+    dhall jsonc json5 ipynb patch diff""".split()
+
+
+@pytest.mark.parametrize("ext", _NEW_TEXT_EXTS)
+def test_more_text_extensions_are_text_binary(ext):
+    path = f"infra/main.{ext}"
+    [hit] = checks.binaries([fc(path, binary=True)], {path: b"x = 1\n\x00 hidden\n"})
+    assert (hit.rule, hit.overridable) == ("text-binary", False)
+
+
+@pytest.mark.parametrize("path", [
+    "Makefile", "src/GNUmakefile", "Dockerfile", "deploy/Containerfile", "Gemfile",
+    "Rakefile", "Vagrantfile", "Jenkinsfile", "Procfile", "Brewfile", "justfile",
+    "ios/Podfile", ".gitattributes", ".gitmodules", ".gitignore", ".npmrc", ".yarnrc",
+    ".editorconfig", ".envrc", "MAKEFILE", "Dockerfile.dev", "docker/app.dockerfile",
+])
+def test_known_text_file_names_are_text_binary(path):
+    data = b"all:\n\t@echo hi\n\x00 hidden\n"
+    [hit] = checks.binaries([fc(path, binary=True)], {path: data})
+    assert (hit.rule, hit.overridable) == ("text-binary", False)
+
+
+@pytest.mark.parametrize("path,data", [
+    ("bin/run", b"#!/bin/sh\n\x00echo hidden\n"),        # no extension
+    ("bin/run", b"\x7fELF\x02\x01\x01\x00"),             # no extension, whatever it holds
+    ("tools/gen.bin", b"#!/usr/bin/env python3\n\x00"),  # a shebang is text
+])
+def test_extensionless_or_shebang_files_are_text_binary(path, data):
+    [hit] = checks.binaries([fc(path, binary=True)], {path: data})
+    assert (hit.rule, hit.overridable) == ("text-binary", False)
+
+
+@pytest.mark.parametrize("path,data", [
+    ("logo.png", PNG), ("dist/pkg.zip", b"PK\x03\x04" + b"\x00" * 20),
+    ("wheels/a-1.0-py3-none-any.whl", b"PK\x03\x04" + b"\x00" * 20),
+    ("fonts/x.woff2", b"wOF2" + b"\x00" * 20), ("blob.dat", b"\x00\x01\x02"),
+])
+def test_real_binaries_stay_overridable(path, data):
+    [hit] = checks.binaries([fc(path, binary=True)], {path: data})
+    assert (hit.rule, hit.overridable) == ("binary", True)
+
+
 def test_a_deleted_text_binary_is_not_a_hit():
     assert checks.binaries([fc("a.js", binary=True, status="deleted")], {}) == []
 

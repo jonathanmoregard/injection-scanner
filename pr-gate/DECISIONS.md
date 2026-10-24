@@ -234,6 +234,18 @@ it, each with the reason. Design: `docs/superpowers/specs/2026-10-24-pr-gate-des
     so no model, Unicode or lockfile check sees it, and an ASCII magic
     (`MZ`, `BZh`, `GIF89a`, `#!`) is trivial to put at the top of a text
     file. A real binary renamed to a text extension blocks the same way.
+    The same holds for a git-binary file that is text by name or shape
+    (`_text_file`): a known text file name, casefolded (`Makefile`,
+    `GNUmakefile`, `Dockerfile`, `Containerfile`, `Gemfile`, `Rakefile`,
+    `Vagrantfile`, `Jenkinsfile`, `Procfile`, `Brewfile`, `justfile`,
+    `Podfile`, `.gitattributes`, `.gitmodules`, `.gitignore`, `.npmrc`,
+    `.yarnrc`, `.editorconfig`, `.envrc`, `Dockerfile.*`, `*.dockerfile`);
+    no extension at all (scripts like `bin/run`, dotfiles); or content
+    starting with `#!`. Otherwise an owner dismissal of the overridable
+    `binary` hit would merge a Makefile or a `bin/run` nobody saw. Cost: a
+    real extensionless binary (a compiled `bin/tool`) cannot be overridden
+    either; it needs an extension or a CI build. Other git-binary files
+    (`.png`, `.zip`, `.whl`, `.dat`, ...) keep the overridable `binary` hit.
 24. **Extra scrutiny** (listed to the model, never blocks): `*.nix`,
     lockfiles, `build.rs`, install/setup scripts, package manifests and
     `.gitattributes`/`.gitmodules`/`.npmrc`, minified or vendored paths,

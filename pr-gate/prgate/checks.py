@@ -85,12 +85,31 @@ _EXT_KIND = {
 # Source/text extensions. Git calls such a file binary when it holds e.g. a
 # NUL byte; then no added lines reach the model or the Unicode and lockfile
 # checks, so nobody can see what it says.
-# Such a file is a text-binary hit whatever its content looks like.
+# Such a file is a text-binary hit whatever its content looks like. So is a
+# known text file name, a file with no extension (scripts, dotfiles) and
+# anything starting with "#!".
 _TEXT_EXTS = frozenset("""
     js mjs cjs ts tsx jsx py rb go rs java kt c h cc cpp hpp cs php sh bash zsh fish ps1
     pl lua nix json yaml yml toml ini cfg conf md txt html css scss sql xml svg lock
+    tf hcl tfvars mk cmake gradle kts groovy scala swift m mm vue svelte r ex exs erl hs
+    ml dart bat cmd psm1 psd1 csv tsv rst adoc tex graphql gql proto env properties tpl
+    j2 jinja erb ejs hbs mustache rake gemspec podspec bzl bazel star cue dhall jsonc
+    json5 ipynb patch diff
+""".split())
+_TEXT_NAMES = frozenset("""
+    makefile gnumakefile dockerfile containerfile gemfile rakefile vagrantfile
+    jenkinsfile procfile brewfile justfile podfile .gitattributes .gitmodules
+    .gitignore .npmrc .yarnrc .editorconfig .envrc
 """.split())
 TEXT_BINARY = "text file with binary content (e.g. NUL bytes); no reviewer can see it"
+
+
+def _text_file(path: str, kind: str | None) -> bool:
+    p = PurePosixPath(path)
+    name = p.name.casefold()
+    return (p.suffix.lower().lstrip(".") in _TEXT_EXTS or not p.suffix
+            or name in _TEXT_NAMES or name.startswith("dockerfile.")
+            or name.endswith(".dockerfile") or kind == "script")
 
 
 def magic_type(data: bytes) -> str | None:
@@ -112,7 +131,7 @@ def binaries(files: list[FileChange], contents: dict[str, bytes | None]) -> list
         kind = None if data is None else magic_type(data)
         # Whatever its magic: an ASCII one ("MZ", "BZh", "GIF89a") is easy
         # to type at the top of a text file whose NUL byte hides the rest.
-        if ext in _TEXT_EXTS:
+        if _text_file(f.path, kind):
             hits.append(Hit("text-binary", f.path, TEXT_BINARY, False))
             continue
         expected = _EXT_KIND.get(ext)
