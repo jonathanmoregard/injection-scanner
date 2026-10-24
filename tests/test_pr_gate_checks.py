@@ -1030,6 +1030,11 @@ def test_a_free_text_colon_is_not_a_package_spec():
     ("ws@patch:ws@github%3Aatk/ws#~/.yarn/patches/ws.patch", True),
     ("lib@file:../lib#../lib::hash=4f2e8c&locator=app%40workspace%3A.", False),
     ("lib@link:../lib::locator=app%40workspace%3A.", False),
+    # A path ending in a URL scheme word ("../ws", "./git") is not a scheme.
+    ("ws@link:../ws::locator=app%40workspace%3A.", False),
+    ("ws@file:../ws#../ws::hash=4f2e8c&locator=app%40workspace%3A.", False),
+    ("git@portal:./git::locator=app%40workspace%3A.", False),
+    ("ws@npm:8.17.0::__archiveUrl=wss%3A%2F%2Fevil.example%2Fws.tgz", True),
 ])
 def test_yarn_berry_resolutions(resolution, hit):
     text = _YARN_BERRY.replace('resolution: "ws@npm:8.17.0"', f'resolution: "{resolution}"')

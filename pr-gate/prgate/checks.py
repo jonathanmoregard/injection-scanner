@@ -252,7 +252,7 @@ _OK_SCHEMES = frozenset({"https", "git+https", "registry+https", "sparse+https",
 # ":" and ANY run of slashes, even none: WHATWG/npm read "https:evil.x" and
 # "https:///evil.x" as host evil.x. Any other "scheme://" is a URL too
 # (including file://); a bare local `file:../pkg` reference is not.
-_SCHEME = re.compile(r"(?<![A-Za-z0-9+.-])([A-Za-z][A-Za-z0-9+.-]*):")
+_SCHEME = re.compile(r"(?<![A-Za-z0-9+./-])([A-Za-z][A-Za-z0-9+.-]*):")
 _KNOWN_SCHEME = re.compile(r"(?:\w+\+)?(?:https?|ftp|wss?|git|ssh)", re.I)
 _AUTHORITY = re.compile(r"(/*)([^/?#\s\"'`]*)")
 _FLAKE_TYPES_OK = frozenset({"github", "git", "tarball", "file", "path", "indirect"})
@@ -494,7 +494,7 @@ def _strings(doc, skip_metadata: bool = False):
 _NPM_LOCKS = frozenset({"package-lock.json", "npm-shrinkwrap.json", "bun.lock",
                         "yarn.lock", "pnpm-lock.yaml"})
 _GIT_WORD = r"(?:[A-Za-z0-9.-]+\+)?(?:git|github|gitlab|bitbucket|gist)(?:\+[A-Za-z0-9.-]+)?"
-_GIT_SPEC = re.compile(r"(?<![A-Za-z0-9+.-])(" + _GIT_WORD + r"):(?!\s)", re.I)
+_GIT_SPEC = re.compile(r"(?<![A-Za-z0-9+./-])(" + _GIT_WORD + r"):(?!\s)", re.I)
 _SPEC_PREFIX = re.compile(r"([A-Za-z][A-Za-z0-9+.-]*):(?!\s)")
 _LOCAL_PROTOCOLS = frozenset({"file", "link", "portal"})
 # npm: aliases a registry name; workspace: and catalog: resolve inside the

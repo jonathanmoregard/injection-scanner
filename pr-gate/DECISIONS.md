@@ -225,6 +225,11 @@ it, each with the reason. Design: `docs/superpowers/specs/2026-10-24-pr-gate-des
     the authority up to `/ \ ? #`, whitespace or a quote; any other
     `scheme://` counts too. Scheme candidates are scanned one `word:` at a
     time, so a junk prefix (`x:https://evil.x`) can't hide the URL after it.
+    A candidate (URL scheme or hosted-git protocol) preceded by a letter,
+    digit, `+ . -` or `/` is not one: it is the end of a word or of a path
+    segment, as in Berry's `link:../ws::locator=...`, where `ws:` would
+    otherwise read as the WebSocket scheme. No consumer fetches a URL that
+    starts mid-path.
     Bracketed IPv6 hosts reach the host check (never allowlisted).
     Per-line formats (below) decode JSON/TOML/YAML string escapes (`\/`,
     `\uXXXX`, `\UXXXXXXXX`, `\xXX`, the one-letter ones) before the check;
@@ -319,6 +324,11 @@ it, each with the reason. Design: `docs/superpowers/specs/2026-10-24-pr-gate-des
     a local tarball dependency (`"resolved": "file:../x.tgz"`). `patch:`
     is safe because its inner (percent-encoded) locator is resolved as its
     own lockfile entry; the decoded form is checked as well.
+    **Residual:** that rests on Berry listing a patch's inner locator as
+    its own entry, which was not verified against Berry's source; a patch
+    whose inner locator only appears inside the `patch:` reference is
+    covered by the decoded-form URL and hosted-git checks alone (a bare
+    `owner/repo` there is not caught).
     **Metadata exempt from every string check** (npm family only): a
     package entry's `funding` (a string, `{type, url}`, or a list of
     those), `deprecated` (npm, pnpm) and `license`. No package manager
