@@ -28,13 +28,16 @@ MAX_FINDINGS = 40
 MAX_HITS = 40
 # Review-body marker, authenticated with an HMAC keyed by the Anthropic API
 # key: any workflow in the repo can post as github-actions[bot], but only the
-# gate step holds that secret. An unsigned marker (dry-run) never verifies.
-MARKER = "<!-- pr-gate:v2 verdict={verdict} head={head} hash={hash} mac={mac} -->"
+# gate step holds that secret. The MAC also covers a digest of the rest of
+# the body, so an edited body or a copied marker over other text never
+# verifies. An unsigned marker (dry-run) never verifies.
+MARKER = "<!-- pr-gate:v3 verdict={verdict} head={head} hash={hash} mac={mac} -->"
 UNSIGNED = "unsigned"
 _MARKER_RE = re.compile(
-    r"\A<!-- pr-gate:v2 verdict=(pass|block) head=([0-9a-f]{40}) hash=([0-9a-f]{64})"
+    r"\A<!-- pr-gate:v3 verdict=(pass|block) head=([0-9a-f]{40}) hash=([0-9a-f]{64})"
     r" mac=([0-9a-f]{64}) -->"
 )
+_MARKER_ROOM = 256   # the marker line is ~220 characters; MAX_BODY covers both
 
 
 @dataclass
@@ -93,18 +96,28 @@ def neutralise(text: str, limit: int = 600) -> str:
     return text
 
 
+def body_digest(rest: str) -> str:
+    """SHA-256 of the body after the marker line, as GitHub may store it
+    back: line endings read as \n, trailing whitespace at the end dropped.
+    Lone surrogates (possible in a JSON string) hash, never raise."""
+    text = rest.replace("\r\n", "\n").replace("\r", "\n").rstrip()
+    return hashlib.sha256(text.encode("utf-8", "surrogatepass")).hexdigest()
+
+
 def marker_mac(key: bytes, *, verdict: str, repo: str, number: int, head: str,
-               own_hash: str) -> str:
-    """HMAC-SHA256 over a fixed JSON array: no field can bleed into another."""
-    msg = json.dumps(["pr-gate-marker", "v2", verdict, repo.casefold(), number, head, own_hash],
-                     separators=(",", ":"))
+               own_hash: str, rest: str) -> str:
+    """HMAC-SHA256 over a fixed JSON array: no field can bleed into another.
+    `rest` is the body after the marker line."""
+    msg = json.dumps(["pr-gate-marker", "v3", verdict, repo.casefold(), number, head, own_hash,
+                      body_digest(rest)], separators=(",", ":"))
     return hmac.new(key, msg.encode("utf-8"), hashlib.sha256).hexdigest()
 
 
 def render_marker(key: bytes | None, *, verdict: str, repo: str, number: int, head: str,
-                  own_hash: str) -> str:
+                  own_hash: str, rest: str) -> str:
+    """The marker line for a body that continues with `rest`."""
     mac = (marker_mac(key, verdict=verdict, repo=repo, number=number, head=head,
-                      own_hash=own_hash) if key else UNSIGNED)
+                      own_hash=own_hash, rest=rest) if key else UNSIGNED)
     return MARKER.format(verdict=verdict, head=head, hash=own_hash, mac=mac)
 
 
@@ -119,12 +132,14 @@ def parse_marker(body) -> tuple[str, str, str, str] | None:
 def verify_marker(body, key: bytes | None, *, repo: str, number: int
                   ) -> tuple[str, str, str] | None:
     """(verdict, head, own_hash) if the marker's MAC checks out under `key`
-    for this repo and PR; None otherwise (treated as no marker)."""
+    for this repo and PR and the body as it stands now; None otherwise
+    (treated as no marker)."""
     m = parse_marker(body)
     if not key or m is None:
         return None
+    rest = body[_MARKER_RE.match(body).end():]
     expected = marker_mac(key, verdict=m[0], repo=repo, number=number, head=m[1],
-                          own_hash=m[2])
+                          own_hash=m[2], rest=rest)
     return m[:3] if hmac.compare_digest(m[3], expected) else None
 
 
@@ -152,9 +167,7 @@ def render_body(r: Result, *, key: bytes | None, repo: str, number: int, head: s
     `dismissable=False`: the block goes out as a COMMENT, which GitHub
     cannot dismiss, so the body must not tell the owner to dismiss it."""
     verdict = "block" if r.block else "pass"
-    out = [render_marker(key, verdict=verdict, repo=repo, number=number, head=head,
-                         own_hash=own_hash)]
-    out.append(f"### AI gate: {'BLOCKED' if r.block else 'passed'}")
+    out = [f"### AI gate: {'BLOCKED' if r.block else 'passed'}"]
     if _MODE_LINE[mode]:
         out.append(_MODE_LINE[mode])
     if r.passes:
@@ -192,7 +205,10 @@ def render_body(r: Result, *, key: bytes | None, repo: str, number: int, head: s
             "**To clear a false alarm:** the owner dismisses this review, then re-runs the "
             "failed ai-gate check. Hidden-Unicode, lockfile-host and text-binary hits "
             "cannot be cleared that way: fix the change instead.")
-    body = "\n\n".join(out)
-    if len(body) > MAX_BODY:
-        body = body[:MAX_BODY - 20] + "\n\n… (truncated)"
-    return body
+    rest = "\n\n" + "\n\n".join(out)
+    room = MAX_BODY - _MARKER_ROOM
+    if len(rest) > room:
+        rest = rest[:room - 20] + "\n\n… (truncated)"
+    # Signed last, over the final text: the marker covers exactly what is posted.
+    return render_marker(key, verdict=verdict, repo=repo, number=number, head=head,
+                         own_hash=own_hash, rest=rest) + rest

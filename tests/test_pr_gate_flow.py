@@ -172,7 +172,7 @@ def run(gh, model=None, action="auto_merge_enabled", head=HEAD, attempt=1, **kw)
 def gate_review(verdict_, head, own_hash, state=None, rid=100, login=BOT):
     state = state or ("CHANGES_REQUESTED" if verdict_ == "block" else "COMMENTED")
     body = verdict.render_marker(KEY, verdict=verdict_, repo=REPO, number=7, head=head,
-                                 own_hash=own_hash) + "\n\nbody"
+                                 own_hash=own_hash, rest="\n\nbody") + "\n\nbody"
     return Review(id=rid, login=login, state=state, commit_id=head, body=body)
 
 
@@ -257,6 +257,9 @@ def test_request_changes_refused_falls_back_to_comment():
     assert out.exit_code == 1
     [(ev, _, body)] = gh.posted
     assert ev == "COMMENT" and verdict.parse_marker(body)[0] == "block"
+    # Signed over the re-rendered (undismissable) text actually posted.
+    assert verdict.UNDISMISSABLE in body
+    assert verdict.verify_marker(body, KEY, repo=REPO, number=7)[0] == "block"
 
 
 def test_a_block_posted_as_a_comment_says_it_cannot_be_dismissed():
@@ -583,23 +586,28 @@ def test_reopened_after_a_pass_of_the_same_changes_carries_over():
 def forged_bodies(verdict_, head, own_hash):
     """Marker text any workflow in the repo can post as github-actions[bot],
     without the gate's key."""
-    def with_mac_of(key=KEY, repo=REPO, number=7, v=verdict_, h=own_hash):
-        mac = verdict.marker_mac(key, verdict=v, repo=repo, number=number, head=head, own_hash=h)
-        return verdict.MARKER.format(verdict=verdict_, head=head, hash=own_hash, mac=mac)
+    rest = "\n\nbody"
+
+    def with_mac_of(key=KEY, repo=REPO, number=7, v=verdict_, h=own_hash, signed=rest):
+        mac = verdict.marker_mac(key, verdict=v, repo=repo, number=number, head=head,
+                                 own_hash=h, rest=signed)
+        return verdict.MARKER.format(verdict=verdict_, head=head, hash=own_hash, mac=mac) + rest
 
     real_mac = verdict.marker_mac(KEY, verdict=verdict_, repo=REPO, number=7, head=head,
-                                  own_hash=own_hash)
+                                  own_hash=own_hash, rest=rest)
     one_digit_off = ("0" if real_mac[0] != "0" else "1") + real_mac[1:]
     return [
         f"<!-- pr-gate:v1 verdict={verdict_} head={head} hash={own_hash} -->\n\nbody",
         verdict.render_marker(None, verdict=verdict_, repo=REPO, number=7, head=head,
-                              own_hash=own_hash),                          # unsigned
+                              own_hash=own_hash, rest=rest) + rest,        # unsigned
         with_mac_of(key=b"some-other-key"),
         with_mac_of(number=8),                                             # another PR
         with_mac_of(repo="jonathan/other"),                                # another repo
         with_mac_of(h="f" * 64),                                           # other changes
         with_mac_of(v="block" if verdict_ == "pass" else "pass"),          # other verdict
-        verdict.MARKER.format(verdict=verdict_, head=head, hash=own_hash, mac=one_digit_off),
+        with_mac_of(signed="\n\nother text"),                              # other body
+        verdict.MARKER.format(verdict=verdict_, head=head, hash=own_hash,
+                              mac=one_digit_off) + rest,
     ]
 
 
@@ -652,6 +660,62 @@ def test_a_pass_does_not_dismiss_a_forged_bot_block(body):
                              gate_review("block", OLD, "0" * 64, rid=2)])
     out, _ = run(gh)
     assert out.exit_code == 0 and gh.dismissed == [2]
+
+
+# ----- the marker signs the whole body: edited and minted copies -------------------
+
+def real_block_body():
+    """The body the gate itself posts when it blocks HEAD."""
+    gh = FakeGitHub()
+    run(gh, FakeModel([PassResult("monitor_a", "ok", suspicion=90, findings=[Finding(
+        "src/app.py", "malicious", "high", "sends the deploy key to a remote host",
+        "monitor_a")]), PassResult("monitor_b", "ok", suspicion=5), PassResult("review", "ok")]))
+    [(_, _, body)] = gh.posted
+    assert "sends the deploy key" in body
+    return body
+
+
+def test_an_edited_block_is_no_block_and_its_dismissal_is_no_override():
+    # Another workflow (same bot identity) rewrites the findings under the
+    # intact marker line; the owner dismisses what now looks benign.
+    edited = real_block_body().replace("sends the deploy key to a remote host", "style nit")
+    gh = FakeGitHub(reviews=[Review(1, BOT, "DISMISSED", HEAD, edited)],
+                    dismissals=[dismissal(1, OWNER)])
+    out, model = run(gh, attempt=2)
+    assert out.exit_code == 1 and model.calls == [] and gh.posted == []
+    assert "no verified gate block" in out.message
+
+
+def test_an_edited_block_gets_a_fresh_review_on_the_owners_toggle():
+    edited = real_block_body().replace("sends the deploy key to a remote host", "style nit")
+    gh = FakeGitHub(reviews=[Review(1, BOT, "CHANGES_REQUESTED", HEAD, edited)])
+    out, model = run(gh)
+    assert len(model.calls) == 1 and out.message == "passed (full)"
+
+
+def test_a_minted_review_with_a_copied_marker_and_benign_text_overrides_nothing():
+    # The real block stays; a second review carries its marker line over
+    # harmless text, and the owner dismisses that one.
+    body = real_block_body()
+    minted = body.split("\n", 1)[0] + "\n\n### AI gate: passed\n\nNothing found."
+    gh = FakeGitHub(reviews=[Review(1, BOT, "CHANGES_REQUESTED", HEAD, body),
+                             Review(2, BOT, "DISMISSED", HEAD, minted)],
+                    timeline=[posted(1), posted(2), dismissal(2, OWNER)])
+    out, model = run(gh, attempt=2)
+    assert out.exit_code == 1 and f"{OWNER} must dismiss its review" in out.message
+    assert gh.posted == [] and gh.dismissed == [] and model.calls == []
+
+
+def test_a_minted_identical_copy_of_a_block_is_harmless():
+    # A byte-identical copy verifies, but it shows the owner the very same
+    # findings: dismissing it is an informed override of this change.
+    body = real_block_body()
+    gh = FakeGitHub(reviews=[Review(1, BOT, "CHANGES_REQUESTED", HEAD, body),
+                             Review(2, BOT, "DISMISSED", HEAD, body)],
+                    timeline=[posted(1), posted(2), dismissal(2, OWNER)])
+    out, model = run(gh, attempt=2)
+    assert out.exit_code == 0 and out.message == "passed (owner-override)"
+    assert model.calls == [] and gh.dismissed == [1]
 
 
 def test_carry_over_still_runs_the_always_on_checks():
