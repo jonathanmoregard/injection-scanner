@@ -778,6 +778,63 @@ def test_binary_content_change_breaks_carry_over():
     assert out.exit_code == 1 and gh2.posted == []
 
 
+# ----- pure renames and copies of binaries ---------------------------------------
+# A 100%-similarity rename or copy has no hunks and no "Binary files" line:
+# git says nothing about its content, so the gate reads it at the merge.
+
+def pure(old, new, kind="rename"):
+    return (f"diff --git a/{old} b/{new}\nsimilarity index 100%\n"
+            f"{kind} from {old}\n{kind} to {new}\n")
+
+
+ELF = b"\x7fELF\x02\x01\x01\x00" + b"\x00" * 64
+PNG = b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR" + b"\x00" * 32
+
+
+@pytest.mark.parametrize("kind", ["rename", "copy"])
+def test_a_pure_rename_of_a_binary_to_a_script_name_is_a_text_binary_hit(kind):
+    gh = FakeGitHub(diff=pure("data.bin", "run.sh", kind), files={"run.sh": ELF})
+    out, _ = run(gh)
+    assert out.message == "blocked: deterministic check: text-binary"
+
+
+def test_a_pure_binary_rename_to_a_script_name_survives_an_override():
+    diff = pure("data.bin", "run.sh")
+    gh = blocked(diff=diff, files={"run.sh": ELF}, dismissals=[dismissal(1, OWNER)])
+    out, model = run(gh, attempt=2)
+    assert out.message == "blocked: deterministic check: text-binary" and model.calls == []
+
+
+@pytest.mark.parametrize("kind", ["rename", "copy"])
+def test_a_pure_png_rename_is_an_overridable_binary_hit(kind):
+    gh = FakeGitHub(diff=pure("a.png", "b.png", kind), files={"b.png": PNG})
+    out, _ = run(gh)
+    assert out.message == "blocked: deterministic check: binary"
+    gh2 = blocked(diff=pure("a.png", "b.png", kind), files={"b.png": PNG},
+                  dismissals=[dismissal(1, OWNER)])
+    out2, _ = run(gh2, attempt=2)
+    assert out2.message == "passed (owner-override)"
+
+
+def test_a_pure_text_rename_is_no_hit():
+    gh = FakeGitHub(diff=pure("src/a.py", "src/b.py"), files={"src/b.py": b"x = 1\n"})
+    out, _ = run(gh)
+    assert out.exit_code == 0, out.message
+
+
+def test_a_pure_text_rename_hashes_as_before():
+    g = core.gather_from(pure("src/a.py", "src/b.py").encode(), lambda p: b"x = 1\n",
+                         lambda f: None)
+    assert g.own_hash == "5be811aa84b39d67f88c926701c12f478fd666070cb7371b42dd3a23ba5ee18c"
+
+
+def test_a_pure_binary_rename_puts_its_content_in_the_hash():
+    a = core.gather_from(pure("a.png", "b.png").encode(), lambda p: PNG, lambda f: None)
+    b = core.gather_from(pure("a.png", "b.png").encode(), lambda p: PNG + b"x",
+                         lambda f: None)
+    assert a.own_hash != b.own_hash
+
+
 # ----- step 2: the base must be the default branch -----------------------------------
 
 @pytest.mark.parametrize("action", core.ACTIONS)

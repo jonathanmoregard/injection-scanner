@@ -489,6 +489,21 @@ it, each with the reason. Design: `docs/superpowers/specs/2026-10-24-pr-gate-des
     comes from the BASE branch, so a PR's edit to the list has no effect on
     its own run; and changing the list is a `.github/workflows/` change,
     a sensitive-path block the owner must dismiss.
+22d. **Binary pure renames and copies.** A 100%-similarity rename or copy
+    has no hunks and no "Binary files" line, so the parsed file was never
+    binary and the binary / text-binary rules never ran: an earlier
+    overridden `data.bin` could be renamed `run.sh` with no deterministic
+    hit. `gather_from` now fetches every pure rename or copy (no hunks, not
+    a gitlink) at the merge with the binary fetch and cap, and marks it
+    binary the way git decides (`buffer_is_binary`: a NUL in the first 8000
+    bytes). It is then an ordinary binary under its NEW path: the
+    overridable/non-overridable split follows the new extension and the
+    magic bytes, and its SHA-256 goes into the own-changes hash like any
+    binary's. Text pure renames are untouched; their hash is pinned by a
+    test, so no existing marker changes. Cost: one contents fetch per pure
+    rename. Residual: a renamed symlink is read through the contents API,
+    which follows a link to an in-repo file, so a link to a binary file
+    counts as a binary.
 23. **Binary magic** table covers common images, fonts, archives, PDF, and
     executables (ELF, PE, Mach-O, wasm, `#!` scripts); executables are
     labelled. Every binary blocks either way (design option (a)). Which

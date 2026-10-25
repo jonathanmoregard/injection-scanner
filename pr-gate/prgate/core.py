@@ -45,6 +45,7 @@ DIFF_LLM_CAP = 400_000        # bytes of diff the model passes may read
 DIFF_HARD_CAP = 5_000_000     # bytes of diff the deterministic checks will read
 CONTENTS_BUDGET = 400_000     # bytes of post-change file contents for Monitor B
 FILE_FETCH_CAP = 25_000_000   # per binary file (magic bytes + content hash) or lockfile
+GIT_BINARY_PEEK = 8000        # git's buffer_is_binary: a NUL in the first 8000 bytes
 _LOGIN = re.compile(r"^[A-Za-z0-9](?:[A-Za-z0-9-]{0,38})$")
 _SHA = re.compile(r"^[0-9a-f]{40}$")
 
@@ -165,7 +166,21 @@ def gather_from(diff_bytes: bytes, fetch_binary: Callable[[str], bytes],
         raise TooLarge("diff")
     diff_text = diff_bytes.decode("utf-8", errors="replace")
     files = parse(diff_text)
-    binaries = {f.path: fetch_binary(f.path) for f in files if f.binary and f.status != "deleted"}
+    binaries: dict[str, bytes] = {}
+    for f in files:
+        if f.status == "deleted":
+            continue
+        if f.binary:
+            binaries[f.path] = fetch_binary(f.path)
+        elif f.status == "renamed" and not f.body and not f.gitlink:
+            # A pure (100%) rename or copy has no hunks and no "Binary files"
+            # line: git says nothing about the content. Read it and decide as
+            # git does (a NUL in the first 8000 bytes); a binary is then
+            # checked and hashed under its new path like any other.
+            data = fetch_binary(f.path)
+            if b"\0" in data[:GIT_BINARY_PEEK]:
+                f.binary = True
+                binaries[f.path] = data
     lockfiles = {f.path: fetch_lockfile(f) for f in files if checks.fetched_lockfile(f)}
     # The hash reads the diff with every invalid byte kept distinct
     # (surrogateescape); "replace" maps them all to U+FFFD, so swapping one
@@ -174,6 +189,8 @@ def gather_from(diff_bytes: bytes, fetch_binary: Callable[[str], bytes],
     exact = parse(diff_bytes.decode("utf-8", errors="surrogateescape"))
     if len(exact) != len(files):
         raise DiffError("diff parses differently")
+    for f, e in zip(files, exact):
+        e.binary = f.binary   # a pure rename found binary above
     digests = {e.path: hashlib.sha256(binaries[f.path]).hexdigest()
                for f, e in zip(files, exact) if f.path in binaries}
     return Gathered(diff_bytes, diff_text, files, binaries, own_changes_hash(exact, digests),
