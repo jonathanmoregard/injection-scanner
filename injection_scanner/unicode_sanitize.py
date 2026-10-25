@@ -27,6 +27,19 @@ Goals:
 
 This is NOT a verdict layer on its own; it cleans input and emits a stats
 dict the orchestrator can use.
+
+Profiles:
+  - "prose" (default): the set above. Tuned for research reports, where
+    emoji selectors, RTL marks, soft hyphens and private-use glyphs occur
+    in benign text.
+  - "code": strict, for source diffs (used by the pr-gate). Adds everything
+    the prose profile spares for benign-text reasons: emoji variation
+    selectors U+FE00..U+FE0F (the GlassWorm vector), all private-use code
+    points (BMP and planes 15/16), U+00AD, U+200E/U+200F, U+2028/U+2029,
+    every other format character (category Cf), and the code points that
+    render as nothing (Hangul fillers, combining grapheme joiner, Mongolian
+    free variation selectors). Source code has no legitimate need for any
+    of them that an escape sequence cannot serve.
 """
 from __future__ import annotations
 
@@ -58,6 +71,21 @@ FMT_COVERT = frozenset(
 # Whitespace-in-weird-places: NBSP + line/paragraph separators often used
 # to desynchronize tokenizers but not always malicious. We strip only the
 # zero-width variants; NBSP is left alone.
+
+# Code-profile additions, beyond everything the prose profile strips.
+# Emoji variation selectors U+FE00..U+FE0F are the GlassWorm (2025) vector:
+# a run of them inside a string literal decodes to a payload while the
+# reviewer sees an empty string.
+EMOJI_VARIATION_SELECTORS = (0xFE00, 0xFE0F)
+PRIVATE_USE = ((0xE000, 0xF8FF), (0xF0000, 0xFFFFD), (0x100000, 0x10FFFD))
+CODE_BIDI_MARKS = frozenset({0x200E, 0x200F, 0x061C})  # LRM, RLM, ALM
+# Code points that are not category Cf but still render as nothing.
+CODE_INVISIBLE = frozenset(
+    {0x00AD, 0x2028, 0x2029, 0x034F, 0x115F, 0x1160, 0x3164, 0xFFA0}
+    | set(range(0x180B, 0x1810))          # Mongolian free variation selectors
+)
+
+PROFILES = ("prose", "code")
 
 # Confusable slashes that NFKC does NOT fold to ASCII `/`. Without
 # explicit translation, a tag like `<∕system-reminder>` (U+2215 DIVISION
@@ -93,27 +121,103 @@ def _in_variation_selectors_supplement(cp: int) -> bool:
     )
 
 
-def sanitize(text: str) -> SanitizeResult:
-    bidi = 0
-    tag = 0
-    zw = 0
-    fmt = 0
+def _check_profile(profile: str) -> None:
+    if profile not in PROFILES:
+        raise ValueError(f"unknown unicode_sanitize profile: {profile!r}")
+
+
+def _classify(cp: int, code: bool) -> str | None:
+    """Counter a hidden code point belongs to, or None if it is kept."""
+    if _in_tag_block(cp) or _in_variation_selectors_supplement(cp):
+        return "tag"
+    if cp in BIDI_OVERRIDES:
+        return "bidi"
+    if cp in ZERO_WIDTH:
+        return "zw"
+    if cp in FMT_COVERT:
+        return "fmt"
+    if not code:
+        return None
+    if EMOJI_VARIATION_SELECTORS[0] <= cp <= EMOJI_VARIATION_SELECTORS[1]:
+        return "tag"
+    if cp in CODE_BIDI_MARKS:
+        return "bidi"
+    if cp in CODE_INVISIBLE or any(lo <= cp <= hi for lo, hi in PRIVATE_USE):
+        return "fmt"
+    if unicodedata.category(chr(cp)) == "Cf":
+        return "fmt"
+    return None
+
+
+def is_hidden(cp: int, profile: str = "prose") -> bool:
+    """True if `cp` is a covert/invisible code point under `profile`."""
+    _check_profile(profile)
+    return _classify(cp, profile == "code") is not None
+
+
+# Characters that take an emoji presentation selector in ordinary text
+# ("⚠️", "❤️", "✔️", "1️⃣"). Deliberately coarse: a lone selector after one of
+# these carries at most a bit, while GlassWorm-style payloads need long runs.
+_EMOJI_BASE_RANGES = (
+    (0x0023, 0x0023), (0x002A, 0x002A), (0x0030, 0x0039),  # keycap bases
+    (0x00A9, 0x00A9), (0x00AE, 0x00AE),
+    (0x203C, 0x203C), (0x2049, 0x2049), (0x2122, 0x2122), (0x2139, 0x2139),
+    (0x2194, 0x21AA), (0x231A, 0x23FF), (0x24C2, 0x24C2), (0x25AA, 0x25FE),
+    (0x2600, 0x27BF), (0x2934, 0x2935), (0x2B05, 0x2B55),
+    (0x3030, 0x3030), (0x303D, 0x303D), (0x3297, 0x3297), (0x3299, 0x3299),
+    (0x1F000, 0x1FAFF),
+)
+
+
+def _is_emoji_base(cp: int) -> bool:
+    return any(lo <= cp <= hi for lo, hi in _EMOJI_BASE_RANGES)
+
+
+def _is_variation_selector(cp: int) -> bool:
+    return 0xFE00 <= cp <= 0xFE0F or 0xE0100 <= cp <= 0xE01EF
+
+
+def _is_emoji_presentation(text: str, i: int) -> bool:
+    """True for a single U+FE0E/U+FE0F directly after an emoji base and not
+    followed by another variation selector — the normal way "⚠️" is spelled."""
+    if ord(text[i]) not in (0xFE0E, 0xFE0F) or i == 0:
+        return False
+    if not _is_emoji_base(ord(text[i - 1])):
+        return False
+    return i + 1 >= len(text) or not _is_variation_selector(ord(text[i + 1]))
+
+
+def find_hidden(text: str, profile: str = "code") -> list[tuple[int, int]]:
+    """(index, code point) of every hidden code point in `text`.
+
+    For callers that must BLOCK on any hit (the pr-gate) rather than strip:
+    no density test and no minimum count, so a two-character payload is
+    reported. One exception under the code profile: a single emoji
+    presentation selector after an emoji base ("⚠️") is ordinary text, not a
+    covert channel, and blocking it would make every agent-written doc with
+    an emoji unmergeable.
+    """
+    _check_profile(profile)
+    code = profile == "code"
+    return [
+        (i, ord(ch)) for i, ch in enumerate(text)
+        if _classify(ord(ch), code) is not None
+        and not (code and _is_emoji_presentation(text, i))
+    ]
+
+
+def sanitize(text: str, profile: str = "prose") -> SanitizeResult:
+    _check_profile(profile)
+    code = profile == "code"
+    counts = {"bidi": 0, "tag": 0, "zw": 0, "fmt": 0}
     buf: list[str] = []
     for ch in text:
-        cp = ord(ch)
-        if _in_tag_block(cp) or _in_variation_selectors_supplement(cp):
-            tag += 1
-            continue
-        if cp in BIDI_OVERRIDES:
-            bidi += 1
-            continue
-        if cp in ZERO_WIDTH:
-            zw += 1
-            continue
-        if cp in FMT_COVERT:
-            fmt += 1
+        kind = _classify(ord(ch), code)
+        if kind is not None:
+            counts[kind] += 1
             continue
         buf.append(ch)
+    bidi, tag, zw, fmt = counts["bidi"], counts["tag"], counts["zw"], counts["fmt"]
     raw_clean = "".join(buf)
     nfkc = unicodedata.normalize("NFKC", raw_clean)
     # Fold confusable slashes that NFKC missed so downstream regex layers
