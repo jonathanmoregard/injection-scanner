@@ -41,3 +41,5 @@ jobs:
           anthropic-api-key: ${{ secrets.AI_GATE_ANTHROPIC_KEY }}
           # exceptions: |
           #   .claude/**
+          # lockfile-hosts: |
+          #   npm.mycompany.example

@@ -467,6 +467,28 @@ it, each with the reason. Design: `docs/superpowers/specs/2026-10-24-pr-gate-des
     appeared, which npm usually writes). **Residual:** a fetch slot this
     list does not name (a future lockfile field) is covered only by rule
     (a) and the URL check.
+22c. **`lockfile-hosts`: an owner-set extension of the allowlists**
+    (owner directive 2026-10-25: "the host list should be
+    configurable/extendable using parameters to the job"). One global list
+    of extra hostnames, accepted by every lockfile kind on top of its
+    built-in list: the owner vouches for a host, so per-ecosystem precision
+    buys little and would double the input surface. It only extends:
+    built-ins cannot be removed, schemes stay `https` / `ssh` (no http), and
+    matching stays exact (no subdomains), exactly as for the built-ins, so
+    every path (URLs in parsed and line-checked lockfiles, scp-like
+    remotes, flake `host`, pip options) reads the same merged set. Each
+    non-blank, non-`#` line must be a plain DNS hostname: labels
+    `[a-z0-9-]` not starting or ending in `-`, at least two, the last not
+    all digits (no IPv4), ASCII only, at most 253 characters; case and a
+    trailing dot are normalised. Anything else (wildcard, scheme, port,
+    path, userinfo, IP literal, inline comment) fails the run as a config
+    error, `lockfile-hosts line N is not a plain DNS hostname`, before any
+    GitHub or model call: the line number only, never the value (closed
+    vocabulary). Why the PR cannot widen it: the input lives in the caller
+    workflow, which runs on `pull_request_target` and therefore always
+    comes from the BASE branch, so a PR's edit to the list has no effect on
+    its own run; and changing the list is a `.github/workflows/` change,
+    a sensitive-path block the owner must dismiss.
 23. **Binary magic** table covers common images, fonts, archives, PDF, and
     executables (ELF, PE, Mach-O, wasm, `#!` scripts); executables are
     labelled. Every binary blocks either way (design option (a)). Which

@@ -228,6 +228,7 @@ Org repos need their own secret and ruleset.
 | `effort` | `high` | `low`, `medium`, `high`, `xhigh`, `max`. |
 | `suspicion-threshold` | `25` | Calibrate on past honest PRs (below). |
 | `exceptions` | empty | Newline-separated globs (`*` crosses `/`) whose sensitive-path rule becomes extra scrutiny instead of a block, e.g. `.claude/*` for the `.claude` repo. Never covers `.github/workflows/`, `.github/actions/`, hidden Unicode or lockfile hosts. |
+| `lockfile-hosts` | empty | Newline-separated extra hostnames (e.g. a private registry, `npm.mycompany.example`) that every lockfile check accepts on top of its built-in allowlist. Exact match only: no subdomains, wildcards, schemes, ports, paths or IP literals; blank and `#` comment lines are skipped, case and a trailing dot normalised. Any other line fails the run as a config error naming the line number. It only extends: built-in hosts stay, and URLs must still be https (or ssh for git). Lives in the caller workflow, so a PR cannot extend its own allowlist (DECISIONS item 22c). |
 | `anthropic-api-key` | (required) | `${{ secrets.AI_GATE_ANTHROPIC_KEY }}`. Reaches only the gate step's env. |
 
 There is no token input: the gate always uses the workflow's `github.token`
@@ -358,8 +359,10 @@ their maximum suspicion.
   only the model passes see which repo and commit it is. A value already
   on the default branch that is changed in any way (another repo or
   commit on the same foreign host) counts as new.
-- Lockfile hosts outside the allowlist (e.g. a private registry) cannot be
-  cleared per repo; that needs a gate change. Local `file:../pkg`
+- Lockfile hosts outside the built-in allowlist (e.g. a private registry)
+  cannot be cleared by an override; list them in the caller's
+  `lockfile-hosts` input instead (that edit is itself a `.github/` change
+  the owner must dismiss a block for). Local `file:../pkg`
   references are not host-checked (the referenced path is in the diff);
   `file://` URLs are hits. So is every git dependency in an npm-family
   lockfile (`github:o/r`, `git+ssh://...`), legitimate or not: only values
