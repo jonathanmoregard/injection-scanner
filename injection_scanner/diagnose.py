@@ -75,25 +75,47 @@ def _status_text(code: str) -> str:
     return f"HTTP {code}"
 
 
+# Fixed judge vote signals (judge.py). The judge's api-error and parse-error
+# signals carry no provider prefix — the judge id already names the provider.
+_JUDGE_FIXED = {
+    "key-config-error": "API key configuration error (key file unreadable or malformed)",
+    "malformed-verdict": "reply was not a verdict (malformed-verdict)",
+    "unknown-provider": "provider not supported by this scanner (unknown-provider)",
+}
+
+
+def _api_error(parts: list[str]) -> str:
+    """`<Type>[:<status>]` after an api-error head."""
+    exc = _seg(parts[0]) if parts else "other"
+    if len(parts) > 1:
+        return f"returned {_status_text(parts[1])} ({exc})"
+    return f"API call failed ({exc})"
+
+
+def _parse_error(parts: list[str]) -> str:
+    exc = _seg(parts[0]) if parts else "other"
+    return f"unparseable response ({exc})"
+
+
 def _provider_signal(parts: list[str]) -> str:
-    """Describe a provider-call signal such as `openai-api-error:NotFoundError:404`
-    (honeypot) or `api-error:RateLimitError:429` (judge)."""
+    """Describe a provider-call signal: the honeypot's prefixed
+    `openai-api-error:NotFoundError:404` or the judge's `api-error:NotFoundError:404`."""
     if not parts:
         return "unavailable"
     head = _seg(parts[0])
-    exc = _seg(parts[1]) if len(parts) > 1 else "other"
     if head in ("api-error", "openai-api-error", "anthropic-api-error"):
-        if len(parts) > 2:
-            return f"returned {_status_text(parts[2])} ({exc})"
-        return f"API call failed ({exc})"
+        return _api_error(parts[1:])
     if head in ("parse-error", "openai-parse-error", "anthropic-parse-error"):
-        return f"unparseable response ({exc})"
+        return _parse_error(parts[1:])
+    if head in _JUDGE_FIXED:
+        return _JUDGE_FIXED[head]
     for provider in ("openai", "anthropic"):
         if head == f"no-{provider}-api-key":
             return f"no API key (set {provider.upper()}_API_KEY)"
         if head == f"{provider}-lib-missing":
             return f"{provider} SDK not installed"
     if head == "unhandled":
+        exc = _seg(parts[1]) if len(parts) > 1 else "other"
         return f"unhandled {exc}"
     return head
 

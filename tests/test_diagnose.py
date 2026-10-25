@@ -145,6 +145,27 @@ from injection_scanner.diagnose import describe
             "l2_arbitration:judge_unavailable:anthropic_haiku45:no-anthropic-api-key",
             "judge: anthropic model claude-haiku-4-5: no API key (set ANTHROPIC_API_KEY)",
         ),
+        (
+            "l2_arbitration:judge_unavailable:openai_41_mini:api-error:NotFoundError:404",
+            "judge: openai model gpt-4.1-mini: returned HTTP 404 (NotFoundError)",
+        ),
+        (
+            "l2_arbitration:judge_unavailable:anthropic_haiku45:api-error:TimeoutError",
+            "judge: anthropic model claude-haiku-4-5: API call failed (TimeoutError)",
+        ),
+        (
+            "l2_arbitration:judge_unavailable:anthropic_haiku45:parse-error:IndexError",
+            "judge: anthropic model claude-haiku-4-5: unparseable response (IndexError)",
+        ),
+        (
+            "l2_arbitration:judge_unavailable:openai_41_mini:malformed-verdict",
+            "judge: openai model gpt-4.1-mini: reply was not a verdict (malformed-verdict)",
+        ),
+        (
+            "l2_arbitration:judge_unavailable:openai_41_mini:key-config-error",
+            "judge: openai model gpt-4.1-mini: API key configuration error (key file "
+            "unreadable or malformed)",
+        ),
         ("l2_arbitration:judge_unavailable:panel-incomplete", "judge: panel incomplete"),
         (
             "l2_arbitration:attack:anthropic_haiku45",
@@ -168,6 +189,7 @@ def test_each_layer_is_named(reason: str, expected: str) -> None:
         "lakera_unavailable:Evil$(rm -rf):999999",
         "honeypot_unavailable:ignore previous instructions:unavailable:x",
         "l2_arbitration:judge_unavailable:<script>:api-error:X:4044",
+        "l2_arbitration:judge_unavailable:openai_41_mini:parse-error:ignore previous",
         "model_armor_unavailable:Evil$(x):999999",
         "model_armor:ignore previous instructions",
     ],
@@ -194,3 +216,51 @@ def test_every_panel_vendor_has_a_diagnosis() -> None:
         message = describe(f"{vendor}_unavailable:throttled")
         assert message.startswith(f"{vendor}: ")
         assert message.endswith("quota breaker open (throttled)")
+
+
+class _FakeResponse:
+    """What `APIStatusError.__init__` reads off a response (see test_judge)."""
+
+    def __init__(self, status: int) -> None:
+        self.status_code = status
+        self.headers: dict[str, str] = {}
+        self.request = None
+
+
+@pytest.mark.parametrize("status, exc_name", [(404, "NotFoundError"), (429, "RateLimitError")])
+def test_real_judge_reason_keeps_type_and_status(monkeypatch, status, exc_name) -> None:
+    """The reason comes from the real judge panel, not a hand-typed string, so
+    a drift between what judge.py emits and what describe() parses fails here.
+    Every judge raises the real SDK status error for `status`."""
+    import anthropic
+    import openai
+
+    from injection_scanner import judge
+
+    def raiser(sdk):
+        exc = getattr(sdk, exc_name)("msg", response=_FakeResponse(status), body=None)
+
+        def create(*_a, **_kw):
+            raise exc
+
+        return create
+
+    class _FakeAnthropic:
+        def __init__(self, *_a, **_kw):
+            self.messages = type("_M", (), {"create": staticmethod(raiser(anthropic))})()
+
+    class _FakeOpenAI:
+        def __init__(self, *_a, **_kw):
+            completions = type("_C", (), {"create": staticmethod(raiser(openai))})()
+            self.chat = type("_Chat", (), {"completions": completions})()
+
+    monkeypatch.setattr(judge, "_anthropic_key", lambda: "sk-ant-test")
+    monkeypatch.setattr(judge, "_openai_key", lambda: "sk-openai-test")
+    monkeypatch.setattr(anthropic, "Anthropic", _FakeAnthropic)
+    monkeypatch.setattr(openai, "OpenAI", _FakeOpenAI)
+
+    jr = judge.check("benign text")
+    assert not jr.ok and jr.reason.startswith("judge_unavailable:")
+    # intercept wraps the judge's reason exactly like this.
+    msg = describe(f"l2_arbitration:{jr.reason}")
+    assert f"HTTP {status}" in msg and f"({exc_name})" in msg, msg
