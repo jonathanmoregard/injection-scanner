@@ -264,7 +264,7 @@ git diff FETCH_HEAD^1...FETCH_HEAD > /tmp/pr123.diff   # base...merge: what woul
 python pr-gate/gate.py --dry-run --diff /tmp/pr123.diff --no-llm       # deterministic only
 ANTHROPIC_API_KEY=... python pr-gate/gate.py --dry-run --diff /tmp/pr123.diff \
     [--files-dir CHECKOUT] [--model claude-fable-5-1] [--effort high] [--threshold 25] \
-    [--exceptions-file globs.txt]
+    [--exceptions-file globs.txt] [--lockfile-hosts-file hosts.txt]
 ```
 
 Dry-run reviews the diff it is given as-is and does not compute a merge

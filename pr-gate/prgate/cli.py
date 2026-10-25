@@ -117,11 +117,20 @@ def _read_local(files_dir: Path | None, path: str) -> bytes | None:
 
 
 def _dry_run(args, env) -> int:
+    try:
+        # Gate-written message: a line number, never the value.
+        hosts = checks.parse_lockfile_hosts(
+            Path(args.lockfile_hosts_file).read_text(encoding="utf-8")
+            if args.lockfile_hosts_file else "")
+    except ValueError as e:
+        print(f"config: {e}", file=sys.stderr)
+        return 2
     cfg = core.Config(owner="dry-run", model=args.model, effort=args.effort,
                       threshold=args.threshold,
                       exceptions=checks.parse_exceptions(
                           Path(args.exceptions_file).read_text(encoding="utf-8")
-                          if args.exceptions_file else ""))
+                          if args.exceptions_file else ""),
+                      lockfile_hosts=hosts)
     cfg.validate()
     if not args.no_llm and not (env.get("ANTHROPIC_API_KEY") or "").strip():
         print("ANTHROPIC_API_KEY is not set (or pass --no-llm)", file=sys.stderr)
@@ -195,6 +204,8 @@ def main(argv=None, env=None) -> int:
     p.add_argument("--effort", default="high", choices=llm.EFFORTS)
     p.add_argument("--threshold", type=int, default=25)
     p.add_argument("--exceptions-file", help="newline-separated path globs (dry-run)")
+    p.add_argument("--lockfile-hosts-file",
+                   help="newline-separated extra lockfile hostnames, as the lockfile-hosts input (dry-run)")
     args = p.parse_args(argv)
     try:
         if args.dry_run:

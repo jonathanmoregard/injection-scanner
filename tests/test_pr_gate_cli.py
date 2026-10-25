@@ -121,6 +121,38 @@ def test_dry_run_exceptions_file(tmp_path, capsys):
     assert code == 0 and out["scrutiny"] == [{"path": "CLAUDE.md", "reason": "exception-path"}]
 
 
+_CORP_LOCK = ('{"lockfileVersion": 3, "packages": {"node_modules/a": {"version": "1.0.0", '
+              '"resolved": "https://npm.corp.example/a/-/a-1.0.0.tgz"}}}\n')
+_CORP_LOCK_DIFF = ("diff --git a/package-lock.json b/package-lock.json\n"
+                   "new file mode 100644\n"
+                   "--- /dev/null\n+++ b/package-lock.json\n@@ -0,0 +1 @@\n+" + _CORP_LOCK)
+
+
+@pytest.mark.parametrize("hosts, blocked", [(None, True),
+                                            ("# corp\nnpm.corp.example\n", False)])
+def test_dry_run_lockfile_hosts_file(tmp_path, capsys, hosts, blocked):
+    files = tmp_path / "files"
+    files.mkdir()
+    (files / "package-lock.json").write_text(_CORP_LOCK)
+    argv = ["--dry-run", "--no-llm", "--diff", write(tmp_path, "d.diff", _CORP_LOCK_DIFF),
+            "--files-dir", str(files)]
+    if hosts is not None:
+        argv += ["--lockfile-hosts-file", write(tmp_path, "hosts.txt", hosts)]
+    code = cli.main(argv, env={})
+    out = json.loads(capsys.readouterr().out)
+    assert (code != 0) == blocked
+    assert any(h["rule"] == "lockfile-host" and "npm.corp.example" in h["detail"]
+               for h in out["deterministic"]) == blocked
+
+
+def test_dry_run_bad_lockfile_hosts_file_is_rejected(tmp_path, capsys):
+    code = cli.main(["--dry-run", "--no-llm", "--diff", write(tmp_path, "d.diff", CLEAN),
+                     "--lockfile-hosts-file", write(tmp_path, "h.txt", "*.corp.example\n")],
+                    env={})
+    err = capsys.readouterr().err
+    assert code == 2 and "config: lockfile-hosts line 1" in err and "corp" not in err
+
+
 # ----- Actions mode ----------------------------------------------------------------
 
 def actions_env(tmp_path, **over):
