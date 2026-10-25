@@ -88,10 +88,13 @@ DEFAULT_MAX_CHARS = 240_000
 MAX_CHARS_RANGE = (1_000, 262_144)
 
 # The free tier is 2M tokens a month and nothing server-side stops a project
-# past it: it is billed instead. The default leaves 5% headroom for the
-# estimate being low; 0 refuses every call.
+# past it: it is billed instead, at $0.10 per 1M tokens. The fleet scans about
+# 1.5M tokens a month, so a cap at the free tier would refuse scans late in a
+# heavy month, and with a panel floor of 2 that refuses every report. The
+# default is a runaway guard, not a free-tier fence: 20M tokens is at most
+# ~$1.80 a month over the free tier. 0 refuses every call.
 ENV_MONTHLY_TOKENS = "MONTHLY_TOKENS"
-DEFAULT_MONTHLY_TOKENS = 1_900_000
+DEFAULT_MONTHLY_TOKENS = 20_000_000
 MONTHLY_TOKENS_RANGE = (0, 100_000_000)
 
 # A cached token is replaced this long before Google says it expires, so a
@@ -404,7 +407,7 @@ class _Spend:
     bills, whatever the verdict — and releases it for every other outcome, so
     a dead or erroring endpoint cannot drain the month with zero verdicts.
     A timeout is released too although Google may have billed it, so the
-    ledger can under-count by such calls; the default's 5% headroom covers it.
+    ledger can under-count by such calls; a runaway guard tolerates that.
     """
 
     def __init__(self, cost: int) -> None:

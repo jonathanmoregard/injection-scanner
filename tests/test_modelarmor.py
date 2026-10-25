@@ -856,7 +856,7 @@ def test_the_monthly_budget_is_clamped(monkeypatch):
     monkeypatch.setenv("INJECTION_SCANNER_MODEL_ARMOR_MONTHLY_TOKENS", str(10**12))
     assert modelarmor.monthly_tokens() == 100_000_000
     monkeypatch.delenv("INJECTION_SCANNER_MODEL_ARMOR_MONTHLY_TOKENS")
-    assert modelarmor.monthly_tokens() == 1_900_000
+    assert modelarmor.monthly_tokens() == 20_000_000
 
 
 def test_an_unusable_budget_ledger_is_a_limiter_error(google, monkeypatch, tmp_path):
