@@ -506,7 +506,9 @@ it, each with the reason. Design: `docs/superpowers/specs/2026-10-24-pr-gate-des
     test, so no existing marker changes. Cost: one contents fetch per pure
     rename. Residual: a renamed symlink is read through the contents API,
     which follows a link to an in-repo file, so a link to a binary file
-    counts as a binary.
+    counts as a binary. A pure rename or copy over the fetch cap is not
+    read; it gets an overridable `too-large` hit instead of failing the
+    run with "split the PR", which a rename cannot do.
 23. **Binary magic** table covers common images, fonts, archives, PDF, and
     executables (ELF, PE, Mach-O, wasm, `#!` scripts); executables are
     labelled. Every binary blocks either way (design option (a)). Which

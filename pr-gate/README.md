@@ -109,6 +109,8 @@ the base branch). In order, failing closed at every step:
      bytes), checks it under its new name like any other binary: renaming
      an approved `data.bin` to `run.sh` is a non-overridable
      `text-binary` hit, `a.png` to `b.png` stays an overridable `binary`.
+     One too large to read (over 25 MB) is an overridable `too-large` hit:
+     look at it before dismissing.
    - an added or bumped submodule pointer (gitlink): the commit it points
      at lives in another repo that no reviewer sees. Check the target repo
      (`.gitmodules`) and commit before dismissing. Deleting one is fine.

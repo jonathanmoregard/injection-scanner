@@ -121,6 +121,9 @@ class Gathered:
     binaries: dict[str, bytes]
     own_hash: str
     lockfiles: dict[str, checks.Lockfile]
+    # Pure renames/copies too large to read: content unchecked (an
+    # overridable too-large hit; a rename cannot be split).
+    unread_renames: list[str] = field(default_factory=list)
 
 
 def gather(gh, base_oid: str, ref: str) -> Gathered:
@@ -167,6 +170,7 @@ def gather_from(diff_bytes: bytes, fetch_binary: Callable[[str], bytes],
     diff_text = diff_bytes.decode("utf-8", errors="replace")
     files = parse(diff_text)
     binaries: dict[str, bytes] = {}
+    unread: list[str] = []
     for f in files:
         if f.status == "deleted":
             continue
@@ -177,7 +181,11 @@ def gather_from(diff_bytes: bytes, fetch_binary: Callable[[str], bytes],
             # line: git says nothing about the content. Read it and decide as
             # git does (a NUL in the first 8000 bytes); a binary is then
             # checked and hashed under its new path like any other.
-            data = fetch_binary(f.path)
+            try:
+                data = fetch_binary(f.path)
+            except TooLarge:
+                unread.append(f.path)
+                continue
             if b"\0" in data[:GIT_BINARY_PEEK]:
                 f.binary = True
                 binaries[f.path] = data
@@ -194,7 +202,7 @@ def gather_from(diff_bytes: bytes, fetch_binary: Callable[[str], bytes],
     digests = {e.path: hashlib.sha256(binaries[f.path]).hexdigest()
                for f, e in zip(files, exact) if f.path in binaries}
     return Gathered(diff_bytes, diff_text, files, binaries, own_changes_hash(exact, digests),
-                    lockfiles)
+                    lockfiles, unread)
 
 
 def full_review(g: Gathered, cfg: Config, review_fn: ReviewFn,
@@ -206,6 +214,9 @@ def full_review(g: Gathered, cfg: Config, review_fn: ReviewFn,
     is dry-run --no-llm only."""
     hits, scrutiny = checks.run_all(g.files, g.binaries, cfg.exceptions, g.lockfiles,
                                     extra_hosts=cfg.lockfile_hosts)
+    hits += [checks.Hit("too-large", p, "renamed or copied file too large to read; its "
+                        "content was not checked; human review", True)
+             for p in g.unread_renames]
     passes: list[PassResult] = []
     asked = len(g.diff_bytes) <= DIFF_LLM_CAP
     if not asked:

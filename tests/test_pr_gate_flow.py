@@ -828,6 +828,18 @@ def test_a_pure_text_rename_hashes_as_before():
     assert g.own_hash == "5be811aa84b39d67f88c926701c12f478fd666070cb7371b42dd3a23ba5ee18c"
 
 
+@pytest.mark.parametrize("kind", ["rename", "copy"])
+def test_a_pure_rename_too_large_to_read_is_an_overridable_hit_not_stuck(kind, monkeypatch):
+    # A rename can't be split, so "split the PR" would strand the owner.
+    monkeypatch.setattr(core, "FILE_FETCH_CAP", 16)
+    diff = pure("data/big.json", "data/huge.json", kind)
+    files = {"data/huge.json": b"{" + b" " * 64 + b"}"}
+    out, _ = run(FakeGitHub(diff=diff, files=files))
+    assert out.message == "blocked: deterministic check: too-large"
+    out2, _ = run(blocked(diff=diff, files=files, dismissals=[dismissal(1, OWNER)]), attempt=2)
+    assert out2.message == "passed (owner-override)"
+
+
 def test_a_pure_binary_rename_puts_its_content_in_the_hash():
     a = core.gather_from(pure("a.png", "b.png").encode(), lambda p: PNG, lambda f: None)
     b = core.gather_from(pure("a.png", "b.png").encode(), lambda p: PNG + b"x",
