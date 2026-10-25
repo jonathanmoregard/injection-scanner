@@ -78,11 +78,14 @@ def _actions(env) -> int:
             effort=(env.get("PR_GATE_EFFORT") or "").strip(),
             threshold=int((env.get("PR_GATE_THRESHOLD") or "").strip()),
             exceptions=checks.parse_exceptions(env.get("PR_GATE_EXCEPTIONS", "")),
+            lockfile_hosts=checks.parse_lockfile_hosts(env.get("PR_GATE_LOCKFILE_HOSTS", "")),
             marker_key=(env.get("ANTHROPIC_API_KEY") or "").strip().encode("utf-8"),
         ).validate()
     except ValueError as e:
-        # Messages from Config.validate are gate-written; int() errors are not.
-        msg = str(e) if str(e).startswith(("owner", "model", "effort", "suspicion")) \
+        # Messages from Config.validate and parse_lockfile_hosts are gate-written
+        # (a line number, never the value); int() errors are not.
+        msg = str(e) if str(e).startswith(("owner", "model", "effort", "suspicion",
+                                           "lockfile-hosts")) \
             else "suspicion-threshold must be an integer 0-100"
         return fail(f"config: {msg}")
     token = (env.get("PR_GATE_GITHUB_TOKEN") or "").strip()

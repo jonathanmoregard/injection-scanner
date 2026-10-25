@@ -616,6 +616,73 @@ def test_a_deleted_lockfile_is_not_checked():
     assert checks.lockfile_hosts([fc("uv.lock", status="deleted")], {}) == []
 
 
+# ----- lockfile-hosts: owner-listed extra hosts --------------------------------------
+
+def extra_lock_hits(path, text, extra):
+    f = fc(path, text.split("\n"))
+    return checks.lockfile_hosts([f], {path: checks.Lockfile(text.encode(), None)},
+                                 extra_hosts=frozenset(extra))
+
+
+CORP = "corp.example"
+EXTRA_HOST_CASES = [
+    ("package-lock.json", '"resolved": "https://npm.corp.example/a/-/a-1.0.0.tgz",',
+     "npm.corp.example"),
+    ("uv.lock", 'sdist = { url = "https://pypi.corp.example/packages/a.tar.gz" }',
+     "pypi.corp.example"),
+    ("Cargo.lock", 'source = "git+https://git.corp.example/o/r#0123abcd"', "git.corp.example"),
+    ("flake.lock", '"host": "git.corp.example",', "git.corp.example"),
+    ("Cargo.lock", 'source = "git@git.corp.example:o/r.git"', "git.corp.example"),
+    ("requirements.txt", "-i https://pypi.corp.example/simple", "pypi.corp.example"),
+]
+
+
+@pytest.mark.parametrize("path,line,host", EXTRA_HOST_CASES)
+def test_an_extra_lockfile_host_is_accepted(path, line, host):
+    text = doc(path, line)
+    assert extra_lock_hits(path, text, []) != []           # foreign by default
+    assert extra_lock_hits(path, text, [host]) == []
+
+
+@pytest.mark.parametrize("path,line,host", EXTRA_HOST_CASES)
+def test_a_host_not_listed_still_hits(path, line, host):
+    assert extra_lock_hits(path, doc(path, line), ["other.example"]) != []
+
+
+@pytest.mark.parametrize("path,line,host", EXTRA_HOST_CASES)
+def test_an_extra_host_does_not_cover_its_subdomains(path, line, host):
+    assert extra_lock_hits(path, doc(path, line), [CORP]) != []
+
+
+def test_an_extra_host_does_not_allow_plain_http():
+    text = doc("package-lock.json", '"resolved": "http://npm.corp.example/a.tgz",')
+    assert extra_lock_hits("package-lock.json", text, ["npm.corp.example"]) != []
+
+
+def test_no_extra_hosts_is_the_built_in_allowlist():
+    text = doc("uv.lock", 'sdist = { url = "https://files.pythonhosted.org/a.tar.gz" }')
+    assert extra_lock_hits("uv.lock", text, []) == []
+
+
+def test_lockfile_hosts_input_parses_to_normalised_hostnames():
+    text = "# our registries\n\nnpm.corp.example\n  PyPI.Corp.Example.  \n"
+    assert checks.parse_lockfile_hosts(text) == frozenset(
+        {"npm.corp.example", "pypi.corp.example"})
+    assert checks.parse_lockfile_hosts("") == frozenset()
+
+
+@pytest.mark.parametrize("bad", [
+    "*.corp.example", "https://npm.corp.example", "npm.corp.example:8443",
+    "npm.corp.example/simple", "user@npm.corp.example", "10.0.0.7", "[::1]", "localhost",
+    "npm_corp.example", "-npm.corp.example", "npm..corp.example", "npm.corp.example # x",
+    "npm.corp.examрle", "a" * 64 + ".example",
+])
+def test_a_lockfile_hosts_entry_that_is_not_a_plain_hostname_is_rejected(bad):
+    with pytest.raises(ValueError) as e:
+        checks.parse_lockfile_hosts(f"ok.example\n{bad}\n")
+    assert str(e.value) == "lockfile-hosts line 2 is not a plain DNS hostname"
+
+
 EVIL_PKG = '[[package]]\nname = "{n}"\nsdist = {{ url = "https://evil.example/{n}.tar.gz" }}\n'
 GOOD_PKG = '[[package]]\nname = "{n}"\nsdist = {{ url = "https://files.pythonhosted.org/{n}.tar.gz" }}\n'
 

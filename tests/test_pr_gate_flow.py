@@ -1263,6 +1263,24 @@ def test_override_never_clears_lockfile_hosts():
     assert out.exit_code == 1 and "lockfile-host" in gh.posted[0][2]
 
 
+CORP_LOCK = {"uv.lock": b'url = "https://pypi.corp.example/p.whl"\n'}
+CORP_DIFF = LOCK_DIFF.replace("https://evil.example/p.whl", "https://pypi.corp.example/p.whl")
+
+
+def test_a_full_review_accepts_the_configured_lockfile_hosts():
+    out, _ = run(FakeGitHub(diff=CORP_DIFF, files=CORP_LOCK))
+    assert out.exit_code == 1 and "lockfile-host" in out.message
+    out, _ = run(FakeGitHub(diff=CORP_DIFF, files=CORP_LOCK),
+                 lockfile_hosts=frozenset({"pypi.corp.example"}))
+    assert out.exit_code == 0, out.message
+
+
+def test_an_override_runs_its_always_on_lockfile_check_with_the_configured_hosts():
+    gh = blocked(diff=CORP_DIFF, files=CORP_LOCK, dismissals=[dismissal(1, OWNER)])
+    out, model = run(gh, attempt=2, lockfile_hosts=frozenset({"pypi.corp.example"}))
+    assert out.message == "passed (owner-override)" and model.calls == []
+
+
 # A URL split by a blank line inside a YAML block scalar. The diff shows only
 # one innocuous-looking added line; the whole file is what pnpm reads.
 PNPM_DIFF = ("diff --git a/pnpm-lock.yaml b/pnpm-lock.yaml\n--- a/pnpm-lock.yaml\n"

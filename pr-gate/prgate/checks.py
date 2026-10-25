@@ -289,6 +289,29 @@ def _allowlist(path: str) -> frozenset[str] | None:
     return _PY if kind == "requirements" else _LOCKFILES.get(kind)
 
 
+# The `lockfile-hosts` input: plain DNS hostnames, one per line, that every
+# lockfile accepts on top of its built-in allowlist. Exact match only, like
+# the built-ins. Two or more labels, the last one not all digits (no IPv4).
+_LABEL = r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?"
+_HOSTNAME = re.compile(rf"(?:{_LABEL}\.)+(?=[a-z0-9-]*[a-z-])({_LABEL})", re.ASCII)
+
+
+def parse_lockfile_hosts(text: str) -> frozenset[str]:
+    """Blank lines and `#` comment lines are skipped; case and a trailing
+    dot are normalised. Anything else raises ValueError naming only the
+    line number: the value is never echoed."""
+    hosts = set()
+    for n, line in enumerate((text or "").splitlines(), 1):
+        entry = line.strip()
+        if not entry or entry.startswith("#"):
+            continue
+        host = entry.lower().removesuffix(".")
+        if len(host) > 253 or not _HOSTNAME.fullmatch(host):
+            raise ValueError(f"lockfile-hosts line {n} is not a plain DNS hostname")
+        hosts.add(host)
+    return frozenset(hosts)
+
+
 def renamed_from_other_kind(f: FileChange) -> bool:
     """Renamed or copied from a path that is not the same kind of lockfile
     (tests/fixtures/lock.json -> package-lock.json): the old file was never
@@ -778,12 +801,16 @@ def _checked_lines(f: FileChange, lf: Lockfile | None):
     return enumerate(lf.head.decode("utf-8", errors="replace").split("\n"), 1)
 
 
-def lockfile_hosts(files: list[FileChange], lockfiles: dict[str, Lockfile]) -> list[Hit]:
+def lockfile_hosts(files: list[FileChange], lockfiles: dict[str, Lockfile], *,
+                   extra_hosts: frozenset[str] = frozenset()) -> list[Hit]:
+    """`extra_hosts` (the lockfile-hosts input) only extends each built-in
+    allowlist; schemes and every other rule are unchanged."""
     hits = []
     for f in files:
         allowed = _allowlist(f.path)
         if allowed is None or f.status == "deleted":
             continue
+        allowed = allowed | extra_hosts
         name = PurePosixPath(f.path).name.casefold()
         lf = lockfiles.get(f.path)
         if not parsed_lockfile(f):
@@ -859,7 +886,7 @@ def scrutiny(files: list[FileChange]) -> list[Scrutiny]:
 
 def run_all(files: list[FileChange], contents: dict[str, bytes | None],
             exceptions: list[str], lockfiles: dict[str, Lockfile], *,
-            always_on_only: bool = False
+            always_on_only: bool = False, extra_hosts: frozenset[str] = frozenset()
             ) -> tuple[list[Hit], list[Scrutiny]]:
     """All deterministic hits and the extra-scrutiny list.
 
@@ -867,7 +894,7 @@ def run_all(files: list[FileChange], contents: dict[str, bytes | None],
     override can clear.
     """
     path_hits, exempted = sensitive_paths(files, exceptions)
-    hits = (hidden_unicode(files) + lockfile_hosts(files, lockfiles)
+    hits = (hidden_unicode(files) + lockfile_hosts(files, lockfiles, extra_hosts=extra_hosts)
             + binaries(files, contents) + submodules(files) + path_hits)
     if always_on_only:
         hits = [h for h in hits if not h.overridable]

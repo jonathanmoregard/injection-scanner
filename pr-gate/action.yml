@@ -27,6 +27,14 @@ inputs:
       hidden-Unicode check or the lockfile-host check.
     required: false
     default: ""
+  lockfile-hosts:
+    description: >
+      Newline-separated extra hostnames (exact match, no wildcards, schemes,
+      ports or paths; # comment lines allowed) that every lockfile check
+      accepts on top of its built-in allowlist, e.g. a private registry.
+      Only extends; https/ssh-only schemes are unchanged.
+    required: false
+    default: ""
   anthropic-api-key:
     description: Anthropic API key from a dedicated, spend-capped Console workspace. Also the HMAC key that signs the gate's review markers.
     required: true
@@ -58,6 +66,7 @@ runs:
         PR_GATE_EFFORT: ${{ inputs.effort }}
         PR_GATE_THRESHOLD: ${{ inputs.suspicion-threshold }}
         PR_GATE_EXCEPTIONS: ${{ inputs.exceptions }}
+        PR_GATE_LOCKFILE_HOSTS: ${{ inputs.lockfile-hosts }}
         PR_GATE_GITHUB_TOKEN: ${{ github.token }}
         ANTHROPIC_API_KEY: ${{ inputs.anthropic-api-key }}
       run: '"$RUNNER_TEMP/pr-gate-venv/bin/python" -I "$GITHUB_ACTION_PATH/gate.py"'

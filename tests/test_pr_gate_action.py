@@ -18,7 +18,8 @@ def load(name):
 def test_action_inputs_and_defaults():
     inputs = load("action.yml")["inputs"]
     assert set(inputs) == {"owner", "model", "effort", "suspicion-threshold", "exceptions",
-                           "anthropic-api-key"}
+                           "lockfile-hosts", "anthropic-api-key"}
+    assert inputs["lockfile-hosts"]["default"] == ""
     assert inputs["owner"]["required"] is True
     assert inputs["anthropic-api-key"]["required"] is True
     assert inputs["model"]["default"] == "claude-opus-5-5"

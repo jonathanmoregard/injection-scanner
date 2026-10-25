@@ -77,6 +77,9 @@ class Config:
     effort: str
     threshold: int
     exceptions: list[str] = field(default_factory=list)
+    # The lockfile-hosts input: hostnames every lockfile accepts on top of
+    # the built-in allowlists (checks.parse_lockfile_hosts).
+    lockfile_hosts: frozenset[str] = frozenset()
     # The Anthropic API key, also the HMAC key for review markers. Kept out
     # of repr so a stray print of the config cannot leak it.
     marker_key: bytes = field(default=b"", repr=False)
@@ -184,7 +187,8 @@ def full_review(g: Gathered, cfg: Config, review_fn: ReviewFn,
     closed unless exactly the three passes came back, each with a known
     status (anything but "ok" blocks in `decide`). `require_passes=False`
     is dry-run --no-llm only."""
-    hits, scrutiny = checks.run_all(g.files, g.binaries, cfg.exceptions, g.lockfiles)
+    hits, scrutiny = checks.run_all(g.files, g.binaries, cfg.exceptions, g.lockfiles,
+                                    extra_hosts=cfg.lockfile_hosts)
     passes: list[PassResult] = []
     asked = len(g.diff_bytes) <= DIFF_LLM_CAP
     if not asked:
@@ -262,7 +266,7 @@ def _owner_dismissed(gh, ev: Event, owner: str, review_ids: list[int]) -> bool:
 
 def _always_on(g: Gathered, cfg: Config) -> verdict.Result:
     hits, scrutiny = checks.run_all(g.files, g.binaries, cfg.exceptions, g.lockfiles,
-                                    always_on_only=True)
+                                    always_on_only=True, extra_hosts=cfg.lockfile_hosts)
     return verdict.decide(hits, scrutiny, [], cfg.threshold)
 
 

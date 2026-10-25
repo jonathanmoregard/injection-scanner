@@ -141,6 +141,7 @@ def actions_env(tmp_path, **over):
         "PR_GATE_EFFORT": "high",
         "PR_GATE_THRESHOLD": "25",
         "PR_GATE_EXCEPTIONS": ".claude/*\n",
+        "PR_GATE_LOCKFILE_HOSTS": "# ours\nNPM.corp.example\n",
         "PR_GATE_GITHUB_TOKEN": "ghs_x",
         "ANTHROPIC_API_KEY": "sk-ant-x",
         "GITHUB_STEP_SUMMARY": str(tmp_path / "summary.md"),
@@ -164,6 +165,7 @@ def test_actions_mode_maps_env_to_config_and_event(tmp_path, capsys, monkeypatch
     c = seen["cfg"]
     assert (c.owner, c.model, c.effort, c.threshold, c.exceptions, c.marker_key) == (
         "jonathan", "claude-opus-5-5", "high", 25, [".claude/*"], b"sk-ant-x")
+    assert c.lockfile_hosts == frozenset({"npm.corp.example"})
     assert "::notice::" in capsys.readouterr().out
     assert "passed" in (tmp_path / "summary.md").read_text()
 
@@ -181,6 +183,31 @@ def test_actions_mode_refuses_other_events(tmp_path, capsys):
 def test_actions_mode_config_errors_fail(tmp_path, capsys, over):
     code = cli.main([], env=actions_env(tmp_path, **over))
     assert code == 1 and "::error::" in capsys.readouterr().out
+
+
+def test_actions_mode_without_lockfile_hosts_has_none(tmp_path, monkeypatch):
+    seen = {}
+    monkeypatch.setattr(cli.core, "run", lambda ev, cfg, gh, fn: seen.update(cfg=cfg)
+                        or core.Outcome(0, "passed (full)"))
+    env = actions_env(tmp_path)
+    del env["PR_GATE_LOCKFILE_HOSTS"]
+    assert cli.main([], env=env) == 0 and seen["cfg"].lockfile_hosts == frozenset()
+
+
+@pytest.mark.parametrize("value", ["*.corp.example", "https://npm.corp.example",
+                                   "npm.corp.example:8443", "10.0.0.7", "localhost"])
+def test_a_bad_lockfile_hosts_entry_is_a_config_error_before_any_call(tmp_path, capsys,
+                                                                      monkeypatch, value):
+    def never(*a):
+        raise AssertionError("the gate must not run")
+
+    monkeypatch.setattr(cli.core, "run", never)
+    code = cli.main([], env=actions_env(tmp_path,
+                                        PR_GATE_LOCKFILE_HOSTS=f"ok.example\n\n{value}\n"))
+    out = capsys.readouterr().out
+    assert code == 1
+    assert "::error::config: lockfile-hosts line 3 is not a plain DNS hostname" in out
+    assert value not in out
 
 
 @pytest.mark.parametrize("over", [{"GITHUB_RUN_ATTEMPT": ""}, {"GITHUB_RUN_ATTEMPT": "x"}])
