@@ -71,6 +71,30 @@ def test_a_hidden_character_path_that_will_exist_is_a_hit(status, old_path):
     [hit] = checks.hidden_unicode([fc(HIDDEN_PATH, status=status, old_path=old_path)])
     assert hit.rule == "hidden-unicode" and not hit.overridable and "path" in hit.detail
 
+@pytest.mark.parametrize("ch,cp", [("\t", "U+0009"), ("\x0c", "U+000C"), ("\r", "U+000D"),
+                                   ("\x1b", "U+001B"), ("\x00", "U+0000"), ("\x7f", "U+007F"),
+                                   ("\x85", "U+0085"), ("\n", "U+000A")])
+def test_a_control_character_in_a_file_path_is_a_hit(ch, cp):
+    [hit] = checks.hidden_unicode([fc(f"src/a{ch}b.py", status="added")])
+    assert (hit.rule, hit.overridable) == ("hidden-unicode", False)
+    assert "path" in hit.detail and cp in hit.detail
+
+
+def test_a_quoted_path_with_a_tab_from_the_diff_is_a_hit():
+    diff = ('diff --git "a/src/a\\tb.py" "b/src/a\\tb.py"\nnew file mode 100644\n'
+            '--- /dev/null\n+++ "b/src/a\\tb.py"\n@@ -0,0 +1 @@\n+x = 1\n')
+    [f] = parse(diff)
+    assert f.path == "src/a\tb.py"
+    [hit] = checks.hidden_unicode([f])
+    assert "U+0009" in hit.detail
+
+
+def test_deleting_or_renaming_away_a_control_character_path_is_no_hit():
+    assert checks.hidden_unicode([fc("src/a\x1bb.py", status="deleted")]) == []
+    assert checks.hidden_unicode([fc("src/ab.py", status="renamed",
+                                     old_path="src/a\x1bb.py")]) == []
+
+
 def test_clean_lines_pass():
     assert checks.hidden_unicode([fc("a.md", ["café 中 ✅ tab\there"])]) == []
 

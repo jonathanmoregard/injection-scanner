@@ -281,7 +281,10 @@ it, each with the reason. Design: `docs/superpowers/specs/2026-10-24-pr-gate-des
     line (CRLF files). An ESC erase-line or conceal sequence, backspaces or
     a mid-line CR hide or overwrite the line in a terminal review; NUL and
     U+0085 have no use in source. Same non-overridable hit, with the code
-    points listed.
+    points listed. In file paths (those the merge leaves, item 21) EVERY
+    control character is a hit, TAB, form feed and CR included: none has a
+    legitimate use in a file name, and a TAB or CR in a path can reshape
+    how a terminal or a log shows the file list.
 22. **Lockfile allowlists:** npm-family locks: `registry.npmjs.org`,
     `registry.yarnpkg.com`. Python locks and pip requirement files
     (`requirements*.txt` / `constraints*.txt`, pip-tools'

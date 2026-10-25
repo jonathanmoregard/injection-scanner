@@ -58,7 +58,8 @@ the base branch). In order, failing closed at every step:
      soft-hyphen, line-separator characters), and control characters in
      added lines (ESC sequences that erase or conceal a line in a terminal,
      NUL, backspace, DEL, C1 such as U+0085; TAB, form feed and a trailing CR
-     are fine). **Never overridable.**
+     are fine). In those file paths every control character is a hit, TAB,
+     form feed and CR included. **Never overridable.**
    - lockfile entries resolving to a host outside the per-ecosystem allowlist
      (npm/yarn registries, crates.io, PyPI, github.com and NixOS release hosts
      for flakes, rubygems). JSON, TOML and YAML lockfiles (`package-lock.json`,

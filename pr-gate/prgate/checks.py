@@ -55,6 +55,7 @@ def _u(cps) -> str:
 # shared "code" profile keeps them for its other callers. Allowed: TAB, form
 # feed (page breaks) and a trailing CR (CRLF files).
 _CONTROLS = re.compile(r"[\x00-\x08\x0a\x0b\x0d-\x1f\x7f-\x9f]")
+_PATH_CONTROLS = re.compile(r"[\x00-\x1f\x7f-\x9f]")  # all of Cc
 
 
 def hidden_unicode(files: list[FileChange]) -> list[Hit]:
@@ -62,10 +63,13 @@ def hidden_unicode(files: list[FileChange]) -> list[Hit]:
     for f in files:
         # Only a path that exists after the merge: one already on the base
         # must stay deletable, and renamable to a clean name.
-        found = [] if f.status == "deleted" else find_hidden(f.path, "code")
-        if found:
-            hits.append(Hit("hidden-unicode", f.path,
-                            f"in the file path: {_u(cp for _, cp in found)}", False))
+        # Every control character counts in a path, TAB, FF and CR too:
+        # none of them has a legitimate use in a file name.
+        cps = [] if f.status == "deleted" else (
+            [cp for _, cp in find_hidden(f.path, "code")]
+            + [ord(c) for c in _PATH_CONTROLS.findall(f.path)])
+        if cps:
+            hits.append(Hit("hidden-unicode", f.path, f"in the file path: {_u(cps)}", False))
         for line_no, text in f.added:
             cps = [cp for _, cp in find_hidden(text, "code")]
             cps += [ord(c) for c in _CONTROLS.findall(text.removesuffix("\r"))]
