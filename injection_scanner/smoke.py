@@ -58,6 +58,7 @@ from pathlib import Path
 from typing import Callable
 
 from injection_scanner import throttle
+from injection_scanner.diagnose import describe
 from injection_scanner.intercept import (
     Verdict,
     is_lakera_quota_degraded,
@@ -372,8 +373,7 @@ def run_smoke(
     if not v.ok:
         msg = (
             f"benign liveness probe returned ok=False ({v.reason}). "
-            "Likely L2/L3 degraded — check LAKERA_API_KEY / ANTHROPIC_API_KEY "
-            "/ OPENAI_API_KEY / network / SDK."
+            f"Failed layer — {describe(v.reason)}."
         )
         err(f"scanner self-test FAILED: {msg}")
         raise SmokeFailure(msg)
@@ -381,7 +381,7 @@ def run_smoke(
     if hp != "pass":
         msg = (
             f"honeypot layer not 'pass' on benign probe (got {hp!r}). "
-            "L3 likely degraded."
+            f"Failed layer — {describe(hp)}."
         )
         err(f"scanner self-test FAILED: {msg}")
         raise SmokeFailure(msg)
@@ -393,8 +393,7 @@ def run_smoke(
     if lk != "pass" and not quota_fallback:
         msg = (
             f"lakera layer not 'pass' and strict quota fallback incomplete "
-            f"on benign probe (got {lk!r}). L2 likely degraded — check "
-            "LAKERA_API_KEY / network."
+            f"on benign probe (got {lk!r}). Failed layer — {describe(lk)}."
         )
         err(f"scanner self-test FAILED: {msg}")
         raise SmokeFailure(msg)
