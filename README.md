@@ -69,6 +69,17 @@ Batch callers pass a wait budget instead of being refused: `scan(..., lakera_max
 
 The final directory component is checked with `lstat` before every use. It must be a real directory owned by the current uid; symlinks and foreign owners are refused. A same-owner directory is also refused when it grants group or world write unless it has the sticky bit. Sticky world-writable directories are allowed because other unprivileged users cannot rename or unlink entries they do not own; the directory owner or a privileged process still can. A refusal makes the limiter fail closed with `lakera_unavailable:limiter-error` and the liveness cache read as a miss. This covers both hostile pre-creation under a shared temp directory and ordinary `sudo -E` ownership accidents. **Sharing one cache directory between accounts is unsupported by design.**
 
+### Prompt size: one request per text, measured past 8k tokens
+
+`lakera.check()` sends the whole text in one request. Lakera's Community plan lists an 8k-token maximum prompt and does not document what happens above it, so it was measured on 2026-10-24 (two calls, production key and project policy):
+
+| # | Text | Result |
+|---|---|---|
+| 1 | ~49k chars (~12k tokens) of benign prose, one obvious injection at ~10k tokens | HTTP 200, `lakera:prompt_attack` (flagged) |
+| 2 | Same text, injection replaced by a benign sentence | HTTP 200, `pass` |
+
+Guard therefore screens content after the 8k mark, at least up to ~12k tokens, and no chunking is done. Larger texts (the biggest research reports reach ~95k characters, ~24k tokens) are unmeasured; re-run the same two-call probe at that size before relying on it.
+
 ### The boot-smoke liveness cache
 
 `run_smoke()` has two phases: deterministic canaries that touch no network, and one live probe that calls Lakera and the honeypot providers. Measured 2026-09-06, research-agent boot smokes alone ran **~632 per day** — one per server spawn, plus one per degraded recheck — about 19,000 a month against a 10,000-a-month quota, before a single report is scanned. Spawn frequency, not scan volume, is what exhausts the account, and one Claude Code session restore spawns six panes at once. The limiter bounds the RATE; only this reduces the DEMAND.
@@ -108,7 +119,7 @@ The key can be sent only to the canonical Guard destination, `https://api.lakera
 
 Per-push CI calls no external service. `.github/workflows/ci.yml` runs only the deterministic suite on Python 3.12 and 3.13 — no Lakera, no Anthropic, no OpenAI, no secrets — so a pull request cannot go red because a vendor is down or throttled, and it works unchanged on a fork. Pytest installs a project-wide socket embargo before collection and keeps it through fixture finalizers: IPv4 and IPv6 sockets are forbidden, Unix sockets remain available, and command-line, marker and fixture escape hatches are rejected. Offline coverage does not shrink: `tests/test_judge.py` drives the real Anthropic/OpenAI SDKs over a stub transport (which is what caught the 1.x `temperature` signature break), while `tests/test_lakera.py` exercises request construction, proxy/redirect policy, bounded reads, JSON decoding and the strict response contract using only in-process `_post`, transport and `OpenerDirector` doubles — never loopback or a real endpoint.
 
-The live evaluation is an operational/scheduled workflow, not part of pytest or the merge gate. It lives in `.github/workflows/live-eval.yml` and runs **nightly at 03:17 UTC and on demand**:
+The live evaluation is an operational workflow, not part of pytest or the merge gate. It lives in `.github/workflows/live-eval.yml` and runs **on demand only** — the nightly schedule was removed 2026-10-24 so CI puts no recurring load on vendor quotas:
 
 ```bash
 # check a detection-quality-sensitive PR before merging
