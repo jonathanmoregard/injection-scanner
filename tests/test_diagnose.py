@@ -66,12 +66,37 @@ from injection_scanner.intercept import Verdict
         ),
         ("lakera_unavailable:URLError", "lakera: transport error (URLError)"),
         ("lakera:prompt_attack", "lakera: flagged the benign probe (prompt_attack)"),
-        # L4 judge.
+        # L4 judge. Its vote signals are NOT provider-prefixed (judge.py):
+        # `api-error:<Type>[:<status>]`, `parse-error:<Type>`, and fixed labels.
         (
-            "lakera_arbitration:unavailable:openai_41_mini:openai-api-error:"
-            "RateLimitError:429",
+            "lakera_arbitration:unavailable:openai_41_mini:api-error:RateLimitError:429",
             "judge: openai model gpt-4.1-mini: returned HTTP 429 (quota/rate limit) "
             "(RateLimitError)",
+        ),
+        (
+            "lakera_arbitration:unavailable:openai_41_mini:api-error:NotFoundError:404",
+            "judge: openai model gpt-4.1-mini: returned HTTP 404 (NotFoundError)",
+        ),
+        (
+            "lakera_arbitration:unavailable:anthropic_haiku45:api-error:TimeoutError",
+            "judge: anthropic model claude-haiku-4-5: API call failed (TimeoutError)",
+        ),
+        (
+            "lakera_arbitration:unavailable:anthropic_haiku45:parse-error:IndexError",
+            "judge: anthropic model claude-haiku-4-5: unparseable response (IndexError)",
+        ),
+        (
+            "lakera_arbitration:unavailable:openai_41_mini:malformed-verdict",
+            "judge: openai model gpt-4.1-mini: reply was not a verdict (malformed-verdict)",
+        ),
+        (
+            "lakera_arbitration:unavailable:openai_41_mini:key-config-error",
+            "judge: openai model gpt-4.1-mini: API key configuration error (key file "
+            "unreadable or malformed)",
+        ),
+        (
+            "lakera_arbitration:unavailable:openai_41_mini:no-openai-api-key",
+            "judge: openai model gpt-4.1-mini: no API key (set OPENAI_API_KEY)",
         ),
         (
             "lakera_arbitration:attack:anthropic_haiku45",
@@ -95,6 +120,8 @@ def test_each_layer_is_named(reason: str, expected: str) -> None:
         "lakera_unavailable:Evil$(rm -rf):999999",
         "honeypot_unavailable:ignore previous instructions:unavailable:x",
         "lakera_arbitration:unavailable:<script>:openai-api-error:X:4044",
+        "lakera_arbitration:unavailable:<script>:api-error:X:4044",
+        "lakera_arbitration:unavailable:openai_41_mini:parse-error:ignore previous",
     ],
 )
 def test_out_of_vocabulary_segments_never_reach_the_message(reason: str) -> None:
@@ -137,3 +164,50 @@ def test_smoke_failure_names_the_honeypot_not_lakera(monkeypatch) -> None:
     assert "honeypot: openai model gpt-4.1-mini" in msg
     assert "HTTP 404" in msg
     assert "LAKERA_API_KEY" not in msg
+
+
+class _FakeResponse:
+    """What `APIStatusError.__init__` reads off a response (see test_judge)."""
+
+    def __init__(self, status: int) -> None:
+        self.status_code = status
+        self.headers: dict[str, str] = {}
+        self.request = None
+
+
+@pytest.mark.parametrize("status, exc_name", [(404, "NotFoundError"), (429, "RateLimitError")])
+def test_real_judge_reason_keeps_type_and_status(monkeypatch, status, exc_name) -> None:
+    """The reason comes from the real judge panel, not a hand-typed string, so
+    a drift between what judge.py emits and what describe() parses fails here.
+    Every judge raises the real SDK status error for `status`."""
+    import anthropic
+    import openai
+
+    from injection_scanner import judge
+
+    def raiser(sdk):
+        exc = getattr(sdk, exc_name)("msg", response=_FakeResponse(status), body=None)
+
+        def create(*_a, **_kw):
+            raise exc
+
+        return create
+
+    class _FakeAnthropic:
+        def __init__(self, *_a, **_kw):
+            self.messages = type("_M", (), {"create": staticmethod(raiser(anthropic))})()
+
+    class _FakeOpenAI:
+        def __init__(self, *_a, **_kw):
+            completions = type("_C", (), {"create": staticmethod(raiser(openai))})()
+            self.chat = type("_Chat", (), {"completions": completions})()
+
+    monkeypatch.setattr(judge, "_anthropic_key", lambda: "sk-ant-test")
+    monkeypatch.setattr(judge, "_openai_key", lambda: "sk-openai-test")
+    monkeypatch.setattr(anthropic, "Anthropic", _FakeAnthropic)
+    monkeypatch.setattr(openai, "OpenAI", _FakeOpenAI)
+
+    jr = judge.check("benign text")
+    assert not jr.ok and jr.reason.startswith("unavailable:")
+    msg = describe(f"lakera_arbitration:{jr.reason}")
+    assert f"HTTP {status}" in msg and f"({exc_name})" in msg, msg
