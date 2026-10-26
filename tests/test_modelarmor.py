@@ -844,11 +844,120 @@ def test_the_endpoint_allowlist_admits_only_the_exact_built_destination(url):
 # ----- size and monthly budget -----
 
 
-def test_a_text_over_the_size_cap_is_too_large_and_never_sent(google, monkeypatch):
-    monkeypatch.setenv("INJECTION_SCANNER_MODEL_ARMOR_MAX_CHARS", "1000")
-    assert modelarmor.check("x" * 1001) == _unavailable("too-large")
+def _sent_texts(google) -> list[str]:
+    return [
+        json.loads(c["body"])["userPromptData"]["text"]
+        for c in google.calls
+        if c["url"] == SANITIZE_URL
+    ]
+
+
+def _small_windows(monkeypatch, size=1000, overlap=500, chunks=None):
+    monkeypatch.setenv("INJECTION_SCANNER_MODEL_ARMOR_MAX_CHARS", str(size))
+    monkeypatch.setenv("INJECTION_SCANNER_MODEL_ARMOR_OVERLAP_CHARS", str(overlap))
+    if chunks is not None:
+        monkeypatch.setenv("INJECTION_SCANNER_MODEL_ARMOR_MAX_CHUNKS", str(chunks))
+
+
+def test_a_text_within_the_size_cap_is_one_request(google, monkeypatch):
+    _small_windows(monkeypatch)
+    text = "x" * 1000
+    assert modelarmor.check(text).reason == "pass"
+    assert _sent_texts(google) == [text]
+
+
+@pytest.mark.parametrize("length", [1001, 1500, 1501, 2999, 3000, 3001])
+def test_windows_cover_the_text_with_the_overlap(length):
+    text = "".join(chr(0x4E00 + i) for i in range(length))  # every char distinct
+    parts = modelarmor.windows(text, 1000, 300)
+    assert all(len(p) <= 1000 for p in parts)
+    assert parts[0] == text[:1000]
+    assert text.endswith(parts[-1])
+    for prev, nxt in zip(parts, parts[1:]):
+        assert text.index(nxt) - text.index(prev) == 700
+        assert prev[-300:] == nxt[:300]
+
+
+def test_an_injection_no_longer_than_the_overlap_is_whole_in_some_window():
+    size, overlap = 1000, 300
+    payload = "P" * overlap
+    for offset in range(0, 2500, 37):
+        text = "." * offset + payload + "." * (3000 - offset)
+        assert any(payload in p for p in modelarmor.windows(text, size, overlap)), offset
+
+
+def test_a_text_over_the_size_cap_is_scanned_as_overlapping_windows(google, monkeypatch):
+    _small_windows(monkeypatch)
+    text = "".join(chr(0x4E00 + i) for i in range(2200))
+    assert modelarmor.check(text) == VendorResult(ok=True, reason="pass")
+    assert _sent_texts(google) == [
+        text[0:1000], text[500:1500], text[1000:2000], text[1500:2200]
+    ]
+
+
+class _PerWindow(_Google):
+    """Flags (or fails) only the request whose text contains `trigger`."""
+
+    def __init__(self, key, clock, trigger: str, outcome) -> None:
+        super().__init__(key, clock)
+        self.trigger = trigger
+        self.outcome = outcome
+
+    def __call__(self, url, body, headers, *, timeout, max_bytes):
+        if url == SANITIZE_URL and self.trigger in json.loads(body)["userPromptData"]["text"]:
+            self.calls.append({"url": url, "body": body, "headers": dict(headers)})
+            if isinstance(self.outcome, BaseException):
+                raise self.outcome
+            return self.outcome
+        return super().__call__(url, body, headers, timeout=timeout, max_bytes=max_bytes)
+
+
+def test_a_flag_in_any_window_flags_the_text_and_stops(monkeypatch, tmp_path, rsa_key, clock):
+    _configure(monkeypatch, tmp_path, rsa_key)
+    _small_windows(monkeypatch)
+    google = _install(
+        monkeypatch, _PerWindow(rsa_key, clock, "INJECT", _verdict(match="MATCH_FOUND"))
+    )
+    text = "." * 1200 + "INJECT" + "." * 1800
+    assert modelarmor.check(text) == VendorResult(
+        ok=False, flagged=True, reason="model_armor:prompt_attack"
+    )
+    sent = _sent_texts(google)
+    assert len(sent) == 2 and "INJECT" in sent[1], "no window after the flag is sent"
+
+
+def test_an_unavailable_window_makes_the_text_unavailable(
+    monkeypatch, tmp_path, rsa_key, clock
+):
+    _configure(monkeypatch, tmp_path, rsa_key)
+    _small_windows(monkeypatch)
+    google = _install(monkeypatch, _PerWindow(rsa_key, clock, "BOOM", _http_error(500)))
+    text = "." * 2000 + "BOOM" + "." * 200
+    assert modelarmor.check(text) == _unavailable("HTTPError:500")
+    assert len(_sent_texts(google)) == 4
+
+
+def test_a_text_needing_more_than_max_chunks_windows_is_too_large_and_never_sent(
+    google, monkeypatch
+):
+    _small_windows(monkeypatch, overlap=500, chunks=3)
+    assert len(modelarmor.windows("x" * 2000, 1000, 500)) == 3
+    assert len(modelarmor.windows("x" * 2001, 1000, 500)) == 4
+    assert modelarmor.check("x" * 2001) == _unavailable("too-large")
     assert google.calls == []
-    assert modelarmor.check("x" * 1000).reason == "pass"
+    assert modelarmor.check("x" * 2000).reason == "pass"
+
+
+def test_the_overlap_is_clamped_to_half_a_window(monkeypatch):
+    monkeypatch.setenv("INJECTION_SCANNER_MODEL_ARMOR_MAX_CHARS", "1000")
+    monkeypatch.setenv("INJECTION_SCANNER_MODEL_ARMOR_OVERLAP_CHARS", "999999")
+    assert modelarmor.overlap_chars() == 500
+    monkeypatch.setenv("INJECTION_SCANNER_MODEL_ARMOR_OVERLAP_CHARS", "0")
+    assert modelarmor.overlap_chars() == modelarmor.OVERLAP_CHARS_RANGE[0]
+    monkeypatch.delenv("INJECTION_SCANNER_MODEL_ARMOR_MAX_CHARS")
+    monkeypatch.delenv("INJECTION_SCANNER_MODEL_ARMOR_OVERLAP_CHARS")
+    assert modelarmor.overlap_chars() == 10_000
+    assert modelarmor.max_chunks() == 8
 
 
 def test_the_size_cap_is_clamped(monkeypatch):
