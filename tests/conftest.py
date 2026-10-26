@@ -1,4 +1,4 @@
-"""Suite-wide isolation for the on-disk Lakera limiter.
+"""Suite-wide isolation for the on-disk per-vendor L2 limiters.
 
 `injection_scanner.throttle` keeps a token bucket and a circuit breaker in a
 JSON file under `$INJECTION_SCANNER_CACHE_DIR` (default
@@ -76,37 +76,51 @@ def pytest_collection_modifyitems(items: list[pytest.Item]) -> None:
                 f"{item.nodeid} uses {', '.join(used)}"
             )
 
-# Every environment variable `throttle.LimiterConfig.from_env` reads, minus
-# the cache dir (set below rather than cleared). Listed explicitly so a new
-# knob has to be added here on purpose — a stray value in the developer's
-# shell must never change what the suite measures.
-_LIMITER_ENV = (
-    "INJECTION_SCANNER_LAKERA_MIN_INTERVAL_S",
-    "INJECTION_SCANNER_LAKERA_BURST",
-    "INJECTION_SCANNER_LAKERA_BACKOFF_BASE_S",
-    "INJECTION_SCANNER_LAKERA_BACKOFF_MAX_S",
-    "INJECTION_SCANNER_LAKERA_LOCK_WAIT_S",
-    "INJECTION_SCANNER_LAKERA_MAX_WAIT_S",
+# Every per-vendor environment variable the limiter and the shared transport
+# read, minus the cache dir (set below rather than cleared), for every vendor
+# in the L2 panel. Listed explicitly so a new knob or vendor has to be added
+# here on purpose — a stray value in the developer's shell must never change
+# what the suite measures.
+_VENDORS = ("LAKERA", "MODEL_ARMOR")
+_VENDOR_KNOBS = (
+    "MIN_INTERVAL_S",
+    "BURST",
+    "BACKOFF_BASE_S",
+    "BACKOFF_MAX_S",
+    "LOCK_WAIT_S",
+    "MAX_WAIT_S",
+    "TIMEOUT",
+    "MAX_RESPONSE_BYTES",
+)
+_LIMITER_ENV = tuple(
+    f"INJECTION_SCANNER_{vendor}_{knob}"
+    for vendor in _VENDORS
+    for knob in _VENDOR_KNOBS
 )
 
 
-# `smoke.py`'s own knob (the boot-smoke liveness cache). Not read by
-# `LimiterConfig.from_env`, but it shares the cache directory and carries the
-# same hazard: a value in the developer's shell must not change what the suite
-# measures, and a suite that silently reuses a cached pass measures the cache
-# instead of the probe. Pinned OFF below; tests/test_smoke_liveness.py opts
-# back in per test.
-_SMOKE_ENV = (
-    "INJECTION_SCANNER_SMOKE_LIVENESS_TTL_S",
+# The panel floor and Model Armor's credential, endpoint ids, size cap and
+# monthly budget. Cleared so the suite always measures the documented default
+# floor (2) and an unconfigured Model Armor, whatever the developer's shell
+# exports.
+_PANEL_ENV = (
+    "INJECTION_SCANNER_L2_MIN_VERDICTS",
+    "MODEL_ARMOR_CREDENTIALS_FILE",
+    "MODEL_ARMOR_CREDENTIALS",
+    "MODEL_ARMOR_PROJECT",
+    "MODEL_ARMOR_LOCATION",
+    "MODEL_ARMOR_TEMPLATE",
+    "INJECTION_SCANNER_MODEL_ARMOR_MAX_CHARS",
+    "INJECTION_SCANNER_MODEL_ARMOR_MONTHLY_TOKENS",
 )
 
 
 @pytest.fixture(autouse=True)
 def _isolated_limiter_state(monkeypatch, tmp_path):
-    """Private cache directory + the documented "off" budget, cache included."""
-    for name in _LIMITER_ENV + _SMOKE_ENV:
+    """Private cache directory + the documented "off" budget."""
+    for name in _LIMITER_ENV + _PANEL_ENV:
         monkeypatch.delenv(name, raising=False)
     monkeypatch.setenv("INJECTION_SCANNER_CACHE_DIR", str(tmp_path / "cache"))
-    monkeypatch.setenv("INJECTION_SCANNER_LAKERA_MIN_INTERVAL_S", "0")
-    monkeypatch.setenv("INJECTION_SCANNER_LAKERA_BACKOFF_MAX_S", "0")
-    monkeypatch.setenv("INJECTION_SCANNER_SMOKE_LIVENESS_TTL_S", "0")
+    for vendor in _VENDORS:
+        monkeypatch.setenv(f"INJECTION_SCANNER_{vendor}_MIN_INTERVAL_S", "0")
+        monkeypatch.setenv(f"INJECTION_SCANNER_{vendor}_BACKOFF_MAX_S", "0")

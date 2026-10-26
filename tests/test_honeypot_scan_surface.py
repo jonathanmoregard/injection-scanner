@@ -266,7 +266,7 @@ def test_unhandled_block_bytes_never_reach_signal_or_reason(monkeypatch):
         assert not s.api_error_detail
 
     v = intercept.scan_text("Benign. Sources: 1. example.",
-                            use_honeypot=True, use_lakera=False)
+                            use_honeypot=True, use_l2=False)
     assert BLOCK_MARKER not in v.reason
     for k, val in v.layers.items():
         assert BLOCK_MARKER not in val, f"leaked in layers[{k}]"

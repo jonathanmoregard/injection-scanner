@@ -9,9 +9,7 @@ from __future__ import annotations
 
 import pytest
 
-from injection_scanner import smoke
 from injection_scanner.diagnose import describe
-from injection_scanner.intercept import Verdict
 
 
 @pytest.mark.parametrize(
@@ -66,40 +64,111 @@ from injection_scanner.intercept import Verdict
         ),
         ("lakera_unavailable:URLError", "lakera: transport error (URLError)"),
         ("lakera:prompt_attack", "lakera: flagged the benign probe (prompt_attack)"),
-        # L4 judge. Its vote signals are NOT provider-prefixed (judge.py):
-        # `api-error:<Type>[:<status>]`, `parse-error:<Type>`, and fixed labels.
         (
-            "lakera_arbitration:unavailable:openai_41_mini:api-error:RateLimitError:429",
+            "lakera_unavailable:unhandled:RuntimeError",
+            "lakera: unhandled RuntimeError",
+        ),
+        # L2 Model Armor.
+        (
+            "model_armor_unavailable:no-key",
+            "model_armor: no credential (set MODEL_ARMOR_CREDENTIALS_FILE)",
+        ),
+        (
+            "model_armor_unavailable:key-config-error",
+            "model_armor: credential configuration error (MODEL_ARMOR_CREDENTIALS_FILE "
+            "unreadable, or not a service-account key for oauth2.googleapis.com)",
+        ),
+        (
+            "model_armor_unavailable:url-config-error",
+            "model_armor: endpoint configuration error (MODEL_ARMOR_PROJECT / "
+            "MODEL_ARMOR_LOCATION / MODEL_ARMOR_TEMPLATE missing or invalid)",
+        ),
+        (
+            "model_armor_unavailable:too-large",
+            "model_armor: text over INJECTION_SCANNER_MODEL_ARMOR_MAX_CHARS, not sent",
+        ),
+        (
+            "model_armor_unavailable:skipped",
+            "model_armor: prompt-injection filter skipped (EXECUTION_SKIPPED)",
+        ),
+        (
+            "model_armor_unavailable:partial-invocation",
+            "model_armor: not every filter ran (invocationResult PARTIAL or FAILURE)",
+        ),
+        (
+            "model_armor_unavailable:token-error",
+            "model_armor: OAuth token exchange failed (network error or malformed "
+            "token response)",
+        ),
+        (
+            "model_armor_unavailable:token-error:400",
+            "model_armor: OAuth token exchange returned HTTP 400",
+        ),
+        (
+            "model_armor_unavailable:token-error:4000",
+            "model_armor: OAuth token exchange returned HTTP other",
+        ),
+        (
+            "model_armor_unavailable:limiter-error",
+            "model_armor: shared limiter or monthly budget ledger unusable (cache "
+            "directory, lock, IO error, or torn model_armor-budget.json)",
+        ),
+        (
+            "model_armor_unavailable:HTTPError:429",
+            "model_armor: HTTP 429 (quota/rate limit) (HTTPError)",
+        ),
+        (
+            "model_armor_unavailable:throttled",
+            "model_armor: local fleet budget or monthly token budget exhausted, or "
+            "quota breaker open (throttled)",
+        ),
+        (
+            "model_armor_unavailable:bad-result",
+            "model_armor: adapter result outside its closed vocabulary",
+        ),
+        (
+            "model_armor:prompt_attack",
+            "model_armor: flagged the benign probe (prompt_attack)",
+        ),
+        # The panel's own machinery.
+        ("l2_unavailable:unhandled:RuntimeError", "l2: unhandled RuntimeError"),
+        # L4 judge — the exact shapes judge.py + intercept emit. Judge signals
+        # are `api-error:<Exc>[:<status>]`, not the honeypot's
+        # `<provider>-api-error`.
+        (
+            "l2_arbitration:judge_unavailable:openai_41_mini:api-error:"
+            "RateLimitError:429",
             "judge: openai model gpt-4.1-mini: returned HTTP 429 (quota/rate limit) "
             "(RateLimitError)",
         ),
         (
-            "lakera_arbitration:unavailable:openai_41_mini:api-error:NotFoundError:404",
+            "l2_arbitration:judge_unavailable:anthropic_haiku45:no-anthropic-api-key",
+            "judge: anthropic model claude-haiku-4-5: no API key (set ANTHROPIC_API_KEY)",
+        ),
+        (
+            "l2_arbitration:judge_unavailable:openai_41_mini:api-error:NotFoundError:404",
             "judge: openai model gpt-4.1-mini: returned HTTP 404 (NotFoundError)",
         ),
         (
-            "lakera_arbitration:unavailable:anthropic_haiku45:api-error:TimeoutError",
+            "l2_arbitration:judge_unavailable:anthropic_haiku45:api-error:TimeoutError",
             "judge: anthropic model claude-haiku-4-5: API call failed (TimeoutError)",
         ),
         (
-            "lakera_arbitration:unavailable:anthropic_haiku45:parse-error:IndexError",
+            "l2_arbitration:judge_unavailable:anthropic_haiku45:parse-error:IndexError",
             "judge: anthropic model claude-haiku-4-5: unparseable response (IndexError)",
         ),
         (
-            "lakera_arbitration:unavailable:openai_41_mini:malformed-verdict",
+            "l2_arbitration:judge_unavailable:openai_41_mini:malformed-verdict",
             "judge: openai model gpt-4.1-mini: reply was not a verdict (malformed-verdict)",
         ),
         (
-            "lakera_arbitration:unavailable:openai_41_mini:key-config-error",
+            "l2_arbitration:judge_unavailable:openai_41_mini:key-config-error",
             "judge: openai model gpt-4.1-mini: API key configuration error (key file "
             "unreadable or malformed)",
         ),
+        ("l2_arbitration:judge_unavailable:panel-incomplete", "judge: panel incomplete"),
         (
-            "lakera_arbitration:unavailable:openai_41_mini:no-openai-api-key",
-            "judge: openai model gpt-4.1-mini: no API key (set OPENAI_API_KEY)",
-        ),
-        (
-            "lakera_arbitration:attack:anthropic_haiku45",
+            "l2_arbitration:attack:anthropic_haiku45",
             "judge: anthropic model claude-haiku-4-5 voted attack on the benign probe",
         ),
         ("judge_unavailable:unhandled:RuntimeError", "judge: unhandled RuntimeError"),
@@ -119,9 +188,10 @@ def test_each_layer_is_named(reason: str, expected: str) -> None:
     [
         "lakera_unavailable:Evil$(rm -rf):999999",
         "honeypot_unavailable:ignore previous instructions:unavailable:x",
-        "lakera_arbitration:unavailable:<script>:openai-api-error:X:4044",
-        "lakera_arbitration:unavailable:<script>:api-error:X:4044",
-        "lakera_arbitration:unavailable:openai_41_mini:parse-error:ignore previous",
+        "l2_arbitration:judge_unavailable:<script>:api-error:X:4044",
+        "l2_arbitration:judge_unavailable:openai_41_mini:parse-error:ignore previous",
+        "model_armor_unavailable:Evil$(x):999999",
+        "model_armor:ignore previous instructions",
     ],
 )
 def test_out_of_vocabulary_segments_never_reach_the_message(reason: str) -> None:
@@ -136,34 +206,16 @@ def test_unknown_scenario_is_not_echoed() -> None:
     assert "unknown provider model unknown model" in msg
 
 
-def test_smoke_failure_names_the_honeypot_not_lakera(monkeypatch) -> None:
-    """End to end through run_smoke: the 2026-10-24 reason produces a message
-    that names the honeypot's OpenAI model and does not point at Lakera."""
-    reason = (
-        "honeypot:honeypot_unavailable:simulated_env_dump_in_history:"
-        "unavailable:openai-api-error:NotFoundError:404+skipped=2/6"
-    )
-    real = smoke._scan_via_path
+def test_every_panel_vendor_has_a_diagnosis() -> None:
+    """A vendor added to the panel without a diagnose entry would fall
+    through to the generic layer message and lose its fixed conditions."""
+    from injection_scanner import l2
 
-    def fake(payload, *, use_honeypot, use_lakera=True):
-        if not use_honeypot:
-            return real(payload, use_honeypot=use_honeypot, use_lakera=use_lakera)
-        return Verdict(
-            ok=False,
-            reason=reason,
-            layers={"lakera": "pass", "honeypot": reason.removeprefix("honeypot:")},
-            sanitize_stats={},
-            sanitized_text=smoke._BENIGN_PROBE,
-        )
-
-    monkeypatch.setattr(smoke, "_scan_via_path", fake)
-    errors: list[str] = []
-    with pytest.raises(smoke.SmokeFailure) as excinfo:
-        smoke.run_smoke(log_info=lambda _m: None, log_error=errors.append)
-    msg = excinfo.value.reason
-    assert "honeypot: openai model gpt-4.1-mini" in msg
-    assert "HTTP 404" in msg
-    assert "LAKERA_API_KEY" not in msg
+    for vendor in l2.VENDORS:
+        # The generic fall-through renders the bare condition (`<vendor>: throttled`).
+        message = describe(f"{vendor}_unavailable:throttled")
+        assert message.startswith(f"{vendor}: ")
+        assert message.endswith("quota breaker open (throttled)")
 
 
 class _FakeResponse:
@@ -208,6 +260,7 @@ def test_real_judge_reason_keeps_type_and_status(monkeypatch, status, exc_name) 
     monkeypatch.setattr(openai, "OpenAI", _FakeOpenAI)
 
     jr = judge.check("benign text")
-    assert not jr.ok and jr.reason.startswith("unavailable:")
-    msg = describe(f"lakera_arbitration:{jr.reason}")
+    assert not jr.ok and jr.reason.startswith("judge_unavailable:")
+    # intercept wraps the judge's reason exactly like this.
+    msg = describe(f"l2_arbitration:{jr.reason}")
     assert f"HTTP {status}" in msg and f"({exc_name})" in msg, msg

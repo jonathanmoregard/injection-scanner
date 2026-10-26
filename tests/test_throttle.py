@@ -103,16 +103,16 @@ def test_from_env_uses_the_documented_defaults(monkeypatch, tmp_path):
     # sustained is 12/hour, just under it; burst 10 lets a multi-pane session
     # restore through; the breaker waits MINUTES because recovery from the
     # 2026-09-05 throttle took tens of them. See the constants in throttle.py.
-    assert LimiterConfig.from_env() == LimiterConfig(
+    assert LimiterConfig.from_env("lakera") == LimiterConfig(
         min_interval_s=300.0,
         burst=10,
         backoff_base_s=300.0,
         backoff_max_s=3600.0,
         lock_wait_s=2.0,
     )
-    assert throttle.default_max_wait_s() == 0.0
+    assert throttle.default_max_wait_s("lakera") == 0.0
 
-    lim = CrossProcessLimiter.from_env()
+    lim = CrossProcessLimiter.from_env("lakera")
     assert lim.state_path == tmp_path / "lakera-throttle.json"
     assert lim.lock_path == tmp_path / "lakera-throttle.lock"
 
@@ -126,14 +126,14 @@ def test_malformed_env_values_fall_back_to_the_default(monkeypatch, raw):
     monkeypatch.setenv("INJECTION_SCANNER_LAKERA_LOCK_WAIT_S", raw)
     monkeypatch.setenv("INJECTION_SCANNER_LAKERA_MAX_WAIT_S", raw)
 
-    assert LimiterConfig.from_env() == LimiterConfig(
+    assert LimiterConfig.from_env("lakera") == LimiterConfig(
         min_interval_s=300.0,
         burst=10,
         backoff_base_s=300.0,
         backoff_max_s=3600.0,
         lock_wait_s=2.0,
     )
-    assert throttle.default_max_wait_s() == 0.0
+    assert throttle.default_max_wait_s("lakera") == 0.0
 
 
 def test_env_values_are_clamped_to_their_documented_ranges(monkeypatch):
@@ -144,17 +144,53 @@ def test_env_values_are_clamped_to_their_documented_ranges(monkeypatch):
     monkeypatch.setenv("INJECTION_SCANNER_LAKERA_LOCK_WAIT_S", "600")
     monkeypatch.setenv("INJECTION_SCANNER_LAKERA_MAX_WAIT_S", "-1")
 
-    assert LimiterConfig.from_env() == LimiterConfig(
+    assert LimiterConfig.from_env("lakera") == LimiterConfig(
         min_interval_s=3600.0,
         burst=1000,
         backoff_base_s=0.0,
         backoff_max_s=86400.0,
         lock_wait_s=60.0,
     )
-    assert throttle.default_max_wait_s() == 0.0
+    assert throttle.default_max_wait_s("lakera") == 0.0
 
     monkeypatch.setenv("INJECTION_SCANNER_LAKERA_BURST", "0")
-    assert LimiterConfig.from_env().burst == 1
+    assert LimiterConfig.from_env("lakera").burst == 1
+
+
+def test_each_vendor_reads_its_own_prefix_and_keeps_its_own_state(
+    monkeypatch, tmp_path
+):
+    """One class, one budget per vendor.
+
+    The panel calls every vendor for every report, so a shared bucket would
+    let one vendor's spend refuse the other, and a shared breaker would let
+    one vendor's 429 stop calls to a vendor that is answering. Each vendor
+    therefore reads `INJECTION_SCANNER_<VENDOR>_*` and owns
+    `<vendor>-throttle.json`.
+    """
+    monkeypatch.setenv("INJECTION_SCANNER_CACHE_DIR", str(tmp_path))
+    monkeypatch.setenv("INJECTION_SCANNER_LAKERA_BURST", "7")
+    monkeypatch.setenv("INJECTION_SCANNER_MODEL_ARMOR_BURST", "3")
+    monkeypatch.setenv("INJECTION_SCANNER_MODEL_ARMOR_MAX_WAIT_S", "12")
+
+    assert LimiterConfig.from_env("lakera").burst == 7
+    assert LimiterConfig.from_env("model_armor").burst == 3
+    assert throttle.default_max_wait_s("lakera") == 0.0
+    assert throttle.default_max_wait_s("model_armor") == 12.0
+
+    lim = CrossProcessLimiter.from_env("model_armor")
+    assert lim.state_path == tmp_path / "model_armor-throttle.json"
+    assert lim.lock_path == tmp_path / "model_armor-throttle.lock"
+
+
+@pytest.mark.parametrize("name", ["", "Lakera", "model armor", "../x", "a/b"])
+def test_a_vendor_name_that_cannot_form_an_env_prefix_is_refused(name):
+    """The name becomes both an env prefix and a file name. A spelling that
+    fits neither would silently read no operator setting at all."""
+    with pytest.raises(ValueError):
+        LimiterConfig.from_env(name)
+    with pytest.raises(ValueError):
+        throttle.default_max_wait_s(name)
 
 
 def test_the_cache_dir_env_var_selects_the_state_directory(monkeypatch, tmp_path):
@@ -932,7 +968,7 @@ _CHILD = """
 import sys
 from injection_scanner.throttle import CrossProcessLimiter, Decision
 
-lim = CrossProcessLimiter.from_env()
+lim = CrossProcessLimiter.from_env("lakera")
 allowed = sum(1 for _ in range(20) if lim.acquire() is Decision.ALLOWED)
 sys.stdout.write(str(allowed))
 """
@@ -1000,7 +1036,7 @@ def test_the_budget_is_shared_across_processes(tmp_path):
 # is that a wedged peer degrades to a bounded `TimeoutError` — and it hangs the
 # scan rather than failing it closed. `+inf` is the same shape by another route.
 #
-# `file_lock` is public and shared with `smoke.py`'s liveness cache, so the
+# `file_lock` is public and shared with the budget ledger, so the
 # guard belongs at the boundary rather than in each caller. Both callers today
 # pass an `env_float`-clamped value, which is why this was reachable only by a
 # new call site — the kind of footgun worth closing before it is stepped on.
