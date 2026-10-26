@@ -54,7 +54,7 @@ _VENDOR_FIXED = {
         "no-key": "no credential (set MODEL_ARMOR_CREDENTIALS_FILE)",
         "key-config-error": "credential configuration error (MODEL_ARMOR_CREDENTIALS_FILE unreadable, or not a service-account key for oauth2.googleapis.com)",
         "url-config-error": "endpoint configuration error (MODEL_ARMOR_PROJECT / MODEL_ARMOR_LOCATION / MODEL_ARMOR_TEMPLATE missing or invalid)",
-        "too-large": "text over INJECTION_SCANNER_MODEL_ARMOR_MAX_CHARS, not sent",
+        "too-large": "text needs more than INJECTION_SCANNER_MODEL_ARMOR_MAX_CHUNKS windows, not sent",
         "token-error": "OAuth token exchange failed (network error or malformed token response)",
         "skipped": "prompt-injection filter skipped (EXECUTION_SKIPPED)",
         "partial-invocation": "not every filter ran (invocationResult PARTIAL or FAILURE)",

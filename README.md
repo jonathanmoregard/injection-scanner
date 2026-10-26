@@ -60,7 +60,7 @@ Quota-class is exact membership in `<vendor>_unavailable:HTTPError:429` and `<ve
 
 ### Model Armor
 
-`modelarmor.check()` calls Google Cloud Model Armor's `sanitizeUserPrompt` and reads only the `pi_and_jailbreak` filter: `MATCH_FOUND` is `model_armor:prompt_attack`, `NO_MATCH_FOUND` is `pass`, anything else is a shortfall (see the reasons above). The whole text goes in one request; the filter accepts 65,536 tokens.
+`modelarmor.check()` calls Google Cloud Model Armor's `sanitizeUserPrompt` and reads only the `pi_and_jailbreak` filter: `MATCH_FOUND` is `model_armor:prompt_attack`, `NO_MATCH_FOUND` is `pass`, anything else is a shortfall (see the reasons above). A text of up to `MAX_CHARS` characters goes in one request (the filter accepts 65,536 tokens); a longer one is sent as overlapping windows, one request each (see "Prompt size" below). Each window spends a limiter token and a budget reservation, so with the default burst of 10 and `MAX_WAIT_S` 0 a run of long texts can be refused `throttled` part-way through a text, after its earlier windows were billed: fail-closed and quota-class, bounded by `MAX_CHUNKS`.
 
 | Setting | Meaning |
 |---|---|

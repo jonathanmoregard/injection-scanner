@@ -218,8 +218,10 @@ def scan(
     production call paths, callers should NOT pass these — the honeypot and
     the L2 panel are always on.
 
-    `l2_max_wait_s` is how long EACH L2 vendor may wait for its turn in that
-    vendor's fleet-wide budget; the vendors wait concurrently. `None` (the
+    `l2_max_wait_s` is how long EACH L2 vendor request may wait for its turn
+    in that vendor's fleet-wide budget; the vendors wait concurrently. Model
+    Armor sends a text over its `MAX_CHARS` as several requests in turn, each
+    with this wait. `None` (the
     default) means each vendor's `INJECTION_SCANNER_<VENDOR>_MAX_WAIT_S`,
     which defaults to 0 — an interactive scan refuses immediately rather than
     parking a report. Batch callers pass a real budget so they queue instead

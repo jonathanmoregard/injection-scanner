@@ -932,9 +932,12 @@ def test_an_unavailable_window_makes_the_text_unavailable(
     _configure(monkeypatch, tmp_path, rsa_key)
     _small_windows(monkeypatch)
     google = _install(monkeypatch, _PerWindow(rsa_key, clock, "BOOM", _http_error(500)))
-    text = "." * 2000 + "BOOM" + "." * 200
+    # Only window 2 of 4 contains BOOM; windows after it would pass, so
+    # carrying on past the shortfall would turn it into a pass.
+    text = "." * 1200 + "BOOM" + "." * 1000
     assert modelarmor.check(text) == _unavailable("HTTPError:500")
-    assert len(_sent_texts(google)) == 4
+    sent = _sent_texts(google)
+    assert len(sent) == 2 and "BOOM" in sent[1], "no window after the shortfall is sent"
 
 
 def test_a_text_needing_more_than_max_chunks_windows_is_too_large_and_never_sent(
@@ -946,6 +949,12 @@ def test_a_text_needing_more_than_max_chunks_windows_is_too_large_and_never_sent
     assert modelarmor.check("x" * 2001) == _unavailable("too-large")
     assert google.calls == []
     assert modelarmor.check("x" * 2000).reason == "pass"
+
+
+@pytest.mark.parametrize("overlap", [-1, 1000, 1001])
+def test_windows_refuse_a_step_that_cannot_advance(overlap):
+    with pytest.raises(ValueError):
+        modelarmor.windows("x" * 5000, 1000, overlap)
 
 
 def test_the_overlap_is_clamped_to_half_a_window(monkeypatch):

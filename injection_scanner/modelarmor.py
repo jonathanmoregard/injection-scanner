@@ -150,8 +150,12 @@ def max_chunks() -> int:
 def windows(text: str, size: int, overlap: int) -> list[str]:
     """`text` as windows of at most `size` characters, each starting
     `size - overlap` after the previous one; the last ends at the end of the
-    text. A text that fits is one window, itself. Requires
-    `0 <= overlap < size`."""
+    text. A text that fits is one window, itself.
+
+    Raises ValueError unless `0 <= overlap < size`: a step of zero or less
+    would never reach the end of the text."""
+    if not 0 <= overlap < size:
+        raise ValueError("windows need 0 <= overlap < size")
     if len(text) <= size:
         return [text]
     step = size - overlap
