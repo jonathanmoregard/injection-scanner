@@ -147,6 +147,17 @@ def max_chunks() -> int:
     return env_int(vendor_env(VENDOR, ENV_MAX_CHUNKS), DEFAULT_MAX_CHUNKS, MAX_CHUNKS_RANGE)
 
 
+def window_count(length: int, size: int, overlap: int) -> int:
+    """How many windows `windows` makes for a text of `length` characters,
+    without building them. Same precondition as `windows`."""
+    if not 0 <= overlap < size:
+        raise ValueError("windows need 0 <= overlap < size")
+    if length <= size:
+        return 1
+    step = size - overlap
+    return 1 + -(-(length - size) // step)
+
+
 def windows(text: str, size: int, overlap: int) -> list[str]:
     """`text` as windows of at most `size` characters, each starting
     `size - overlap` after the previous one; the last ends at the end of the
@@ -538,9 +549,12 @@ def check(text: str, *, max_wait_s: float | None = None) -> VendorResult:
     if isinstance(prepared, VendorResult):
         return prepared
 
-    parts = windows(text, max_chars(), overlap_chars())
-    if len(parts) > max_chunks():
+    size, overlap = max_chars(), overlap_chars()
+    # Counted before any window is built: an oversized text must cost
+    # nothing proportional to its length before it is refused.
+    if window_count(len(text), size, overlap) > max_chunks():
         return _unavailable("too-large")
+    parts = windows(text, size, overlap)
 
     result = VendorResult(ok=True, reason="pass")
     for part in parts:

@@ -951,10 +951,31 @@ def test_a_text_needing_more_than_max_chunks_windows_is_too_large_and_never_sent
     assert modelarmor.check("x" * 2000).reason == "pass"
 
 
+def test_window_count_matches_the_windows_built():
+    for size, overlap in ((1000, 0), (1000, 300), (1000, 500), (1000, 999)):
+        for length in range(0, 4000, 7):
+            assert modelarmor.window_count(length, size, overlap) == len(
+                modelarmor.windows("x" * length, size, overlap)
+            ), (size, overlap, length)
+
+
+def test_an_oversized_text_is_refused_before_any_window_is_built(google, monkeypatch):
+    _small_windows(monkeypatch, overlap=500, chunks=3)
+    monkeypatch.setattr(modelarmor, "windows", _no_windows)
+    assert modelarmor.check("x" * 20_000_000) == _unavailable("too-large")
+    assert google.calls == []
+
+
+def _no_windows(*_a, **_k):
+    raise AssertionError("an oversized text must be refused before windows() runs")
+
+
 @pytest.mark.parametrize("overlap", [-1, 1000, 1001])
 def test_windows_refuse_a_step_that_cannot_advance(overlap):
     with pytest.raises(ValueError):
         modelarmor.windows("x" * 5000, 1000, overlap)
+    with pytest.raises(ValueError):
+        modelarmor.window_count(5000, 1000, overlap)
 
 
 def test_the_overlap_is_clamped_to_half_a_window(monkeypatch):
