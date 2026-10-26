@@ -14,7 +14,10 @@ Order, each step before anything that costs more:
   2. endpoint from `MODEL_ARMOR_PROJECT` / `_LOCATION` / `_TEMPLATE` —
      `url-config-error`; the URL is BUILT here, never read from the
      environment, and checked against the exact destination;
-  3. size cap — `too-large`, never sent (unavailable, never a pass);
+  3. size — a text over `MAX_CHARS` is split into overlapping windows,
+     each a request of its own through steps 4-6; one needing more than
+     `MAX_CHUNKS` windows is `too-large`, never sent (unavailable, never a
+     pass);
   4. limiter (`vendor_http.paced_post`); a call it refuses touches neither
      OAuth nor the budget;
   5. once admitted, immediately before the POST (`paced_post`'s
@@ -83,13 +86,30 @@ _LOCATION = re.compile(r"[a-z]+(-[a-z]+[0-9]+)?\Z")
 _TEMPLATE = re.compile(r"[A-Za-z0-9_-]{1,63}\Z")
 
 # The prompt-injection filter accepts up to 65,536 tokens. The size cap is a
-# character count: 240,000 sits under 65,536 tokens at Google's ~4 characters
-# per token, and above the largest research report seen (~95k characters).
-# The ceiling is that token limit in characters; the floor keeps a typo from
-# turning every report into `too-large`.
+# character count PER REQUEST: 240,000 sits under 65,536 tokens at Google's ~4
+# characters per token. The ceiling is that token limit in characters; the
+# floor keeps a typo from making every window tiny.
 ENV_MAX_CHARS = "MAX_CHARS"
 DEFAULT_MAX_CHARS = 240_000
 MAX_CHARS_RANGE = (1_000, 262_144)
+
+# A longer text is scanned as overlapping windows of `MAX_CHARS` (see
+# `windows`). Consecutive windows share `OVERLAP_CHARS`, so an injection no
+# longer than the overlap lies wholly inside at least one window wherever it
+# sits — a cut between windows cannot split it out of view. 10,000 characters
+# costs ~4% extra tokens on a full window. The overlap is capped at half a
+# window so every window still advances by at least half its size.
+ENV_OVERLAP_CHARS = "OVERLAP_CHARS"
+DEFAULT_OVERLAP_CHARS = 10_000
+OVERLAP_CHARS_RANGE = (500, 131_072)
+
+# Windows per text. A text that needs more is `too-large`, never sent: every
+# window is a request and a reservation against the monthly budget, so an
+# unbounded input must not turn into unbounded spend. 8 default windows cover
+# ~1.8M characters, over three times research-agent's 512 KiB report cap.
+ENV_MAX_CHUNKS = "MAX_CHUNKS"
+DEFAULT_MAX_CHUNKS = 8
+MAX_CHUNKS_RANGE = (1, 64)
 
 # The free tier is 2M tokens a month and nothing server-side stops a project
 # past it: it is billed instead, at $0.10 per 1M tokens. The fleet scans about
@@ -113,6 +133,50 @@ _EXPIRES_IN_RANGE = (1, 86_400)
 
 def max_chars() -> int:
     return env_int(vendor_env(VENDOR, ENV_MAX_CHARS), DEFAULT_MAX_CHARS, MAX_CHARS_RANGE)
+
+
+def overlap_chars() -> int:
+    """The configured overlap, never more than half of `max_chars()`."""
+    overlap = env_int(
+        vendor_env(VENDOR, ENV_OVERLAP_CHARS), DEFAULT_OVERLAP_CHARS, OVERLAP_CHARS_RANGE
+    )
+    return min(overlap, max_chars() // 2)
+
+
+def max_chunks() -> int:
+    return env_int(vendor_env(VENDOR, ENV_MAX_CHUNKS), DEFAULT_MAX_CHUNKS, MAX_CHUNKS_RANGE)
+
+
+def window_count(length: int, size: int, overlap: int) -> int:
+    """How many windows `windows` makes for a text of `length` characters,
+    without building them. Same precondition as `windows`."""
+    if not 0 <= overlap < size:
+        raise ValueError("windows need 0 <= overlap < size")
+    if length <= size:
+        return 1
+    step = size - overlap
+    return 1 + -(-(length - size) // step)
+
+
+def windows(text: str, size: int, overlap: int) -> list[str]:
+    """`text` as windows of at most `size` characters, each starting
+    `size - overlap` after the previous one; the last ends at the end of the
+    text. A text that fits is one window, itself.
+
+    Raises ValueError unless `0 <= overlap < size`: a step of zero or less
+    would never reach the end of the text."""
+    if not 0 <= overlap < size:
+        raise ValueError("windows need 0 <= overlap < size")
+    if len(text) <= size:
+        return [text]
+    step = size - overlap
+    out = []
+    start = 0
+    while True:
+        out.append(text[start : start + size])
+        if start + size >= len(text):
+            return out
+        start += step
 
 
 def monthly_tokens() -> int:
@@ -457,7 +521,9 @@ def check(text: str, *, max_wait_s: float | None = None) -> VendorResult:
                                                      for `TOKEN_URI`
       * `model_armor_unavailable:url-config-error` — project / location /
                                                      template missing or invalid
-      * `model_armor_unavailable:too-large`        — over `MAX_CHARS`; not sent
+      * `model_armor_unavailable:too-large`        — needs more than
+                                                     `MAX_CHUNKS` windows; not
+                                                     sent
       * `model_armor_unavailable:token-error[:<status>]`
                                                    — OAuth exchange failed
       * `model_armor_unavailable:throttled`        — fleet pacing, quota
@@ -471,17 +537,36 @@ def check(text: str, *, max_wait_s: float | None = None) -> VendorResult:
       * `model_armor:prompt_attack`                — `MATCH_FOUND`
       * `pass`                                     — `NO_MATCH_FOUND`
 
-    `max_wait_s` is how long this call may wait for a fleet token; `None`
+    A text over `MAX_CHARS` is scanned as overlapping windows (`windows`),
+    one request each, in order. The first window that is flagged or
+    unavailable is the answer and no later window is sent; `pass` only when
+    every window passed.
+
+    `max_wait_s` is how long each request may wait for a fleet token; `None`
     means `INJECTION_SCANNER_MODEL_ARMOR_MAX_WAIT_S` (default 0).
     """
     prepared = _preflight()
     if isinstance(prepared, VendorResult):
         return prepared
-    cred, url = prepared.credential, prepared.url
 
-    if len(text) > max_chars():
+    size, overlap = max_chars(), overlap_chars()
+    # Counted before any window is built: an oversized text must cost
+    # nothing proportional to its length before it is refused.
+    if window_count(len(text), size, overlap) > max_chunks():
         return _unavailable("too-large")
+    parts = windows(text, size, overlap)
 
+    result = VendorResult(ok=True, reason="pass")
+    for part in parts:
+        result = _check_one(prepared, part, max_wait_s)
+        if result.reason != "pass":
+            return result
+    return result
+
+
+def _check_one(prepared: _Prepared, text: str, max_wait_s: float | None) -> VendorResult:
+    """One `sanitizeUserPrompt` request for a text within `MAX_CHARS`."""
+    cred, url = prepared.credential, prepared.url
     spend = _Spend(estimate_tokens(text))
     headers = {"Content-Type": "application/json"}
 

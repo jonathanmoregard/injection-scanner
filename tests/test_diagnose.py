@@ -85,7 +85,7 @@ from injection_scanner.diagnose import describe
         ),
         (
             "model_armor_unavailable:too-large",
-            "model_armor: text over INJECTION_SCANNER_MODEL_ARMOR_MAX_CHARS, not sent",
+            "model_armor: text needs more than INJECTION_SCANNER_MODEL_ARMOR_MAX_CHUNKS windows, not sent",
         ),
         (
             "model_armor_unavailable:skipped",

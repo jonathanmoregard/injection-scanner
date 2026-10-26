@@ -46,7 +46,7 @@ Quota-class is exact membership in `<vendor>_unavailable:HTTPError:429` and `<ve
 | `model_armor_unavailable:no-key` | No service-account key (`MODEL_ARMOR_CREDENTIALS_FILE`, `MODEL_ARMOR_CREDENTIALS`, keyring `model-armor-sa-key`). |
 | `model_armor_unavailable:key-config-error` | The key file is unreadable, or the key is not a `service_account` JSON with `token_uri` exactly `https://oauth2.googleapis.com/token` and an RSA `private_key`. |
 | `model_armor_unavailable:url-config-error` | `MODEL_ARMOR_PROJECT`, `MODEL_ARMOR_LOCATION` or `MODEL_ARMOR_TEMPLATE` missing or not a valid id. |
-| `model_armor_unavailable:too-large` | Text longer than `INJECTION_SCANNER_MODEL_ARMOR_MAX_CHARS`; not sent. |
+| `model_armor_unavailable:too-large` | Text needs more than `INJECTION_SCANNER_MODEL_ARMOR_MAX_CHUNKS` windows; not sent. |
 | `model_armor_unavailable:token-error` / `token-error:<status>` | The OAuth token exchange failed: network error or malformed token response / HTTP status (a 3xx included — redirects are refused). Hard. |
 | `model_armor_unavailable:throttled` | As for every vendor, plus: the monthly token budget is spent. Quota-class. |
 | `model_armor_unavailable:limiter-error` | As for every vendor, plus: the monthly budget ledger is unusable. Hard. |
@@ -60,7 +60,7 @@ Quota-class is exact membership in `<vendor>_unavailable:HTTPError:429` and `<ve
 
 ### Model Armor
 
-`modelarmor.check()` calls Google Cloud Model Armor's `sanitizeUserPrompt` and reads only the `pi_and_jailbreak` filter: `MATCH_FOUND` is `model_armor:prompt_attack`, `NO_MATCH_FOUND` is `pass`, anything else is a shortfall (see the reasons above). The whole text goes in one request; the filter accepts 65,536 tokens.
+`modelarmor.check()` calls Google Cloud Model Armor's `sanitizeUserPrompt` and reads only the `pi_and_jailbreak` filter: `MATCH_FOUND` is `model_armor:prompt_attack`, `NO_MATCH_FOUND` is `pass`, anything else is a shortfall (see the reasons above). A text of up to `MAX_CHARS` characters goes in one request (the filter accepts 65,536 tokens); a longer one is sent as overlapping windows, one request each (see "Prompt size" below). Each window spends a limiter token and a budget reservation, so with the default burst of 10 and `MAX_WAIT_S` 0 a run of long texts can be refused `throttled` part-way through a text, after its earlier windows were billed: fail-closed and quota-class, bounded by `MAX_CHUNKS`.
 
 | Setting | Meaning |
 |---|---|
@@ -68,7 +68,9 @@ Quota-class is exact membership in `<vendor>_unavailable:HTTPError:429` and `<ve
 | `MODEL_ARMOR_PROJECT` | GCP project id (`[a-z][a-z0-9-]{4,28}[a-z0-9]`). |
 | `MODEL_ARMOR_LOCATION` | Region (`europe-west4`) or multi-region (`eu`, `us`). |
 | `MODEL_ARMOR_TEMPLATE` | Template id (`[A-Za-z0-9_-]{1,63}`). |
-| `INJECTION_SCANNER_MODEL_ARMOR_MAX_CHARS` | Default `240000`, clamp `[1000, 262144]`. Longer text is `too-large` and never sent. |
+| `INJECTION_SCANNER_MODEL_ARMOR_MAX_CHARS` | Default `240000`, clamp `[1000, 262144]`. Characters per request; longer text is scanned as overlapping windows. |
+| `INJECTION_SCANNER_MODEL_ARMOR_OVERLAP_CHARS` | Default `10000`, clamp `[500, 131072]`, never more than half of `MAX_CHARS`. Characters shared by consecutive windows. |
+| `INJECTION_SCANNER_MODEL_ARMOR_MAX_CHUNKS` | Default `8`, clamp `[1, 64]`. Windows per text; a text needing more is `too-large` and never sent. |
 | `INJECTION_SCANNER_MODEL_ARMOR_MONTHLY_TOKENS` | Default `20000000`, clamp `[0, 100000000]`. Fleet-wide monthly token budget, a runaway guard (at most ~$1.80/month past the free tier); `0` refuses every call. |
 
 The endpoint is built from the three ids, never read from the environment: `https://modelarmor.<location>.rep.googleapis.com/v1/projects/<project>/locations/<location>/templates/<template>:sanitizeUserPrompt`, then checked against that exact destination before the token is attached. `modelarmor.ready()` runs the same credential and endpoint checks with no network call and returns the reason a scan would get (`no-key`, `key-config-error`, `url-config-error`), or `None`.
@@ -132,6 +134,8 @@ The final directory component is checked with `lstat` before every use. It must 
 | 2 | Same text, injection replaced by a benign sentence | HTTP 200, `pass` |
 
 Guard therefore screens content after the 8k mark, at least up to ~12k tokens, and no chunking is done. Larger texts (the biggest research reports reach ~95k characters, ~24k tokens) are unmeasured; re-run the same two-call probe at that size before relying on it.
+
+`modelarmor.check()` sends a text of up to `MAX_CHARS` (240,000) characters in one request, under the filter's 65,536-token limit. A longer text is split into windows of `MAX_CHARS` that overlap by `OVERLAP_CHARS` (10,000), so any injection no longer than the overlap lies whole inside at least one window. Windows are sent in order, each a request and a budget reservation of its own; the first flagged or unavailable window is the answer and later windows are not sent, and the text passes only when every window passed.
 
 ### The boot smoke: deterministic readiness
 

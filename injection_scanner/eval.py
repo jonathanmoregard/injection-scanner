@@ -456,8 +456,9 @@ def evaluate(
     single-shot numbers, because one scan per report is what production
     gets: the weakness is surfaced, not absorbed.
 
-    `l2_max_wait_s` is how long each L2 vendor call may queue for its turn in
-    that vendor's fleet-wide budget. A batch run would rather wait than be refused,
+    `l2_max_wait_s` is how long each L2 vendor request may queue for its turn
+    in that vendor's fleet-wide budget (Model Armor sends an oversized text as
+    several requests, each with this wait). A batch run would rather wait than be refused,
     which is the opposite of what an interactive scan wants — hence a
     parameter rather than a global.
 
