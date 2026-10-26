@@ -1,0 +1,8 @@
+# gitleaks config: default rules plus narrowly scoped allowlists.
+[extend]
+useDefault = true
+
+[[allowlists]]
+# detect-secrets baseline: stores SHA-1 hashes of candidate strings, never the strings.
+description = "detect-secrets baseline hashes"
+paths = ['^\.secrets\.baseline$']
