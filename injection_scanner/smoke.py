@@ -1,7 +1,7 @@
 """Self-test for the layered intercept shim.
 
 Exposes `run_smoke()` so consumers (research-agent MCP server boot,
-futuresearch-gate's boot check, claude-cl-sync cron tick, ad-hoc CLI)
+claude-cl-sync cron tick, ad-hoc CLI)
 all exercise the same checks instead of hand-rolling drift-prone copies.
 
 Each canary runs through BOTH public entry points so a regression

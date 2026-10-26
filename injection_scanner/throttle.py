@@ -251,12 +251,6 @@ def env_int(name: str, default: int, bounds: tuple[int, int]) -> int:
 def cache_dir() -> Path:
     """The limiter's state directory.
 
-    The DEFAULT is the directory `selfupdate.py` defaults to as well, so an
-    operator has one place to look and one place to clear. That is a shared
-    default, not a shared setting: `selfupdate.py` takes its directory as a
-    parameter and never reads this environment variable, so pointing
-    `INJECTION_SCANNER_CACHE_DIR` elsewhere moves the limiter's state alone.
-
     Two ways an operator's value can fail to name one directory fleet-wide,
     both handled here rather than discovered later:
 
