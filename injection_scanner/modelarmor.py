@@ -15,10 +15,14 @@ Order, each step before anything that costs more:
      `url-config-error`; the URL is BUILT here, never read from the
      environment, and checked against the exact destination;
   3. size cap — `too-large`, never sent (unavailable, never a pass);
-  4. OAuth access token, cached in process — `token-error[:<status>]`;
-  5. limiter, then a monthly-budget reservation (`vendor_http.paced_post`'s
-     `before_send`), so a call the limiter refuses spends no budget; the
-     reservation is kept only for a decoded HTTP 200 and released otherwise
+  4. limiter (`vendor_http.paced_post`); a call it refuses touches neither
+     OAuth nor the budget;
+  5. once admitted, immediately before the POST (`paced_post`'s
+     `before_send`): the OAuth access token, cached in process —
+     `token-error[:<status>]`; chosen after the limiter wait so it cannot
+     expire while the call queues. A 429/503 from the token endpoint trips the
+     vendor's fleet breaker like one from Model Armor. Then the monthly-budget
+     reservation, kept only for a decoded HTTP 200 and released otherwise
      (`_Spend`);
   6. strict parse of the `pi_and_jailbreak` filter result.
 
@@ -337,7 +341,7 @@ class _TokenSource:
         redirects are refused), bare `token-error` for any other failure or a
         malformed token response. A 429 is Google rate-limiting this project,
         the same condition as a 429 from Model Armor itself, so it is the
-        quota-class `HTTPError:429`.
+        quota-class `HTTPError:429` and opens the same fleet breaker.
         """
         body = urllib.parse.urlencode(
             {
@@ -350,6 +354,10 @@ class _TokenSource:
             data = vendor_http.send(VENDOR, TOKEN_URI, body, headers)
         except Exception as e:  # noqa: BLE001 — fails CLOSED, type-free reason
             code = vendor_http.breaker_code(e)
+            # The exchange runs after the limiter admitted the call, so the
+            # vendor's breaker is what stops the fleet retrying a throttled
+            # or down token endpoint: the next scan is refused at `acquire`.
+            vendor_http.record_breaker(VENDOR, e)
             if code == 429:
                 raise _TokenFailure("HTTPError:429") from None
             if code is not None:
@@ -474,19 +482,26 @@ def check(text: str, *, max_wait_s: float | None = None) -> VendorResult:
     if len(text) > max_chars():
         return _unavailable("too-large")
 
-    try:
-        token = _TOKENS.token(cred)
-    except _TokenFailure as f:
-        return _unavailable(f.condition)
-
     spend = _Spend(estimate_tokens(text))
+    headers = {"Content-Type": "application/json"}
+
+    def admitted() -> VendorResult | None:
+        # After the limiter wait, immediately before the POST: a token chosen
+        # earlier could expire while the call queues. Token first, so a failed
+        # exchange spends no budget.
+        try:
+            headers["Authorization"] = f"Bearer {_TOKENS.token(cred)}"
+        except _TokenFailure as f:
+            return _unavailable(f.condition)
+        return spend.reserve()
+
     reply = vendor_http.paced_post(
         VENDOR,
         url,
         json.dumps({"userPromptData": {"text": text}}).encode("utf-8"),
-        {"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
+        headers,
         max_wait_s=max_wait_s,
-        before_send=spend.reserve,
+        before_send=admitted,
     )
     spend.settle(reply)
     if reply.failure is not None:

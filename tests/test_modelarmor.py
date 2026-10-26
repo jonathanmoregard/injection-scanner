@@ -467,6 +467,99 @@ def test_a_token_endpoint_429_is_quota_class(google):
     assert google.urls() == [TOKEN_URI]
 
 
+def test_a_token_endpoint_429_opens_the_shared_quota_breaker(google, monkeypatch):
+    """Google rate-limiting the token exchange is the same condition as a 429
+    from Model Armor: the fleet's breaker opens, and every later scan stops at
+    the limiter instead of hitting the throttled endpoint again."""
+    monkeypatch.setenv("INJECTION_SCANNER_MODEL_ARMOR_BACKOFF_BASE_S", "600")
+    monkeypatch.setenv("INJECTION_SCANNER_MODEL_ARMOR_BACKOFF_MAX_S", "600")
+    google.token = _http_error(429, TOKEN_URI)
+
+    assert modelarmor.check("one") == _unavailable("HTTPError:429")
+    for text in ("two", "three"):
+        result = modelarmor.check(text)
+        assert result == _unavailable("throttled")
+        assert l2._is_quota("model_armor", result.reason)
+    assert google.urls() == [TOKEN_URI], "an open breaker must not re-exchange"
+
+
+def test_a_token_endpoint_503_opens_the_service_breaker(google, monkeypatch):
+    monkeypatch.setenv("INJECTION_SCANNER_MODEL_ARMOR_BACKOFF_BASE_S", "600")
+    monkeypatch.setenv("INJECTION_SCANNER_MODEL_ARMOR_BACKOFF_MAX_S", "600")
+    google.token = _http_error(503, TOKEN_URI)
+
+    assert modelarmor.check("one") == _unavailable("token-error:503")
+    assert modelarmor.check("two") == _unavailable("service-unavailable")
+    assert google.urls() == [TOKEN_URI]
+
+
+class _WaitingLimiter:
+    """The real limiter, but `acquire` first lets `wait_s` pass on the test
+    clock: a call that queued behind the fleet for that long."""
+
+    def __init__(self, real, clock, wait_s: float, events: list[str]) -> None:
+        self._real = real
+        self._clock = clock
+        self._wait_s = wait_s
+        self._events = events
+
+    def acquire(self, max_wait_s):
+        self._clock.now += self._wait_s
+        self._events.append("admitted")
+        return self._real.acquire(max_wait_s)
+
+    def __getattr__(self, name):
+        return getattr(self._real, name)
+
+
+def test_the_token_is_chosen_after_the_limiter_wait(google, monkeypatch, clock):
+    """A cached token with 399 s left, then a 600 s queue for a fleet token:
+    the request must leave with a token minted AFTER the wait, not the one
+    that expired while it queued."""
+    assert modelarmor.check("warm").reason == "pass"
+    clock.now = NOW + 3599 - 399
+
+    events: list[str] = []
+    real_from_env = vendor_http.CrossProcessLimiter.from_env
+
+    class _Limiter:
+        @staticmethod
+        def from_env(vendor):
+            return _WaitingLimiter(real_from_env(vendor), clock, 600, events)
+
+    monkeypatch.setattr(vendor_http, "CrossProcessLimiter", _Limiter)
+    original = google.__call__
+
+    def _record(url, body, headers, *, timeout, max_bytes):
+        events.append(url)
+        if url == SANITIZE_URL:
+            # Google refuses a token used past its expiry.
+            minted = [c for c in google.calls if c["url"] == TOKEN_URI]
+            assert clock.now < NOW + 3599 or len(minted) >= 2, "expired token sent"
+        return original(url, body, headers, timeout=timeout, max_bytes=max_bytes)
+
+    monkeypatch.setattr(vendor_http, "_post", _record)
+    assert modelarmor.check("queued", max_wait_s=900).reason == "pass"
+    assert events == ["admitted", TOKEN_URI, SANITIZE_URL]
+
+
+def test_a_refused_admission_mints_no_token(google, monkeypatch):
+    """The limiter decides first: a scan it refuses never reaches OAuth."""
+    monkeypatch.setenv("INJECTION_SCANNER_MODEL_ARMOR_BURST", "1")
+    monkeypatch.setenv("INJECTION_SCANNER_MODEL_ARMOR_MIN_INTERVAL_S", "3600")
+    assert modelarmor.check("one").reason == "pass"
+    google.calls.clear()
+    modelarmor._TOKENS.forget()
+    assert modelarmor.check("two") == _unavailable("throttled")
+    assert google.urls() == []
+
+
+def test_a_failed_exchange_spends_no_budget(google, tmp_path):
+    google.token = URLError("down")
+    assert modelarmor.check("some text") == _unavailable("token-error")
+    assert _budget_used(tmp_path) == 0
+
+
 def test_a_token_endpoint_network_error_is_a_bare_token_error(google):
     google.token = URLError(MARKER)
     assert modelarmor.check("text") == _unavailable("token-error")

@@ -269,6 +269,28 @@ def retry_after(e: BaseException) -> str | None:
     return value if isinstance(value, str) else None
 
 
+def _trip(limiter: CrossProcessLimiter, e: BaseException) -> None:
+    """A 429 opens the breaker with cause QUOTA, a 503 with cause SERVICE —
+    the two codes RFC 9110 pairs with `Retry-After`. Anything else leaves it."""
+    code = breaker_code(e)
+    if code == 429:
+        limiter.record_throttled(retry_after(e), cause=BreakerCause.QUOTA)
+    elif code == 503:
+        limiter.record_throttled(retry_after(e), cause=BreakerCause.SERVICE)
+
+
+def record_breaker(vendor: str, e: BaseException) -> None:
+    """Trip `vendor`'s fleet breaker for an auxiliary request's failure (Model
+    Armor's token exchange), exactly as `paced_post` does for its own. Total:
+    a limiter that cannot be built records nothing, and the caller still
+    fails closed on its own reason."""
+    try:
+        limiter = CrossProcessLimiter.from_env(vendor)
+    except Exception:  # noqa: BLE001 — recording is best-effort by contract
+        return
+    _trip(limiter, e)
+
+
 def unavailable(vendor: str, condition: str) -> VendorResult:
     return VendorResult(ok=False, reason=f"{vendor}_unavailable:{condition}")
 
@@ -313,7 +335,9 @@ def paced_post(
     `before_send`, if given, runs once the limiter has admitted the call and
     before the POST; a `VendorResult` it returns is the reply and nothing is
     sent. It is where a per-call allowance (Model Armor's monthly budget) is
-    charged, so a call the limiter refuses never spends it.
+    charged, so a call the limiter refuses never spends it, and it may
+    complete `headers` in place (Model Armor's bearer token, chosen after the
+    limiter wait so it cannot expire while the call queues).
     """
     started_at = 0.0
     try:
@@ -340,11 +364,7 @@ def paced_post(
     except DuplicateJSONKey:
         return Reply(failure=unavailable(vendor, "bad-response"))
     except Exception as e:  # noqa: BLE001 — any failure fails CLOSED
-        code = breaker_code(e)
-        if code == 429:
-            limiter.record_throttled(retry_after(e), cause=BreakerCause.QUOTA)
-        elif code == 503:
-            limiter.record_throttled(retry_after(e), cause=BreakerCause.SERVICE)
+        _trip(limiter, e)
         return Reply(
             failure=VendorResult(ok=False, reason=transport_reason(vendor, e))
         )
