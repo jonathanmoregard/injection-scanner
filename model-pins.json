@@ -1,0 +1,26 @@
+{
+  "schema": 1,
+  "consumer": "injection-scanner",
+  "models": [
+    {
+      "provider": "anthropic",
+      "id": "claude-haiku-4-5",
+      "used_by": ["judge:anthropic_haiku45"]
+    },
+    {
+      "provider": "anthropic",
+      "id": "claude-haiku-4-5-20251001",
+      "used_by": ["honeypot:conversation_history_leak", "honeypot:long_rapport_history"]
+    },
+    {
+      "provider": "openai",
+      "id": "gpt-4o-mini",
+      "used_by": ["judge:openai_4o_mini", "honeypot:misconfigured_env_file","honeypot:tool_output_canary"]
+    },
+    {
+      "provider": "openai",
+      "id": "gpt-4.1-mini",
+      "used_by": ["judge:openai_41_mini", "honeypot:simulated_env_dump_in_history","honeypot:minimal_priors"]
+    }
+  ]
+}

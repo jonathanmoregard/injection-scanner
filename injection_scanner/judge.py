@@ -55,7 +55,9 @@ _API_TIMEOUT_S = float(os.environ.get("INJECTION_SCANNER_API_TIMEOUT", "20"))
 
 # Same three small models the honeypot ensemble already uses — the keys and
 # SDKs are provisioned wherever the honeypot runs, so the judge adds no new
-# deployment surface.
+# deployment surface. Every model here and in honeypot_scenarios.py is listed
+# in model-pins.json, which the host's model-retirement check reads
+# (tests/test_model_pins.py keeps the two equal).
 _JUDGES: tuple[dict, ...] = (
     {"id": "anthropic_haiku45", "provider": "anthropic", "model": "claude-haiku-4-5"},
     {"id": "openai_4o_mini", "provider": "openai", "model": "gpt-4o-mini"},
