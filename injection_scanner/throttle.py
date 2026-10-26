@@ -1,4 +1,10 @@
-"""Cross-process rate limiting for the hosted Lakera Guard gate (L2).
+"""Cross-process rate limiting for the hosted L2 classifiers.
+
+One limiter per vendor (`CrossProcessLimiter.from_env(<vendor>)`), each with
+its own `INJECTION_SCANNER_<VENDOR>_*` inputs and its own state file. The
+history below is Lakera's, which is why the module exists. `MonthlyBudget`,
+at the end, is the other shared ledger: a monthly allowance for a vendor that
+bills past its free tier instead of refusing.
 
 Lakera Guard is called from ONE function — `injection_scanner.lakera.check()`
 — by several independent processes that share a single Lakera account: a
@@ -84,11 +90,12 @@ import fcntl
 import json
 import math
 import os
+import re
 import stat
 import tempfile
 import time
 from dataclasses import dataclass
-from datetime import timezone
+from datetime import UTC, datetime, timezone
 from email.utils import parsedate_to_datetime
 from pathlib import Path
 
@@ -101,12 +108,23 @@ _SCHEMA = 2
 # ---------- environment variable names ----------
 
 ENV_CACHE_DIR = "INJECTION_SCANNER_CACHE_DIR"
-ENV_MIN_INTERVAL_S = "INJECTION_SCANNER_LAKERA_MIN_INTERVAL_S"
-ENV_BURST = "INJECTION_SCANNER_LAKERA_BURST"
-ENV_BACKOFF_BASE_S = "INJECTION_SCANNER_LAKERA_BACKOFF_BASE_S"
-ENV_BACKOFF_MAX_S = "INJECTION_SCANNER_LAKERA_BACKOFF_MAX_S"
-ENV_LOCK_WAIT_S = "INJECTION_SCANNER_LAKERA_LOCK_WAIT_S"
-ENV_MAX_WAIT_S = "INJECTION_SCANNER_LAKERA_MAX_WAIT_S"
+
+# Per-vendor knobs are `INJECTION_SCANNER_<VENDOR>_<SUFFIX>`, built by
+# `vendor_env`: Lakera's are `INJECTION_SCANNER_LAKERA_MIN_INTERVAL_S` and so
+# on, Model Armor's `INJECTION_SCANNER_MODEL_ARMOR_MIN_INTERVAL_S`. Each vendor
+# is a separate account with its own limits, so each gets its own inputs and
+# its own state file; the algorithm is shared.
+ENV_MIN_INTERVAL_S = "MIN_INTERVAL_S"
+ENV_BURST = "BURST"
+ENV_BACKOFF_BASE_S = "BACKOFF_BASE_S"
+ENV_BACKOFF_MAX_S = "BACKOFF_MAX_S"
+ENV_LOCK_WAIT_S = "LOCK_WAIT_S"
+ENV_MAX_WAIT_S = "MAX_WAIT_S"
+
+# A vendor name becomes an env prefix (upper-cased) and a state-file name, so
+# it must be a plain lower-case identifier. Anything else would read no
+# operator setting at all, silently.
+_VENDOR_NAME = re.compile(r"[a-z][a-z0-9_]*\Z")
 
 # ---------- defaults + clamps ----------
 #
@@ -127,7 +145,7 @@ ENV_MAX_WAIT_S = "INJECTION_SCANNER_LAKERA_MAX_WAIT_S"
 # without being refused; and the breaker waits MINUTES rather than seconds
 # because recovery was observed to take tens of minutes, so a 30 s retry would
 # simply re-spend the budget on 429s. For scale: research-agent boot smokes
-# alone ran ~632 per day before the liveness cache in smoke.py (~19k/month,
+# alone ran ~632 per day before the boot smoke stopped probing (~19k/month,
 # about twice the entire quota) — spawn frequency, not scan volume, is what
 # exhausts this account.
 #
@@ -193,12 +211,11 @@ def env_float(name: str, default: float, bounds: tuple[float, float]) -> float:
     unchanged on CPython, and would then make every comparison in `acquire`
     false — a limiter that neither allows nor refuses.
 
-    PUBLIC because `smoke.py` parses `INJECTION_SCANNER_SMOKE_LIVENESS_TTL_S`
-    with it. That knob is not a limiter setting, but it wants exactly this
-    contract — "every limit is an input with a range", malformed to the
-    default, NaN refused — and one audited implementation of it beats two.
-    `env_int` is public for the same reason: `lakera.py` bounds its response
-    read with it.
+    PUBLIC because `vendor_http.py` parses non-limiter knobs (timeouts) with
+    it. They want exactly this contract — "every limit is an input with a
+    range", malformed to the default, NaN refused — and one audited
+    implementation of it beats two. `env_int` is public for the same reason:
+    `l2.py` and `lakera.py` bound their knobs with it.
     """
     raw = os.environ.get(name)
     value = default
@@ -291,13 +308,26 @@ def cache_dir() -> Path:
         return Path(tempfile.gettempdir()) / f"injection-scanner-{os.getuid()}"
 
 
-def default_max_wait_s() -> float:
+def vendor_env(vendor: str, suffix: str) -> str:
+    """`INJECTION_SCANNER_<VENDOR>_<SUFFIX>` for one vendor's knob.
+
+    Raises ValueError for a name that is not a lower-case identifier; every
+    caller sits inside a fail-closed guard, and the registry names are fixed.
+    """
+    if not isinstance(vendor, str) or not _VENDOR_NAME.match(vendor):
+        raise ValueError("vendor name must be a lower-case identifier")
+    return f"INJECTION_SCANNER_{vendor.upper()}_{suffix}"
+
+
+def default_max_wait_s(vendor: str) -> float:
     """`acquire`'s wait budget when the caller does not name one.
 
     Default 0: an interactive scan refuses immediately rather than parking a
     report behind the fleet's budget. Batch callers (`eval`) pass their own.
     """
-    return env_float(ENV_MAX_WAIT_S, DEFAULT_MAX_WAIT_S, MAX_WAIT_RANGE)
+    return env_float(
+        vendor_env(vendor, ENV_MAX_WAIT_S), DEFAULT_MAX_WAIT_S, MAX_WAIT_RANGE
+    )
 
 
 @dataclass(frozen=True)
@@ -324,20 +354,28 @@ class LimiterConfig:
     """Bounded wait for the flock before `acquire` gives up with `ERROR`."""
 
     @classmethod
-    def from_env(cls) -> "LimiterConfig":
+    def from_env(cls, vendor: str) -> "LimiterConfig":
+        """One vendor's limits from `INJECTION_SCANNER_<VENDOR>_*`.
+
+        Every vendor starts from the same defaults (measured against Lakera's
+        published quota, see above) and is retuned through its own variables.
+        """
+        def env(suffix: str) -> str:
+            return vendor_env(vendor, suffix)
+
         return cls(
             min_interval_s=env_float(
-                ENV_MIN_INTERVAL_S, DEFAULT_MIN_INTERVAL_S, MIN_INTERVAL_RANGE
+                env(ENV_MIN_INTERVAL_S), DEFAULT_MIN_INTERVAL_S, MIN_INTERVAL_RANGE
             ),
-            burst=env_int(ENV_BURST, DEFAULT_BURST, BURST_RANGE),
+            burst=env_int(env(ENV_BURST), DEFAULT_BURST, BURST_RANGE),
             backoff_base_s=env_float(
-                ENV_BACKOFF_BASE_S, DEFAULT_BACKOFF_BASE_S, BACKOFF_BASE_RANGE
+                env(ENV_BACKOFF_BASE_S), DEFAULT_BACKOFF_BASE_S, BACKOFF_BASE_RANGE
             ),
             backoff_max_s=env_float(
-                ENV_BACKOFF_MAX_S, DEFAULT_BACKOFF_MAX_S, BACKOFF_MAX_RANGE
+                env(ENV_BACKOFF_MAX_S), DEFAULT_BACKOFF_MAX_S, BACKOFF_MAX_RANGE
             ),
             lock_wait_s=env_float(
-                ENV_LOCK_WAIT_S, DEFAULT_LOCK_WAIT_S, LOCK_WAIT_RANGE
+                env(ENV_LOCK_WAIT_S), DEFAULT_LOCK_WAIT_S, LOCK_WAIT_RANGE
             ),
         )
 
@@ -462,12 +500,10 @@ def _require_own_directory(state_dir: Path) -> None:
     answer is to refuse, not to repair.
 
     Called from `file_lock`, so it guards EVERY user of the cache directory
-    rather than the limiter alone. `smoke.py`'s liveness cache needs it just as
-    much and for the same reason in the opposite direction: a planted
-    `{"ok": true}` there would let a foreign file suppress the fleet's vendor
-    probe. Both callers reach this inside a guard that renders a raise as their
-    own safe default — the limiter's `ERROR` -> `limiter-error` fail-closed
-    reject, the liveness cache's "miss, probe as before".
+    rather than the limiter alone: the budget ledger reaches it too. A planted
+    state file would let a foreign file steer the fleet's pacing. Each caller
+    reaches this inside a guard that renders a raise as its own safe default —
+    the limiter's `ERROR` -> `limiter-error` fail-closed reject.
 
     Ownership is necessary and NOT sufficient, which is the third shape:
 
@@ -537,11 +573,11 @@ def file_lock(lock_path: Path, wait_s: float, *, clock=time.time, sleep=time.sle
 
     `LOCK_NB` plus a retry, rather than a blocking `LOCK_EX`, because the wait
     has to be BOUNDED: a wedged peer must degrade to a caught `TimeoutError`
-    (which the limiter renders as a fail-closed reject, and the smoke liveness
-    cache renders as a miss) rather than hanging a scan or a boot forever.
+    (which the limiter renders as a fail-closed reject) rather than hanging a
+    scan forever.
 
-    Shared with `smoke.py`'s liveness cache, which keeps a different file in
-    the same directory under the same discipline.
+    Shared by the limiter and the monthly budget ledger, which keep different
+    files in the same directory under the same discipline.
     """
     lock_path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
     _require_own_directory(lock_path.parent)
@@ -560,7 +596,7 @@ def file_lock(lock_path: Path, wait_s: float, *, clock=time.time, sleep=time.sle
     # manager whose callers are written to expect `TimeoutError`.
     #
     # Sanitised HERE rather than in the callers because `file_lock` is public
-    # and shared: the limiter and `smoke.py`'s liveness cache both reach it,
+    # and shared: the limiter and the budget ledger both reach it,
     # both happen to pass an `env_float`-clamped value today, and the next
     # caller should not have to know that this arithmetic is load-bearing.
     try:
@@ -574,8 +610,7 @@ def file_lock(lock_path: Path, wait_s: float, *, clock=time.time, sleep=time.sle
     # fleet's flock on an inode of somebody else's choosing — and the file is
     # created if absent, so the plant does not even have to race a writer. The
     # link raises `ELOOP`, which is an ordinary `OSError` here: the limiter
-    # renders it `ERROR` -> `limiter-error`, the liveness cache renders it a
-    # miss. Paired with `_require_own_directory`, which is what keeps the link
+    # renders it `ERROR` -> `limiter-error`. Paired with `_require_own_directory`, which is what keeps the link
     # from being plantable, and with the same flag in `atomic_write_json`.
     fd = os.open(lock_path, os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600)
     try:
@@ -606,7 +641,7 @@ def atomic_write_json(path: Path, payload: dict) -> None:
     invisible here until it is added on purpose.
 
     There is deliberately NO fsync: what this package keeps in the cache
-    directory is a pacing hint (and a liveness hint) rebuilt on the next call,
+    directory is a pacing hint rebuilt on the next call,
     not a ledger, and paying a disk flush on every scan to protect it would be
     the wrong trade. The exposure is a power loss, after which the file may be
     torn or empty; every reader in this package treats that as unusable and
@@ -622,7 +657,7 @@ def atomic_write_json(path: Path, payload: dict) -> None:
     fail-closed default. `os.replace` needs no such flag: rename operates on
     the link itself and never on what it points at.
 
-    Shared with `smoke.py`'s liveness cache. Call it inside `file_lock`.
+    Shared by the limiter and the budget ledger. Call it inside `file_lock`.
     """
     tmp = path.parent / (path.name + ".tmp")
     fd = os.open(tmp, os.O_CREAT | os.O_WRONLY | os.O_TRUNC | os.O_NOFOLLOW, 0o600)
@@ -657,8 +692,9 @@ class CrossProcessLimiter:
         self._lock_path = self._state_dir / f"{name}-throttle.lock"
 
     @classmethod
-    def from_env(cls, name: str = "lakera") -> "CrossProcessLimiter":
-        return cls(cache_dir(), LimiterConfig.from_env(), name=name)
+    def from_env(cls, name: str) -> "CrossProcessLimiter":
+        """The limiter for vendor `name`: its own env inputs, its own file."""
+        return cls(cache_dir(), LimiterConfig.from_env(name), name=name)
 
     @property
     def state_path(self) -> Path:
@@ -680,9 +716,9 @@ class CrossProcessLimiter:
 
         Note what the `0.0` in the signature is and is not. It is this
         method's own default, NOT the value of
-        `INJECTION_SCANNER_LAKERA_MAX_WAIT_S`: nothing here reads that
+        `INJECTION_SCANNER_<VENDOR>_MAX_WAIT_S`: nothing here reads that
         variable, and it takes effect only where a caller threads
-        `default_max_wait_s()` through — which `lakera.check` does for callers
+        `default_max_wait_s(vendor)` through — which every adapter does for callers
         that name no budget of their own. Calling `acquire()` bare therefore
         ignores the operator's configured wait, deliberately, so that a
         caller which has not thought about waiting never blocks by accident.
@@ -1002,3 +1038,147 @@ class CrossProcessLimiter:
                 "tripped_at": st.tripped_at,
             },
         )
+
+
+# ---------- monthly spend budget ----------
+
+# Bumped only when the ledger's on-disk shape changes.
+_BUDGET_SCHEMA = 1
+_MONTH = re.compile(r"[0-9]{4}-[0-9]{2}\Z")
+
+
+def _utc_month(now: float) -> str:
+    return datetime.fromtimestamp(now, UTC).strftime("%Y-%m")
+
+
+class Reservation:
+    """An amount held against one month of a `MonthlyBudget`.
+
+    `decision` is what `reserve` answered. `release()` gives an `ALLOWED`
+    amount back to the month it was taken from, for a call the vendor did not
+    bill. It is idempotent and never raises; a release that cannot be
+    recorded (lock or ledger unusable) keeps the charge, so a failure
+    over-counts and never mints budget.
+    """
+
+    def __init__(
+        self,
+        decision: Decision,
+        budget: MonthlyBudget | None = None,
+        month: str = "",
+        amount: int = 0,
+    ) -> None:
+        self.decision = decision
+        self._budget = budget
+        self._month = month
+        self._amount = amount
+
+    def release(self) -> None:
+        budget, self._budget = self._budget, None
+        if budget is not None:
+            budget._give_back(self._month, self._amount)
+
+
+class MonthlyBudget:
+    """A fleet-wide allowance per UTC calendar month, shared through one file.
+
+    For a vendor whose free tier is a monthly allowance with no server-side
+    cap: past the allowance the vendor bills rather than refuses, so the only
+    thing that can stop the spend is this ledger. `reserve(amount)` is called
+    BEFORE each request with the vendor's own size estimate; the caller
+    releases the reservation when the vendor did not bill the call.
+
+    `state_dir` holds `<name>-budget.json` and `<name>-budget.lock`, under the
+    same `file_lock` discipline as the limiter (fresh fd per operation,
+    bounded wait, `0700` directory refused unless owned and not group/world
+    writable, `O_NOFOLLOW` opens). The lock serialises threads and processes
+    alike, so concurrent reservations can never overspend.
+
+    The ledger is `{"schema", "month": "YYYY-MM", "used"}`. A missing file is
+    an empty month. A charge in a LATER month than the stored one starts that
+    month at zero; a clock that stepped back into an earlier month keeps the
+    stored count, so a step can delay calls but never mint a budget.
+
+    Unlike the limiter's pacing state, an unreadable, torn or foreign ledger
+    is an ERROR, not a reset: resetting would re-mint a month of billable
+    calls. The operator deletes `<name>-budget.json` to start the month over.
+    """
+
+    def __init__(
+        self,
+        state_dir: Path | str,
+        name: str,
+        limit: int,
+        *,
+        clock=time.time,
+        lock_wait_s: float = DEFAULT_LOCK_WAIT_S,
+    ) -> None:
+        self._state_dir = Path(state_dir)
+        self._name = name
+        self._limit = limit
+        self._clock = clock
+        self._lock_wait_s = lock_wait_s
+        self._state_path = self._state_dir / f"{name}-budget.json"
+        self._lock_path = self._state_dir / f"{name}-budget.lock"
+
+    @property
+    def state_path(self) -> Path:
+        return self._state_path
+
+    def reserve(self, amount: int) -> Reservation:
+        """Spend `amount` if it fits in this month's remainder. Never raises.
+
+        All-or-nothing, under the ledger lock: `ALLOWED` (spent until
+        released), `THROTTLED` (would exceed the limit; nothing spent) or
+        `ERROR` (the ledger is unusable, or `amount` is not a non-negative
+        integer).
+        """
+        try:
+            if not isinstance(self._name, str) or not _VENDOR_NAME.match(self._name):
+                raise ValueError("budget name must be a lower-case identifier")
+            if type(amount) is not int or amount < 0:
+                raise ValueError("amount must be a non-negative integer")
+            with file_lock(self._lock_path, self._lock_wait_s, clock=self._clock):
+                month = _utc_month(self._clock())
+                stored_month, used = self._load(month)
+                if month > stored_month:
+                    stored_month, used = month, 0
+                if used + amount > self._limit:
+                    return Reservation(Decision.THROTTLED)
+                self._store(stored_month, used + amount)
+                return Reservation(Decision.ALLOWED, self, stored_month, amount)
+        except Exception:  # noqa: BLE001 — fails CLOSED; see the docstring
+            return Reservation(Decision.ERROR)
+
+    def _give_back(self, month: str, amount: int) -> None:
+        """`Reservation.release`: refund `amount` to `month`, if the ledger is
+        still on it. A month that has turned started at zero and owes nothing."""
+        try:
+            with file_lock(self._lock_path, self._lock_wait_s, clock=self._clock):
+                stored_month, used = self._load(month)
+                if stored_month == month:
+                    self._store(month, max(0, used - amount))
+        except Exception:  # noqa: BLE001 — keeps the charge; see Reservation
+            pass
+
+    def _store(self, month: str, used: int) -> None:
+        atomic_write_json(
+            self._state_path,
+            {"schema": _BUDGET_SCHEMA, "month": month, "used": used},
+        )
+
+    def _load(self, month: str) -> tuple[str, int]:
+        try:
+            raw = self._state_path.read_text(encoding="utf-8")
+        except FileNotFoundError:
+            return month, 0
+        obj = json.loads(raw)
+        if not isinstance(obj, dict) or obj.get("schema") != _BUDGET_SCHEMA:
+            raise ValueError("foreign budget ledger")
+        stored_month = obj["month"]
+        used = obj["used"]
+        if not isinstance(stored_month, str) or not _MONTH.match(stored_month):
+            raise ValueError("malformed budget month")
+        if type(used) is not int or used < 0:
+            raise ValueError("malformed budget count")
+        return stored_month, used

@@ -29,17 +29,37 @@ _SKIPPED = re.compile(r"\+skipped=([0-9]{1,2})/([0-9]{1,2})\Z")
 _SCENARIO_MODEL = {s["name"]: (s["provider"], s["model"]) for s in ALL_SCENARIOS}
 _JUDGE_MODEL = {j["id"]: (j["provider"], j["model"]) for j in _JUDGES}
 
-# Lakera conditions with a fixed meaning (see lakera.check and the README's
-# reason table). Anything else after `lakera_unavailable:` is a transport
-# exception type, optionally followed by an HTTP status.
-_LAKERA_FIXED = {
-    "no-key": "no API key (set LAKERA_API_KEY or LAKERA_API_KEY_FILE)",
-    "key-config-error": "API key configuration error (LAKERA_API_KEY_FILE unreadable or malformed)",
-    "url-config-error": "endpoint configuration error (only https://api.lakera.ai/v2/guard is allowed)",
+# L2 vendor conditions with a fixed meaning (see vendor_http.paced_post, l2.py,
+# each adapter's `check`, and the README's reason table). Anything else after
+# `<vendor>_unavailable:` is a transport exception type, optionally followed
+# by an HTTP status.
+_PANEL_FIXED = {
     "throttled": "local fleet budget exhausted or quota breaker open (throttled)",
     "service-unavailable": "service breaker open after HTTP 503",
     "limiter-error": "shared limiter unusable (cache directory, lock or IO error)",
-    "bad-response": "unreadable or malformed Guard response",
+    "bad-result": "adapter result outside its closed vocabulary",
+}
+_VENDOR_FIXED = {
+    "lakera": {
+        **_PANEL_FIXED,
+        "no-key": "no API key (set LAKERA_API_KEY or LAKERA_API_KEY_FILE)",
+        "key-config-error": "API key configuration error (LAKERA_API_KEY_FILE unreadable or malformed)",
+        "url-config-error": "endpoint configuration error (only https://api.lakera.ai/v2/guard is allowed)",
+        "bad-response": "unreadable or malformed Guard response",
+    },
+    "model_armor": {
+        **_PANEL_FIXED,
+        "throttled": "local fleet budget or monthly token budget exhausted, or quota breaker open (throttled)",
+        "limiter-error": "shared limiter or monthly budget ledger unusable (cache directory, lock, IO error, or torn model_armor-budget.json)",
+        "no-key": "no credential (set MODEL_ARMOR_CREDENTIALS_FILE)",
+        "key-config-error": "credential configuration error (MODEL_ARMOR_CREDENTIALS_FILE unreadable, or not a service-account key for oauth2.googleapis.com)",
+        "url-config-error": "endpoint configuration error (MODEL_ARMOR_PROJECT / MODEL_ARMOR_LOCATION / MODEL_ARMOR_TEMPLATE missing or invalid)",
+        "too-large": "text over INJECTION_SCANNER_MODEL_ARMOR_MAX_CHARS, not sent",
+        "token-error": "OAuth token exchange failed (network error or malformed token response)",
+        "skipped": "prompt-injection filter skipped (EXECUTION_SKIPPED)",
+        "partial-invocation": "not every filter ran (invocationResult PARTIAL or FAILURE)",
+        "bad-response": "unreadable or malformed Model Armor response",
+    },
 }
 
 
@@ -83,21 +103,17 @@ def _provider_signal(parts: list[str]) -> str:
     if not parts:
         return "unavailable"
     head = _seg(parts[0])
-    if head == "api-error":
+    if head in ("api-error", "openai-api-error", "anthropic-api-error"):
         return _api_error(parts[1:])
-    if head == "parse-error":
+    if head in ("parse-error", "openai-parse-error", "anthropic-parse-error"):
         return _parse_error(parts[1:])
     if head in _JUDGE_FIXED:
         return _JUDGE_FIXED[head]
     for provider in ("openai", "anthropic"):
-        if head == f"{provider}-api-error":
-            return _api_error(parts[1:])
         if head == f"no-{provider}-api-key":
             return f"no API key (set {provider.upper()}_API_KEY)"
         if head == f"{provider}-lib-missing":
             return f"{provider} SDK not installed"
-        if head == f"{provider}-parse-error":
-            return _parse_error(parts[1:])
     if head == "unhandled":
         exc = _seg(parts[1]) if len(parts) > 1 else "other"
         return f"unhandled {exc}"
@@ -128,27 +144,40 @@ def _honeypot(rest: str, *, triggered: bool) -> str:
     return f"honeypot: {where}: {_provider_signal(signal)}{skipped}"
 
 
+def _judge_outage(parts: list[str]) -> str:
+    """The `judge_unavailable:` tail: `<judge>:<signal>` or `panel-incomplete`
+    (judge.py), or `unhandled:<ExcType>` (intercept's guard around the layer)."""
+    if parts[0] == "unhandled":
+        return f"judge: {_provider_signal(parts)}"
+    if parts[0] == "panel-incomplete":
+        return "judge: panel incomplete"
+    judge = _seg(parts[0])
+    return f"judge: {_model_for(_JUDGE_MODEL, judge)}: {_provider_signal(parts[1:])}"
+
+
 def _judge(rest: str) -> str:
     parts = rest.split(":")
     if parts[0] == "attack":
         judge = _seg(parts[1]) if len(parts) > 1 else "other"
         return f"judge: {_model_for(_JUDGE_MODEL, judge)} voted attack on the benign probe"
-    if parts[0] == "unavailable" and len(parts) > 1:
-        if parts[1] == "panel-incomplete":
-            return "judge: panel incomplete"
-        judge = _seg(parts[1])
-        return f"judge: {_model_for(_JUDGE_MODEL, judge)}: {_provider_signal(parts[2:])}"
+    if parts[0] == "judge_unavailable":
+        return _judge_outage(parts[1:] or ["other"])
     return f"judge: {_seg(parts[0])}"
 
 
-def _lakera(rest: str) -> str:
-    if rest in _LAKERA_FIXED:
-        return f"lakera: {_LAKERA_FIXED[rest]}"
+def _vendor(vendor: str, rest: str) -> str:
+    fixed = _VENDOR_FIXED[vendor]
+    if rest in fixed:
+        return f"{vendor}: {fixed[rest]}"
     parts = rest.split(":")
+    if parts[0] == "unhandled":
+        return f"{vendor}: {_provider_signal(parts)}"
+    if parts[0] == "token-error" and len(parts) == 2:
+        return f"{vendor}: OAuth token exchange returned {_status_text(parts[1])}"
     exc = _seg(parts[0])
     if len(parts) > 1:
-        return f"lakera: {_status_text(parts[1])} ({exc})"
-    return f"lakera: transport error ({exc})"
+        return f"{vendor}: {_status_text(parts[1])} ({exc})"
+    return f"{vendor}: transport error ({exc})"
 
 
 def describe(reason: str) -> str:
@@ -156,14 +185,16 @@ def describe(reason: str) -> str:
     if not isinstance(reason, str) or not reason:
         return "unknown failure"
     head, _, rest = reason.partition(":")
-    if head == "lakera_unavailable":
-        return _lakera(rest)
-    if head == "lakera":
-        return f"lakera: flagged the benign probe ({_seg(rest)})"
-    if head == "lakera_arbitration":
+    for vendor in _VENDOR_FIXED:
+        if head == f"{vendor}_unavailable":
+            return _vendor(vendor, rest)
+        if head == vendor:
+            label = rest if rest == "prompt_attack" else "other"
+            return f"{vendor}: flagged the benign probe ({label})"
+    if head == "l2_arbitration":
         return _judge(rest)
     if head == "judge_unavailable":
-        return f"judge: {_provider_signal(rest.split(':'))}"
+        return _judge_outage(rest.split(":"))
     if head == "honeypot_unavailable":
         return _honeypot(rest, triggered=False)
     if head == "honeypot":
