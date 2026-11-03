@@ -172,12 +172,17 @@ def gather_from(diff_bytes: bytes, fetch_binary: Callable[[str], bytes],
     diff_text = diff_bytes.decode("utf-8", errors="replace")
     files = parse(diff_text)
     binaries: dict[str, bytes] = {}
+    # Everything whose content the hash must cover: the binaries plus pure
+    # renames, whose content appears nowhere in the diff. Kept apart from
+    # `binaries` because that one drives the binary checks, and a renamed
+    # text file is not a binary.
+    hashed: dict[str, bytes] = {}
     unread: list[str] = []
     for f in files:
         if f.status == "deleted":
             continue
         if f.binary:
-            binaries[f.path] = fetch_binary(f.path)
+            binaries[f.path] = hashed[f.path] = fetch_binary(f.path)
         elif f.status == "renamed" and not f.body and not f.gitlink:
             # A pure (100%) rename or copy has no hunks and no "Binary files"
             # line: git says nothing about the content. Read it and decide as
@@ -188,6 +193,9 @@ def gather_from(diff_bytes: bytes, fetch_binary: Callable[[str], bytes],
             except TooLarge:
                 unread.append(f.path)
                 continue
+            # Hashed either way: a renamed text file's content is as absent
+            # from the diff as a binary's.
+            hashed[f.path] = data
             if b"\0" in data[:GIT_BINARY_PEEK]:
                 f.binary = True
                 binaries[f.path] = data
@@ -201,8 +209,8 @@ def gather_from(diff_bytes: bytes, fetch_binary: Callable[[str], bytes],
         raise DiffError("diff parses differently")
     for f, e in zip(files, exact):
         e.binary = f.binary   # a pure rename found binary above
-    digests = {e.path: hashlib.sha256(binaries[f.path]).hexdigest()
-               for f, e in zip(files, exact) if f.path in binaries}
+    digests = {e.path: hashlib.sha256(hashed[f.path]).hexdigest()
+               for f, e in zip(files, exact) if f.path in hashed}
     return Gathered(diff_bytes, diff_text, files, binaries, own_changes_hash(exact, digests),
                     lockfiles, unread)
 

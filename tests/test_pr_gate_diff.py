@@ -286,7 +286,7 @@ def test_the_no_newline_marker_is_not_an_added_or_removed_line():
 def test_diffs_without_the_no_newline_marker_hash_as_before():
     # Pinned before the marker entered the hash: existing passes carry over.
     assert dp.own_changes_hash(dp.parse(MODIFY + ADD + DELETE), {}) == (
-        "a533a091a0cbe0cd1c19a82df7e85688138a3e128a2c8a4cf9c7c464b57a3cbe")
+        "7e212dcc2c8801c6b85e1934535248f858f4b9286d674e22dc494f1715f49071")
 
 
 def test_hash_is_hex_sha256():

@@ -750,11 +750,15 @@ def test_invalid_utf8_in_a_binary_path_still_hashes_its_content():
 
 
 @pytest.mark.parametrize("diff,expected", [
-    # Own-changes hashes of valid UTF-8 diffs as computed before the
-    # surrogateescape change: carry-over of existing passes must not break.
-    (DIFF, "a3ea9398ea44d9e3baad90f573a4e39c5bd3095724c8383d78c4165c949f009d"),
+    # Own-changes hashes of valid UTF-8 diffs. Re-pinned 2026-11-03 when the
+    # record's content digest stopped being binary-only (a text rename's
+    # content was outside the hash, so a passed rename carried over onto
+    # whatever the base later put at the old path). The key rename churns
+    # every record, so these moved too; markers from before this commit no
+    # longer verify, which costs nothing while pr-gate has no consumers.
+    (DIFF, "c2c5831b0b89d9c9faa99307e2274b1f7e615511a173125b71764477ec6bccc8"),
     (DIFF.replace("c = 4", 'c = "caf\u00e9 \u4e2d \u2705"'),
-     "78a565352875188065f5db37b53ccfb8e2f626359a9062280f479bbb03bf8664"),
+     "a9f844d0e36eb49b37f2e22a7412b59a2d140c163b143cd342a95bef8053a6d4"),
 ])
 def test_valid_utf8_diffs_hash_as_before(diff, expected):
     assert _hash_of_bytes(diff.encode()) == expected
@@ -822,10 +826,14 @@ def test_a_pure_text_rename_is_no_hit():
     assert out.exit_code == 0, out.message
 
 
-def test_a_pure_text_rename_hashes_as_before():
+def test_a_pure_text_rename_hash_is_pinned():
+    """Drift detector, not a property: the value moves only with a deliberate
+    change to the record, and moving it invalidates every live marker. Re-
+    pinned 2026-11-03 when the renamed file's content entered the hash --
+    note the content, not just the paths, now feeds it."""
     g = core.gather_from(pure("src/a.py", "src/b.py").encode(), lambda p: b"x = 1\n",
                          lambda f: None)
-    assert g.own_hash == "5be811aa84b39d67f88c926701c12f478fd666070cb7371b42dd3a23ba5ee18c"
+    assert g.own_hash == "1c00d3547917ca53c3ec8b0e13c31645e118feeb965956c9f4d99084bfa1edec"
 
 
 @pytest.mark.parametrize("kind", ["rename", "copy"])
@@ -838,6 +846,19 @@ def test_a_pure_rename_too_large_to_read_is_an_overridable_hit_not_stuck(kind, m
     assert out.message == "blocked: deterministic check: too-large"
     out2, _ = run(blocked(diff=diff, files=files, dismissals=[dismissal(1, OWNER)]), attempt=2)
     assert out2.message == "passed (owner-override)"
+
+
+def test_a_pure_text_rename_puts_its_content_in_the_hash():
+    """Carry-over rests on this hash, and a pure rename has no hunks -- the
+    diff says nothing about the content. Without it in the hash: a PR renames
+    examples/start.py to start.py and passes; main then rewrites
+    examples/start.py; the PR merges main, and the rename diff and hash come
+    out identical, so the pass carries over onto code no model ever saw.
+    The binary twin of this test already existed."""
+    d = pure("examples/start.py", "start.py").encode()
+    a = core.gather_from(d, lambda p: b"print('hi')\n", lambda f: None)
+    b = core.gather_from(d, lambda p: b"__import__('os').system('sh')\n", lambda f: None)
+    assert a.own_hash != b.own_hash
 
 
 def test_a_pure_binary_rename_puts_its_content_in_the_hash():

@@ -617,6 +617,26 @@ it, each with the reason. Design: `docs/superpowers/specs/2026-10-24-pr-gate-des
 30. The pinned SDK is `anthropic==1.17.0`, the version the offline tests ran
     against when this was built.
 
+## Carry-over soundness
+
+39. **A pure rename's content is in the own-changes hash, text or binary**
+    (2026-11-03, review finding). The digest used to be gated on
+    `f.binary`, and a pure rename carries no hunks — so for a renamed *text*
+    file the hash record held only "this path moved to that one". Reproduced:
+    a PR renames `examples/start.py` to `start.py` and passes; `main` then
+    rewrites `examples/start.py`; the PR merges `main`, and the rename diff
+    and own-changes hash come out byte-identical, so the gate returns
+    `passed (carry-over)` with zero model calls while entirely different code
+    lands at `start.py`. The binary case was already covered, which is what
+    marks this an oversight rather than a decision. `core.gather_from` now
+    keeps a `hashed` map (binaries plus pure renames) separate from
+    `binaries` — the latter drives the binary checks, and a renamed text file
+    is not a binary — and the record's field is `content_sha256`, read
+    unconditionally. Renaming the field churns every record, so the four
+    pinned hashes moved with it and markers written before this commit no
+    longer verify; free while pr-gate has no consumers, and the pins exist to
+    force exactly this deliberation.
+
 ## Credentials
 
 31. **The gate stores no model credential.** Each run has GitHub sign a

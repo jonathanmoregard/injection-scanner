@@ -202,15 +202,20 @@ def parse(diff: str) -> list[FileChange]:
     return files
 
 
-def own_changes_hash(files: list[FileChange], binary_sha256: dict[str, str]) -> str:
+def own_changes_hash(files: list[FileChange], content_sha256: dict[str, str]) -> str:
     """Hash of what the PR itself changes, stable across base merges.
 
-    Per file: paths, status, modes, binary content digest, and the hunk
+    Per file: paths, status, modes, content digest, and the hunk
     bodies (context, added and removed lines and "\\ No newline at end of
     file" markers, in order) with the `@@` hunk headers dropped, so line offsets that shift when the base gains lines
     elsewhere do not matter. Context lines are kept on purpose: without
     them, moving an added line into a different function leaves the
     added/removed lists identical (see pr-gate/DECISIONS.md).
+
+    The content digest covers BINARIES AND PURE RENAMES ALIKE. A pure rename
+    carries no hunks, so without the digest the record would say only "this
+    path moved to that one" -- and a passed rename would carry over onto
+    whatever the base later put at the old path.
     """
     h = hashlib.sha256()
     for f in sorted(files, key=lambda f: (f.path, f.old_path or "")):
@@ -221,7 +226,10 @@ def own_changes_hash(files: list[FileChange], binary_sha256: dict[str, str]) -> 
             "old_mode": f.old_mode,
             "new_mode": f.new_mode,
             "binary": f.binary,
-            "binary_sha256": binary_sha256.get(f.path) if f.binary else None,
+            # Unconditional: the map holds binaries and pure renames, and a
+            # file with neither has no entry. Gating this on f.binary is what
+            # let a text rename's content stay out of the hash.
+            "content_sha256": content_sha256.get(f.path),
             "body": f.body,
         }
         h.update(json.dumps(record, ensure_ascii=True, sort_keys=True).encode("ascii"))
