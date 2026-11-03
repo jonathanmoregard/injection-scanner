@@ -1,0 +1,7 @@
+# Runtime dependencies of the pr-gate action. Regenerate requirements.txt with:
+#   uv pip compile requirements.in --generate-hashes --python-version 3.12 \
+#     --python-platform x86_64-unknown-linux-gnu -o requirements.txt
+# then run the test suite against the same anthropic version.
+anthropic==1.17.0
+# The lockfile check parses YAML lockfiles (safe loader only).
+pyyaml==6.0.3
