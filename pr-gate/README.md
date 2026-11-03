@@ -144,7 +144,9 @@ the check says what failed.
    `.github/workflows/ai-gate.yml`. Replace `<FULL_SHA>` with a full
    injection-scanner commit SHA, set `owner` and `model`. Keep the job's
    `name: ai-gate` and never add a job-level `if:` (a skipped required check
-   counts as passing).
+   counts as passing). Keep `id-token: write` in `permissions`: without it
+   GitHub issues no identity token, the gate has no credential, and every PR
+   goes red.
 2. Ruleset on the default branch: require a pull request; require status
    check `ai-gate` with source **GitHub Actions**; **require branches to be
    up to date before merging**; block force pushes; **no bypass actors**.
@@ -160,15 +162,38 @@ the check says what failed.
    anyone but `owner` never clears a block either way).
 3. Settings → General: allow auto-merge; turn off "Allow rebase merging"
    (see Limitations).
-4. Secret `AI_GATE_ANTHROPIC_KEY`: a dedicated key from its own Anthropic
-   Console workspace with a spend limit at or below the monthly API credit.
-   Never the subscription OAuth token. The gate also uses it as the HMAC key
-   that signs its review markers; rotating it invalidates earlier gate
-   verdicts (re-click auto-merge on open PRs).
-5. The agents' GitHub App or token must **not** have the `workflows`
+4. **Federated identity — the gate stores no model credential.** In the
+   Claude Console, under Workload identity, create a service account, a
+   workspace with a spend limit at or below the monthly API credit, and a
+   federation rule for this repository. Then set four **repository
+   variables** (Settings → Secrets and variables → Actions → Variables):
+   `AI_GATE_FEDERATION_RULE_ID`, `AI_GATE_ORGANIZATION_ID`,
+   `AI_GATE_SERVICE_ACCOUNT_ID`, `AI_GATE_WORKSPACE_ID`. Variables, not
+   secrets: they authorise nothing on their own, because only a run in this
+   repository can present an identity token the rule matches. Each run mints
+   its own bearer, valid for minutes, so a leak costs the rest of that
+   lifetime rather than a rotation, and the workspace ceiling bounds what it
+   could spend.
+
+   ⚠️ **GitHub issues an immutable OIDC subject and the Console's wizard
+   does not build that form.** The rule must match
+   `repo:<owner>@<owner id>/<repo>@<repo id>:pull_request_target`, not the
+   classic `repo:<owner>/<repo>:<event>`. The classic form is refused with
+   `match_subject_prefix`; since every refusal is an opaque 401, the reason
+   is only visible in the Console's Workload identity page, under its
+   history tab.
+5. Secret `AI_GATE_MARKER_KEY`: any high-entropy random string
+   (`openssl rand -hex 32`), used only as the HMAC key that signs the gate's
+   review markers. It authorises nothing anywhere — it is what makes a gate
+   review unforgeable by a PR. It is deliberately **not** the model
+   credential: a marker has to still verify on a later run (pass carry-over,
+   a re-run, an owner dismissal), and a federated bearer is gone within
+   minutes. Rotating it invalidates earlier gate verdicts (re-click
+   auto-merge on open PRs).
+6. The agents' GitHub App or token must **not** have the `workflows`
    permission. Otherwise a PR can add a second workflow whose job is also
    named `ai-gate` and reports a fake pass.
-6. Settings → Actions → General → Workflow permissions: **read repository
+7. Settings → Actions → General → Workflow permissions: **read repository
    contents** (read-only default token), for the repo or the org. No other
    workflow may grant itself `checks: write` or `statuses: write`, and no
    workflow that runs PR code (builds, tests, `pull_request_target` with a
@@ -176,7 +201,10 @@ the check says what failed.
    create a check run named `ai-gate` with conclusion success on the head,
    from the same GitHub Actions app the ruleset trusts, so the required
    check passes without the gate; one with `pull-requests: write` posts
-   reviews as `github-actions[bot]` (see Limitations).
+   reviews as `github-actions[bot]` (see Limitations). The same reasoning now
+   covers `id-token: write`: a workflow holding it in this repository can
+   mint a gate credential, which is why adding workflows is a blocked
+   sensitive path and item 6 exists.
 
 Org repos need their own secret and ruleset.
 
@@ -216,10 +244,18 @@ Org repos need their own secret and ruleset.
   (merging the base into the PR) passes on its own as long as the PR's own
   changes are unchanged; a conflict resolution or any extra edit needs the
   re-click. Closing and reopening the PR is treated like a push.
-- **Key rotation:** a new `AI_GATE_ANTHROPIC_KEY` invalidates the gate's
+- **Marker-key rotation:** a new `AI_GATE_MARKER_KEY` invalidates the gate's
   earlier verdicts (their markers no longer verify). Open PRs need a
   re-click of auto-merge. So does a gate update that changes the marker
   version (v2 to v3: the signature now covers the whole review text).
+  Rotating it is cheap and affects no spend; the model credential is
+  federated and needs no rotation at all.
+- **Credential lifetime:** the exchange grants a bearer valid for minutes
+  (the lesser of the rule's setting and twice what is left of the identity
+  token), and the run reports what it was granted. Three passes over a large
+  diff that outlast it surface as `infra` and redden the check — never as a
+  pass. If the pilot shows this happening, the fix is re-minting per pass,
+  not a longer-lived credential.
 - **"enable auto-merge to request the AI gate"** on a new PR is expected:
   that is the gate waiting for you.
 - **PRs must target the default branch.** Into any other branch the check
@@ -238,7 +274,20 @@ Org repos need their own secret and ruleset.
 | `suspicion-threshold` | `25` | Calibrate on past honest PRs (below). |
 | `exceptions` | empty | Newline-separated globs (`*` crosses `/`) whose sensitive-path rule becomes extra scrutiny instead of a block, e.g. `.claude/*` for the `.claude` repo. Never covers `.github/workflows/`, `.github/actions/`, hidden Unicode or lockfile hosts. |
 | `lockfile-hosts` | empty | Newline-separated extra hostnames (e.g. a private registry, `npm.mycompany.example`) that every lockfile check accepts on top of its built-in allowlist. Exact match only: no subdomains, wildcards, schemes, ports, paths or IP literals; blank and `#` comment lines are skipped, case and a trailing dot normalised. Any other line fails the run as a config error naming the line number. It only extends: built-in hosts stay, and URLs must still be https (or ssh for git). Lives in the caller workflow, so a PR cannot extend its own allowlist (DECISIONS item 22c). |
-| `anthropic-api-key` | (required) | `${{ secrets.AI_GATE_ANTHROPIC_KEY }}`. Reaches only the gate step's env. |
+| `marker-key` | (required) | `${{ secrets.AI_GATE_MARKER_KEY }}`. HMAC key for review markers only; reaches only the gate step's env. Never the model credential — see Setup 5. |
+| `federation-rule-id` | (required) | `${{ vars.AI_GATE_FEDERATION_RULE_ID }}`. Reaches only the mint step. |
+| `organization-id` | (required) | `${{ vars.AI_GATE_ORGANIZATION_ID }}`. |
+| `service-account-id` | (required) | `${{ vars.AI_GATE_SERVICE_ACCOUNT_ID }}`. |
+| `workspace-id` | (required) | `${{ vars.AI_GATE_WORKSPACE_ID }}`. Its spend ceiling bounds a leaked bearer. |
+
+There is no model-credential input. The workflow mints one per run from the
+repository's OIDC identity and hands it to the gate step as a 600-mode file
+under `RUNNER_TEMP`, so it is in no other step's environment, no step output
+and no process listing. The exchange happens in the workflow rather than in
+the gate process for two reasons: the identity token's `jti` is single-use,
+so one exchange has to serve all three passes, and the gate is never given
+the means to mint another. `ACTIONS_ID_TOKEN_REQUEST_TOKEN` and `_URL` are
+emptied on the gate step for the same reason.
 
 There is no token input: the gate always uses the workflow's `github.token`
 (`contents: read`, `pull-requests: write`, `issues: read` in the caller), so
@@ -271,7 +320,7 @@ verdict JSON (including the monitors' `analysis`). No GitHub calls.
 git fetch origin pull/123/merge         # GitHub's test merge of PR 123
 git diff FETCH_HEAD^1...FETCH_HEAD > /tmp/pr123.diff   # base...merge: what would land
 python pr-gate/gate.py --dry-run --diff /tmp/pr123.diff --no-llm       # deterministic only
-ANTHROPIC_API_KEY=... python pr-gate/gate.py --dry-run --diff /tmp/pr123.diff \
+ANTHROPIC_API_KEY=... python pr-gate/gate.py --dry-run --diff /tmp/pr123.diff \   # your own key; a laptop has no OIDC issuer to federate with
     [--files-dir CHECKOUT] [--model claude-fable-5-1] [--effort high] [--threshold 25] \
     [--exceptions-file globs.txt] [--lockfile-hosts-file hosts.txt]
 ```

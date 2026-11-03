@@ -35,8 +35,27 @@ inputs:
       Only extends; https/ssh-only schemes are unchanged.
     required: false
     default: ""
-  anthropic-api-key:
-    description: Anthropic API key from a dedicated, spend-capped Console workspace. Also the HMAC key that signs the gate's review markers.
+  marker-key:
+    description: >
+      Secret keying the HMAC that signs the gate's review markers. Its own
+      secret, never the model credential: a marker must still verify on a
+      LATER run (pass carry-over, a re-run, an owner dismissal), and the
+      model credential now expires within minutes. It authorises nothing
+      anywhere -- it only makes a gate review unforgeable by the PR.
+    required: true
+  federation-rule-id:
+    description: >
+      Claude Console, Workload identity. The federation rule bound to this
+      repository's immutable OIDC subject.
+    required: true
+  organization-id:
+    description: Console organization owning the federation rule.
+    required: true
+  service-account-id:
+    description: Console service account the minted token acts as.
+    required: true
+  workspace-id:
+    description: Console workspace whose spend ceiling bounds what a leaked token can cost.
     required: true
 
 runs:
@@ -55,9 +74,108 @@ runs:
           --require-hashes --no-deps --only-binary=:all: \
           -r "$GITHUB_ACTION_PATH/requirements.txt"
 
+    # Last before the gate runs, so the credential is as young as it can be.
+    #
+    # The gate holds no stored model credential. GitHub signs a statement
+    # that THIS repository's pull_request_target job is running; Anthropic
+    # exchanges it for a bearer bound to one workspace with its own spend
+    # ceiling, expiring in minutes. A leak costs the remainder of that
+    # lifetime instead of a rotation.
+    #
+    # The exchange happens here rather than in the gate process because the
+    # identity token carries a single-use `jti`: one exchange serves all
+    # three passes, and the gate is never handed the means to mint another.
+    #
+    # WARNING: GitHub issues an IMMUTABLE OIDC subject, and the Console's
+    # wizard does not build that form. The rule must match
+    # `repo:<owner>@<owner id>/<repo>@<repo id>:pull_request_target`, not the
+    # classic `repo:<owner>/<repo>:<event>`. The classic form is refused with
+    # `match_subject_prefix`, and since every refusal is an opaque 401 the
+    # reason is only visible in the Console's Workload identity history.
+    - name: mint a credential that expires by itself
+      shell: bash
+      env:
+        RULE_ID: ${{ inputs.federation-rule-id }}
+        ORG_ID: ${{ inputs.organization-id }}
+        SERVICE_ACCOUNT_ID: ${{ inputs.service-account-id }}
+        WORKSPACE_ID: ${{ inputs.workspace-id }}
+      run: |
+        set -euo pipefail
+        if [ -z "$RULE_ID" ] || [ -z "$ORG_ID" ] || [ -z "$SERVICE_ACCOUNT_ID" ] \
+           || [ -z "$WORKSPACE_ID" ]; then
+          echo "this repository has no ai-gate federation configured:"
+          echo "  AI_GATE_FEDERATION_RULE_ID:  ${RULE_ID:-MISSING}"
+          echo "  AI_GATE_ORGANIZATION_ID:     ${ORG_ID:-MISSING}"
+          echo "  AI_GATE_SERVICE_ACCOUNT_ID:  ${SERVICE_ACCOUNT_ID:-MISSING}"
+          echo "  AI_GATE_WORKSPACE_ID:        ${WORKSPACE_ID:-MISSING}"
+          echo "failing closed: a gate that cannot reach the model has reviewed nothing"
+          exit 1
+        fi
+        if [ -z "${ACTIONS_ID_TOKEN_REQUEST_URL:-}" ]; then
+          echo "GitHub issued no identity token to this run."
+          echo "the calling workflow needs permissions: id-token: write"
+          echo "failing closed: a gate that cannot reach the model has reviewed nothing"
+          exit 1
+        fi
+        curl --fail --silent --show-error \
+          -H "Authorization: Bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" \
+          "${ACTIONS_ID_TOKEN_REQUEST_URL}&audience=https://api.anthropic.com" \
+          -o "${RUNNER_TEMP}/identity.json"
+        jwt=$(jq -r '.value // empty' "${RUNNER_TEMP}/identity.json")
+        rm -f "${RUNNER_TEMP}/identity.json"
+        if [ -z "$jwt" ]; then
+          echo "the identity token request returned no token"
+          exit 1
+        fi
+        echo "::add-mask::$jwt"
+        # Built with jq so the assertion cannot break the JSON, and written to
+        # a file so it never appears in a process listing.
+        jq -n --arg assertion "$jwt" --arg rule "$RULE_ID" \
+              --arg org "$ORG_ID" --arg account "$SERVICE_ACCOUNT_ID" \
+              --arg workspace "$WORKSPACE_ID" \
+          '{grant_type: "urn:ietf:params:oauth:grant-type:jwt-bearer",
+            assertion: $assertion, federation_rule_id: $rule,
+            organization_id: $org, service_account_id: $account,
+            workspace_id: $workspace}' \
+          > "${RUNNER_TEMP}/exchange.json"
+        code=$(curl --silent --show-error --output "${RUNNER_TEMP}/token.json" \
+          --write-out '%{http_code}' -X POST \
+          https://api.anthropic.com/v1/oauth/token \
+          -H 'content-type: application/json' \
+          --data "@${RUNNER_TEMP}/exchange.json")
+        rm -f "${RUNNER_TEMP}/exchange.json"
+        token=$(jq -r '.access_token // empty' "${RUNNER_TEMP}/token.json")
+        expires=$(jq -r '.expires_in // empty' "${RUNNER_TEMP}/token.json")
+        rm -f "${RUNNER_TEMP}/token.json"
+        # Masked the instant it exists, before any branch that might print.
+        [ -z "$token" ] || echo "::add-mask::$token"
+        if [ -z "$token" ] || [ -z "$expires" ]; then
+          # Presence only. Never interpolate the credential itself, not even
+          # in a branch that "cannot" be reached with it set.
+          if [ -n "$token" ]; then has_token=present; else has_token=MISSING; fi
+          echo "the exchange returned no usable credential (HTTP $code):"
+          echo "  access_token: ${has_token}"
+          echo "  expires_in:   ${expires:-MISSING}"
+          echo "a refused exchange is always an opaque 401; the reason is in"
+          echo "the Console's Workload identity page, under its history tab."
+          echo "failing closed: a gate that cannot reach the model has reviewed nothing"
+          exit 1
+        fi
+        # A file, not a step output and not GITHUB_ENV: an output is kept by
+        # the runner for the whole job and GITHUB_ENV would put the credential
+        # into the environment of every later step.
+        printf '%s' "$token" > "${RUNNER_TEMP}/anthropic-token"
+        chmod 600 "${RUNNER_TEMP}/anthropic-token"
+        # Reported, not exported. Three passes over a large diff outrunning
+        # this lifetime surface as infra and redden the check, never as a
+        # pass -- so the pilot needs to see what was actually granted.
+        echo "minted a workspace token, valid for ${expires}s"
+
     # Every input reaches Python through env, never interpolated into the
-    # script. The API key is scoped to this one step. The token is always
-    # the workflow's own: the gate trusts only github-actions[bot] reviews.
+    # script. The marker key is scoped to this one step and the bearer is
+    # never in the environment at all -- the gate reads it from the 600-mode
+    # file above. The token is always the workflow's own: the gate trusts
+    # only github-actions[bot] reviews.
     - name: ai-gate
       shell: bash
       env:
@@ -68,5 +186,11 @@ runs:
         PR_GATE_EXCEPTIONS: ${{ inputs.exceptions }}
         PR_GATE_LOCKFILE_HOSTS: ${{ inputs.lockfile-hosts }}
         PR_GATE_GITHUB_TOKEN: ${{ github.token }}
-        ANTHROPIC_API_KEY: ${{ inputs.anthropic-api-key }}
+        PR_GATE_MARKER_KEY: ${{ inputs.marker-key }}
+        PR_GATE_TOKEN_FILE: ${{ runner.temp }}/anthropic-token
+        # Emptied, not absent: a variable set to the empty string still
+        # occupies its slot, so the gate process cannot ask GitHub for a
+        # second identity token and mint a credential outliving this run's.
+        ACTIONS_ID_TOKEN_REQUEST_TOKEN: ""
+        ACTIONS_ID_TOKEN_REQUEST_URL: ""
       run: '"$RUNNER_TEMP/pr-gate-venv/bin/python" -I "$GITHUB_ACTION_PATH/gate.py"'

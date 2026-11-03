@@ -26,10 +26,13 @@ SEVERITY_ORDER = {"high": 0, "medium": 1, "low": 2}
 MAX_BODY = 60000
 MAX_FINDINGS = 40
 MAX_HITS = 40
-# Review-body marker, authenticated with an HMAC keyed by the Anthropic API
-# key: any workflow in the repo can post as github-actions[bot], but only the
-# gate step holds that secret. The MAC also covers a digest of the rest of
-# the body, so an edited body or a copied marker over other text never
+# Review-body marker, authenticated with an HMAC keyed by the gate's own
+# marker secret: any workflow in the repo can post as github-actions[bot], but
+# only the gate step holds that secret. It is deliberately not the model
+# credential, which is federated and expires in minutes -- a marker has to
+# still verify on a later run, since carry-over, re-runs and owner dismissals
+# all re-verify one an earlier run wrote. The MAC also covers a digest of the
+# rest of the body, so an edited body or a copied marker over other text never
 # verifies. An unsigned marker (dry-run) never verifies.
 MARKER = "<!-- pr-gate:v3 verdict={verdict} head={head} hash={hash} mac={mac} -->"
 UNSIGNED = "unsigned"

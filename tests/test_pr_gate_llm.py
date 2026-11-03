@@ -64,6 +64,22 @@ class Stub:
         )
 
 
+def test_a_federated_credential_goes_on_the_wire_as_a_bearer():
+    """A minted workspace token is not an API key. Sent as `x-api-key` the
+    exchange's own credential is refused 401, which the gate reads as infra
+    on every single run -- a gate that never reviews anything."""
+    stub = Stub((200, _message(json.dumps(GOOD_MONITOR))))
+    client = llm.build_client(
+        "fed-token", bearer=True,
+        http_client=anthropic.DefaultHttpxClient(transport=httpx2.MockTransport(stub.handle)),
+        max_retries=0)
+    llm.call(client, "monitor_a", kind="monitor", model="claude-opus-5-5", effort="high",
+             system="sys", user="usr")
+    [headers] = stub.headers
+    assert headers.get("authorization") == "Bearer fed-token"
+    assert "x-api-key" not in headers
+
+
 def _monitor(stub, model="claude-opus-5-5", effort="high"):
     return llm.call(stub.client(), "monitor_a", kind="monitor", model=model, effort=effort,
                     system="sys", user="usr")

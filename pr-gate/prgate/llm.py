@@ -207,8 +207,14 @@ def build_inputs(diff_text: str, contents: dict[str, str],
 
 # ----- calls -----------------------------------------------------------------
 
-def build_client(api_key: str, *, http_client=None, max_retries: int = 2) -> anthropic.Anthropic:
-    kw = {"api_key": api_key, "timeout": TIMEOUT_S, "max_retries": max_retries}
+def build_client(credential: str, *, bearer: bool = False, http_client=None,
+                 max_retries: int = 2) -> anthropic.Anthropic:
+    """`bearer` picks the header. A federated workspace token is NOT an API
+    key: sent as `x-api-key` it is refused 401, which the gate would read as
+    infra on every run. Actions mode always federates; the local dry-run
+    takes a developer's own `ANTHROPIC_API_KEY`."""
+    slot = "auth_token" if bearer else "api_key"
+    kw = {slot: credential, "timeout": TIMEOUT_S, "max_retries": max_retries}
     if http_client is not None:
         kw["http_client"] = http_client
     return anthropic.Anthropic(**kw)

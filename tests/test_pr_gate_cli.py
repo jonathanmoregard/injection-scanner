@@ -175,7 +175,8 @@ def actions_env(tmp_path, **over):
         "PR_GATE_EXCEPTIONS": ".claude/*\n",
         "PR_GATE_LOCKFILE_HOSTS": "# ours\nNPM.corp.example\n",
         "PR_GATE_GITHUB_TOKEN": "ghs_x",
-        "ANTHROPIC_API_KEY": "sk-ant-x",
+        "PR_GATE_MARKER_KEY": "marker-secret",
+        "PR_GATE_TOKEN_FILE": str(tmp_path / "anthropic-token"),
         "GITHUB_STEP_SUMMARY": str(tmp_path / "summary.md"),
     }
     env.update(over)
@@ -196,7 +197,7 @@ def test_actions_mode_maps_env_to_config_and_event(tmp_path, capsys, monkeypatch
                                     default_branch="main", run_attempt=2)
     c = seen["cfg"]
     assert (c.owner, c.model, c.effort, c.threshold, c.exceptions, c.marker_key) == (
-        "jonathan", "claude-opus-5-5", "high", 25, [".claude/*"], b"sk-ant-x")
+        "jonathan", "claude-opus-5-5", "high", 25, [".claude/*"], b"marker-secret")
     assert c.lockfile_hosts == frozenset({"npm.corp.example"})
     assert "::notice::" in capsys.readouterr().out
     assert "passed" in (tmp_path / "summary.md").read_text()
@@ -276,11 +277,50 @@ def test_internal_errors_print_only_the_type_name(tmp_path, capsys, monkeypatch)
     assert "RuntimeError" in out.out and "SECRET" not in out.out + out.err
 
 
-def test_missing_key_surfaces_as_infra_not_a_verdict(tmp_path):
-    env = actions_env(tmp_path, ANTHROPIC_API_KEY="")
+def test_missing_credential_surfaces_as_infra_not_a_verdict(tmp_path):
+    env = actions_env(tmp_path, PR_GATE_TOKEN_FILE="")
     review_fn = cli.make_review_fn(env, core.Config("jonathan", "m", "high", 25))
     results = review_fn("diff", {}, [], [])
-    assert {(r.status, r.reason) for r in results} == {("infra", "no-key")}
+    assert {(r.status, r.reason) for r in results} == {("infra", "no-credential")}
+
+
+def test_an_unreadable_token_file_surfaces_as_infra_not_a_verdict(tmp_path):
+    """The mint step fails the job before this, but a gate that reviews
+    nothing must never be able to report a pass."""
+    env = actions_env(tmp_path, PR_GATE_TOKEN_FILE=str(tmp_path / "absent"))
+    review_fn = cli.make_review_fn(env, core.Config("jonathan", "m", "high", 25))
+    results = review_fn("diff", {}, [], [])
+    assert {(r.status, r.reason) for r in results} == {("infra", "no-credential")}
+
+
+def test_the_bearer_is_read_from_its_file_not_from_the_environment(tmp_path, monkeypatch):
+    """A 600-mode file keeps the credential out of every other step's
+    environment and out of any process listing."""
+    seen = {}
+    monkeypatch.setattr(cli.llm, "build_client",
+                        lambda cred, **kw: seen.setdefault("cred", cred) and None)
+    monkeypatch.setattr(cli.llm, "run_passes",
+                        lambda *a, **k: [PassResult("monitor_a", "ok", suspicion=0, analysis="")])
+    token = tmp_path / "anthropic-token"
+    token.write_text("fed-bearer-xyz\n", encoding="utf-8")
+    env = actions_env(tmp_path, PR_GATE_TOKEN_FILE=str(token))
+    cli.make_review_fn(env, core.Config("jonathan", "m", "high", 25))("diff", {}, [], [])
+    assert seen["cred"] == "fed-bearer-xyz"
+
+
+def test_the_marker_key_is_independent_of_the_model_credential(tmp_path, capsys, monkeypatch):
+    """A marker signed with a credential that expires in minutes stops
+    verifying on the next run, which would break pass carry-over, re-runs
+    and owner dismissals."""
+    seen = {}
+    monkeypatch.setattr(cli.core, "run",
+                        lambda ev, cfg, gh, review_fn: seen.setdefault("cfg", cfg)
+                        or core.Outcome(0, "passed (full)"))
+    token = tmp_path / "anthropic-token"
+    token.write_text("fed-bearer-xyz", encoding="utf-8")
+    cli.main([], env=actions_env(tmp_path, PR_GATE_MARKER_KEY="marker-secret",
+                                 PR_GATE_TOKEN_FILE=str(token)))
+    assert seen["cfg"].marker_key == b"marker-secret"
 
 
 def test_workflow_command_escaping():

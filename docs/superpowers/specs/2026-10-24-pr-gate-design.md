@@ -46,12 +46,12 @@ consuming repo                                      injection-scanner (public)
   on: pull_request_target                              pr-gate/gate.py     (stdlib + injection_scanner)
   types: [auto_merge_enabled, synchronize, reopened]
   job name: ai-gate  (the required check)
-  with: model, anthropic-api-key, openai-api-key
+  with: model, marker-key, federation ids (4)
 ```
 
 - **`pull_request_target`** so the workflow always comes from the base branch, never from the PR. No `actions/checkout` of PR code anywhere; the diff is fetched as data through the API.
 - **Composite action** in a subfolder of the public `injection-scanner` repo, consumed **pinned to a full commit SHA**. Updating the gate is a deliberate PR bumping the SHA. Public so the `klaffat` org repo can use it too.
-- **The caller file** (~20 lines) carries what an action cannot: trigger, `permissions: {contents: read, pull-requests: write, issues: read}` (`issues: read` for the timeline that records who dismissed a review), concurrency per PR, the job named `ai-gate`, and `model:`. The required job **must never have a job-level `if:`**: GitHub counts a skipped required job as success.
+- **The caller file** (~30 lines) carries what an action cannot: trigger, `permissions: {contents: read, pull-requests: write, issues: read, id-token: write}` (`issues: read` for the timeline that records who dismissed a review; `id-token: write` so GitHub will sign a statement of the run's identity for the credential exchange), concurrency per PR, the job named `ai-gate`, and `model:`. The required job **must never have a job-level `if:`**: GitHub counts a skipped required job as success.
 - **The secret is passed only to the gate step**, never exported job-wide.
 
 ### What the gate does, in order (fail closed at every step: any error → block)
@@ -89,7 +89,17 @@ consuming repo                                      injection-scanner (public)
 
 1. Ruleset on the default branch: require a PR; require status check `ai-gate` with **source = GitHub Actions**; **require branches to be up to date before merging** (a pass lives on the head SHA; without this rule a base that moves after the check gives a merge result nobody reviewed, and the gate assumes the rule); block force pushes; no bypass actors. If available on the repo type: "Restrict who can dismiss reviews" → Jonathan and GitHub Actions (the gate dismisses its own superseded blocks).
 2. Allow auto-merge. Turn off "Allow rebase merging": the gate reviews the tree a merge or squash lands (step 3); a rebase-merge can land a different one.
-3. Secret: `AI_GATE_ANTHROPIC_KEY` (dedicated, capped Console workspace).
+3. **Federated identity, no stored model credential** (revised 2026-11-03,
+   after the pattern was proven in claude-config #46): a Console service
+   account, a spend-capped workspace and a federation rule bound to this
+   repo's **immutable** OIDC subject
+   `repo:<owner>@<owner id>/<repo>@<repo id>:pull_request_target`, named by
+   four repository *variables* (`AI_GATE_FEDERATION_RULE_ID`,
+   `AI_GATE_ORGANIZATION_ID`, `AI_GATE_SERVICE_ACCOUNT_ID`,
+   `AI_GATE_WORKSPACE_ID`). Each run mints a bearer that expires in minutes.
+   Plus one secret, `AI_GATE_MARKER_KEY`, keying the review-marker HMAC only
+   — it cannot be the model credential, which has to still verify on a later
+   run. DECISIONS items 31-38.
 4. **The agents' GitHub App/token must not have the `workflows` permission.** Otherwise a PR can add a second workflow whose job is also named `ai-gate` and reports a fake pass (pinning the check source to GitHub Actions does not stop this — every workflow reports as GitHub Actions). This is a `.claude#156` item requiring Jonathan's click in the App settings.
 5. **Default workflow token read-only** (repo or org Actions settings), no other workflow granting `checks: write` or `statuses: write`, and no write scope in any workflow that runs PR code. A token with `checks: write` can POST a check run named `ai-gate` with conclusion success on the head from the same GitHub Actions app; one with `pull-requests: write` can re-post a byte-identical older gate pass, which as the newest verified marker carries over across a base merge past a later block of the same change. The gate's guarantees assume this setting (README Limitations).
 
@@ -98,7 +108,15 @@ consuming repo                                      injection-scanner (public)
 1. Whether a REQUEST_CHANGES review posted with `GITHUB_TOKEN` (as `github-actions[bot]`) is accepted by the API and actually blocks merge/auto-merge on a personal repo. Sources conflict. The failing required check is the real gate regardless.
 2. Whether "Restrict who can dismiss reviews" (rulesets, GA 2026-07-07) is offered on user-owned repos.
 3. That `auto_merge_enabled` fires `pull_request_target` reliably (a Feb 2026 community report says it sometimes didn't; workaround: toggle auto-merge or push).
-4. That the monthly API credits are actually consumed by this key (check the Console after the first runs).
+4. ~~That the monthly API credits are actually consumed by this key.~~
+   Retired 2026-11-03 by federation: spend lands on the named Console
+   workspace and is bounded by its ceiling, so the question is no longer
+   "does this key draw on the subscription" but "is the ceiling set". What
+   does need a first real run: that the exchange returns 200 for this
+   repository's identity (the subject form is the known trap, DECISIONS 35),
+   and whether a bearer's granted lifetime covers three passes over a large
+   diff — the step reports what it was granted, and a shortfall shows up as
+   `infra`, never as a pass.
 5. On pass, the merge actually happens (the gate can dismiss its own REQUEST_CHANGES even with dismissal restricted; otherwise Jonathan dismisses it).
 6. Which of two same-named `ai-gate` check runs the ruleset honours. Until known, the fake-check defence rests on no agent credential having the `workflows` permission — and the host PAT (`.claude#156` H4) almost certainly has it.
 7. The ruleset binds to the job's display `name:`; the caller template mandates `name: ai-gate`.

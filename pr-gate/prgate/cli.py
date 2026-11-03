@@ -28,15 +28,36 @@ def escape_command(text: str) -> str:
     return text.replace("%", "%25").replace("\r", "%0D").replace("\n", "%0A")
 
 
-def make_review_fn(env, cfg: core.Config):
-    """The model layer, bound to config. A missing key is a setup failure
-    (infra), not a verdict: after fixing the secret, an auto-merge toggle
-    reviews."""
+def make_review_fn(env, cfg: core.Config, *, federated: bool = True):
+    """The model layer, bound to config. A missing credential is a setup
+    failure (infra), not a verdict: after fixing the configuration, an
+    auto-merge toggle reviews.
+
+    Actions mode federates. The credential is a workspace bearer the workflow
+    minted from this run's OIDC identity, expiring within minutes, handed over
+    as a 600-mode file so it sits in no other step's environment and in no
+    process listing. The local dry-run takes a developer's own API key from
+    ANTHROPIC_API_KEY instead -- a laptop has no OIDC issuer to federate with.
+    """
+    def credential() -> tuple[str, bool]:
+        if not federated:
+            return (env.get("ANTHROPIC_API_KEY") or "").strip(), False
+        path = (env.get("PR_GATE_TOKEN_FILE") or "").strip()
+        if not path:
+            return "", True
+        try:
+            with open(path, encoding="utf-8") as fh:
+                return fh.read().strip(), True
+        except OSError:
+            # The mint step fails the job before this, so reaching here means
+            # the file was lost between steps. Still never a verdict.
+            return "", True
+
     def review_fn(diff_text, contents, scrutiny, omitted) -> list[PassResult]:
-        key = (env.get("ANTHROPIC_API_KEY") or "").strip()
-        if not key:
-            return [PassResult(n, "infra", "no-key") for n in PASS_NAMES]
-        client = llm.build_client(key)
+        cred, bearer = credential()
+        if not cred:
+            return [PassResult(n, "infra", "no-credential") for n in PASS_NAMES]
+        client = llm.build_client(cred, bearer=bearer)
         return llm.run_passes(client, model=cfg.model, effort=cfg.effort,
                               diff_text=diff_text, contents=contents,
                               scrutiny=scrutiny, omitted=omitted)
@@ -79,7 +100,7 @@ def _actions(env) -> int:
             threshold=int((env.get("PR_GATE_THRESHOLD") or "").strip()),
             exceptions=checks.parse_exceptions(env.get("PR_GATE_EXCEPTIONS", "")),
             lockfile_hosts=checks.parse_lockfile_hosts(env.get("PR_GATE_LOCKFILE_HOSTS", "")),
-            marker_key=(env.get("ANTHROPIC_API_KEY") or "").strip().encode("utf-8"),
+            marker_key=(env.get("PR_GATE_MARKER_KEY") or "").strip().encode("utf-8"),
         ).validate()
     except ValueError as e:
         # Messages from Config.validate and parse_lockfile_hosts are gate-written
@@ -156,7 +177,7 @@ def _dry_run(args, env) -> int:
             contents[f.path] = data.decode("utf-8", errors="replace")
         return contents, omitted
 
-    review_fn = (lambda *a: []) if args.no_llm else make_review_fn(env, cfg)
+    review_fn = (lambda *a: []) if args.no_llm else make_review_fn(env, cfg, federated=False)
     result = core.full_review(g, cfg, review_fn, local_contents,
                               require_passes=not args.no_llm)
     llm_state = "skipped" if args.no_llm else (

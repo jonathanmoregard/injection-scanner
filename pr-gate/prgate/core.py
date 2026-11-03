@@ -81,8 +81,10 @@ class Config:
     # The lockfile-hosts input: hostnames every lockfile accepts on top of
     # the built-in allowlists (checks.parse_lockfile_hosts).
     lockfile_hosts: frozenset[str] = frozenset()
-    # The Anthropic API key, also the HMAC key for review markers. Kept out
-    # of repr so a stray print of the config cannot leak it.
+    # The HMAC key for review markers, from its own secret. Deliberately NOT
+    # the model credential: that one is federated and expires within minutes,
+    # and a marker has to still verify on a later run. Kept out of repr so a
+    # stray print of the config cannot leak it.
     marker_key: bytes = field(default=b"", repr=False)
 
     def validate(self) -> "Config":

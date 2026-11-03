@@ -567,7 +567,7 @@ it, each with the reason. Design: `docs/superpowers/specs/2026-10-24-pr-gate-des
     `<!-- pr-gate:v3 verdict=... head=... hash=... mac=... -->` used by the
     override check, carry-over and the dismissal of the gate's own blocks.
     Any workflow in the repo can post as `github-actions[bot]`, so the marker
-    carries an HMAC-SHA256 keyed by the Anthropic API key (only the gate step
+    carries an HMAC-SHA256 keyed by `AI_GATE_MARKER_KEY` (only the gate step
     gets that secret) over the JSON array `["pr-gate-marker", "v3", verdict,
     repo (casefolded), PR number, head SHA, own-changes hash, body digest]`,
     checked with `hmac.compare_digest`. The body digest is the SHA-256 of
@@ -616,3 +616,62 @@ it, each with the reason. Design: `docs/superpowers/specs/2026-10-24-pr-gate-des
     template pins `ubuntu-24.04` (CPython 3.12) for stability.
 30. The pinned SDK is `anthropic==1.17.0`, the version the offline tests ran
     against when this was built.
+
+## Credentials
+
+31. **The gate stores no model credential.** Each run has GitHub sign a
+    statement that this repository's `pull_request_target` job is running,
+    exchanges it at `POST /v1/oauth/token` (jwt-bearer grant) for a bearer
+    bound to one Console workspace with its own spend ceiling, and that
+    bearer expires in minutes. A leak costs the remainder of that lifetime
+    instead of a rotation, and the ceiling bounds what it could spend. The
+    pattern is the one proven in claude-config #46 on a real runner.
+32. **The workflow does the exchange, not the gate process.** The identity
+    token carries a single-use `jti`, so one exchange has to serve all three
+    passes; and the gate is then never holding the means to mint another
+    credential that could outlive this run's.
+    `ACTIONS_ID_TOKEN_REQUEST_TOKEN` and `_URL` are emptied on the gate step
+    to keep that true. The bearer crosses between steps as a 600-mode file
+    under `RUNNER_TEMP` — not a step output (the runner keeps those for the
+    whole job) and not `GITHUB_ENV` (that puts the value in every later
+    step's environment).
+33. **The marker key is its own secret, `AI_GATE_MARKER_KEY`.** It used to be
+    the Anthropic API key, which federation makes impossible: a marker has
+    to verify on a LATER run — pass carry-over, a re-run and an owner
+    dismissal all re-verify one an earlier run wrote — and a federated bearer
+    is gone within minutes. Keyed by the credential, every run would
+    invalidate its predecessor's verdicts. The alternatives were dropping the
+    HMAC for GitHub's own attestation of the review author (leans on a
+    property that has to be re-derived per repo) or deriving the key from the
+    federation variables (public, so anyone could forge a marker and it stops
+    being an authentication boundary). A dedicated secret authorises nothing
+    anywhere; its only job is making a gate review unforgeable by the PR.
+34. **Federation config is four repository VARIABLES, not secrets**
+    (`AI_GATE_FEDERATION_RULE_ID`, `AI_GATE_ORGANIZATION_ID`,
+    `AI_GATE_SERVICE_ACCOUNT_ID`, `AI_GATE_WORKSPACE_ID`). They authorise
+    nothing alone: only a run in the configured repository can present a
+    matching identity token. injection-scanner is public, and treating them
+    as secrets would imply a confidentiality they do not have.
+35. **The Console rule must use GitHub's immutable OIDC subject form**,
+    `repo:<owner>@<owner id>/<repo>@<repo id>:pull_request_target`. The
+    Console's wizard builds the classic `repo:<owner>/<repo>:<event>`, which
+    is refused with `match_subject_prefix`. Every refusal is an opaque 401,
+    so the reason is visible only in the Console's Workload identity history
+    tab. Written down beside the credential step too, because this is the
+    trap that costs an afternoon.
+36. **A federated bearer goes in the SDK's `auth_token`, never `api_key`.**
+    As `x-api-key` a workspace token is refused 401, which the gate reads as
+    `infra` on every run — a gate that reviews nothing while looking
+    configured. `build_client(credential, bearer=...)` makes the choice
+    explicit, and a test drives the real SDK over a stub transport to assert
+    the header on the wire.
+37. **The local dry-run still takes `ANTHROPIC_API_KEY`.** A laptop has no
+    OIDC issuer to federate with. This is not a second auth path in the
+    shipped gate: Actions mode passes `federated=True` and reads only the
+    minted file, and `ANTHROPIC_API_KEY` is set in no step of the action.
+38. **Token lifetime is reported, not exported.** pr-gate has no agent
+    deadline to derive from it (the job timeout bounds the run), but the
+    pilot needs to see what the exchange actually granted. Passes that
+    outlast the bearer fail as `infra` and redden the check, never as a pass;
+    if that happens in practice the fix is re-minting per pass, not a
+    longer-lived credential.
