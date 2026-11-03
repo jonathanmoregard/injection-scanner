@@ -662,6 +662,46 @@ it, each with the reason. Design: `docs/superpowers/specs/2026-10-24-pr-gate-des
     before counting, so `https://x\ ` is treated as continuing where pip's
     `endswith("\\")` would not (pip has a standing TODO there). That direction
     over-flags, which is the safe one for a gate.
+42. **Requirements files are checked as pip's logical lines, head against
+    base — not as added lines at all** (2026-11-03, review finding;
+    supersedes the "added lines are judged as the logical line" half of items
+    40 and 41). Two more bypasses, both reproduced:
+    - A line that is only `\`, inserted into a continuation run. pip
+      continues on ANY line ending in a backslash and that one adds nothing
+      to the joined line, so the run reads straight through it. Items 40–41
+      ended the run there (`_continues` required a non-space character before
+      the backslash run, and a bare `\` has none), read the index as
+      `https://pypi.org`, and reported nothing where pip resolves
+      `https://pypi.org.evil.example/simple`.
+    - A change that adds no line. Deleting the `/simple` between
+      `--index-url https://pypi.org\` and a package name below it makes pip
+      read `https://pypi.orgevil.example`. Added lines cannot see this, and
+      there is no hunk boundary to trust instead: the lines that change
+      meaning are the ones the diff does not touch.
+    Keying the check on added lines was the common root. It now compares the
+    logical lines of head against the base's, as a multiset (one copy in the
+    base covers one in head), and checks the ones that are new — the same
+    rule the parsed lockfiles have always used, so item 22c still holds: a
+    host already on the default branch blocks nothing. `_pip_logical` is now
+    a straight transcription of pip's `join_lines` rather than a
+    reimplementation of its effect, with pip's `endswith("\\")` test
+    (`_pip_joins`) in place of the gate's heuristic, and comment lines
+    handled as pip handles them.
+    Found while fixing the above: **pip and git disagree about where a line
+    ends.** pip splits with `str.splitlines()`, which also ends a line at
+    `\x0b`, `\x0c`, `\x1c`–`\x1e`, `\x85`, U+2028 and U+2029; git ends one
+    only at `\n`. So one line of a diff can be several to pip, with the
+    backslash run that glues them invisible inside it. That was caught, but
+    again only by the undecodable-escape detector, naming no host.
+    `_pip_physical` splits pip's way and keeps git's line numbers for the
+    report. Verified by two differential fuzzes against a transcription of
+    pip's algorithm, 100k cases: the join matches exactly, and every host pip
+    resolves in head but not in base is named in a hit.
+    `_continues` stays the over-cap heuristic only, and no longer requires a
+    non-space character before the backslash run — a line that is just `\`
+    is a continuation there too. It still rstrips before counting, where pip
+    would not: that over-flags, which is the safe direction when the file is
+    too large to fetch and there is nothing to resolve against.
 
 ## Carry-over soundness
 

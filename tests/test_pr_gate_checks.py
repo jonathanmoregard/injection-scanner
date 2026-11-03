@@ -4,6 +4,7 @@ from __future__ import annotations
 import _prgate  # noqa: F401
 
 import json
+import re
 
 import pytest
 
@@ -516,11 +517,14 @@ def test_a_line_continuation_inside_a_lockfile_string_is_resolved(path, text):
     assert "evil.example" in hit.detail
 
 
-def _edited_continuation(added, head):
+def _edited_continuation(added, head, base=None):
     """A requirements.txt whose backslash line is already in the base, so the
-    diff shows only the line after it."""
+    diff shows only the line after it. `base` is what the PR starts from;
+    without it (a new file, or one renamed from another kind) every logical
+    line in head is new."""
     f = FileChange(path="requirements.txt", added=added)
-    return checks.lockfile_hosts([f], {"requirements.txt": checks.Lockfile(head.encode())})
+    lf = checks.Lockfile(head.encode(), None if base is None else base.encode())
+    return checks.lockfile_hosts([f], {"requirements.txt": lf})
 
 
 def test_editing_only_a_pip_continuation_body_is_a_hit():
@@ -567,6 +571,113 @@ def test_a_requirements_file_is_fetched_whole():
     normally added-lines-only; requirements must join across lines, so core
     has to fetch it -- the same reason a rename is already fetched whole."""
     assert checks.fetched_lockfile(FileChange(path="requirements.txt", status="modified"))
+
+
+def test_a_backslash_only_line_keeps_pips_join_open():
+    """pip continues on ANY line ending in a backslash, a line that is only
+    `\\` included: it contributes nothing to the joined line and the run goes
+    on. Stopping the run there reads the index as https://pypi.org, where pip
+    reads https://pypi.org.evil.example."""
+    hits = _edited_continuation(
+        [(1, "--index-url https://pypi.org\\"), (2, "\\"), (3, ".evil.example/simple")],
+        "--index-url https://pypi.org\\\n\\\n.evil.example/simple\nmypkg==1.0\n",
+        "--index-url https://pypi.org/simple\nmypkg==1.0\n")
+    assert [(h.rule, h.overridable) for h in hits] == [("lockfile-host", False)]
+    assert "pypi.org.evil.example" in hits[0].detail
+
+
+def test_a_deletion_alone_can_change_the_line_pip_reads():
+    """A change with no added line at all. Deleting the `/simple` between a
+    continuation and the package name below it re-points the index at that
+    name: pip reads https://pypi.orgevil.example. Added lines cannot see
+    this, so head's logical lines are compared against the base's."""
+    hits = _edited_continuation(
+        [],
+        "--index-url https://pypi.org\\\nevil.example\n",
+        "--index-url https://pypi.org\\\n/simple\nevil.example\n")
+    assert [(h.rule, h.overridable) for h in hits] == [("lockfile-host", False)]
+    assert "pypi.orgevil.example" in hits[0].detail
+
+
+def test_a_logical_line_already_in_the_base_is_no_hit():
+    """The other half of comparing against the base: a host already on the
+    default branch must not block every later change to the file."""
+    assert _edited_continuation(
+        [(3, "mypkg==1.0")],
+        "--index-url https://old.example/simple\nwheel==0.45\nmypkg==1.0\n",
+        "--index-url https://old.example/simple\nwheel==0.45\n") == []
+
+
+def test_a_second_copy_of_a_base_line_is_still_checked():
+    """Comparison is by multiset, not set: one occurrence in the base accounts
+    for one in head, so adding another copy of a bad line is still new."""
+    hits = _edited_continuation(
+        [(2, "--index-url https://old.example/simple")],
+        "--index-url https://old.example/simple\n--index-url https://old.example/simple\n",
+        "--index-url https://old.example/simple\n")
+    assert [h.detail for h in hits] == ["line 2: not allowlisted: https://old.example"]
+
+
+def test_pip_ends_a_line_where_git_does_not():
+    """pip splits with str.splitlines(), which ends a line at a form feed (and
+    at \\x0b, \\x1c-\\x1e, \\x85, U+2028, U+2029) too; git ends one only at \\n.
+    So a single line of the diff can be two lines to pip, with the backslash
+    run that glues them sitting inside it."""
+    hits = _edited_continuation(
+        [(1, "--index-url https://pypi.org\\\x0c.evil.example/simple")],
+        "--index-url https://pypi.org\\\x0c.evil.example/simple\n",
+        "--index-url https://pypi.org/simple\n")
+    assert [(h.rule, h.overridable) for h in hits] == [("lockfile-host", False)]
+    assert "pypi.org.evil.example" in hits[0].detail
+
+
+_PIP_COMMENT_RE = re.compile(r"(^|\s+)#.*$")  # pip's own COMMENT_RE
+
+
+def _pip_join_oracle(content: str) -> list[str]:
+    """pip's `join_lines`, transcribed from pip/_internal/req/req_file.py, as
+    the oracle for the gate's own join. Line numbers are left out: pip counts
+    its own splitlines() pieces, the gate counts the diff's \\n lines, and
+    those differ only where an exotic separator appears."""
+    out: list[str] = []
+    new_line: list[str] = []
+    for line in content.splitlines():
+        if not line.endswith("\\") or _PIP_COMMENT_RE.match(line):
+            if _PIP_COMMENT_RE.match(line):
+                line = " " + line
+            if new_line:
+                new_line.append(line)
+                out.append("".join(new_line))
+                new_line = []
+            else:
+                out.append(line)
+        else:
+            new_line.append(line.strip("\\"))
+    if new_line:
+        out.append("".join(new_line))
+    return out
+
+
+@pytest.mark.parametrize("text", [
+    "mypkg==1.0\nwheel==0.45\n",                        # nothing to join
+    "--index-url https://pypi.org\\\n.evil.example/simple\n",
+    "--index-url https://pypi.org\\\n\\\n.evil.example/simple\n",   # backslash only
+    "a\\\n\\b\\\nc\n",                                  # leading backslashes
+    "a\\\\\\\nb\n",                                     # an even run, then an odd one
+    "requests==2.32.3 \\\n    --hash=sha256:ab \\\n    --hash=sha256:cd\n",
+    "a\\   \nb\n",                                      # whitespace after it: pip stops
+    "# comment\\\nb\n",                                 # a comment never continues
+    "a\\\n# comment\\\nb\n",                            # one inside a run ends it
+    "a\\\n  # indented comment\n",
+    "https://pypi.org\\",                               # no trailing newline
+    "a\\\nb",
+    "",
+    "\\",
+    "a\\\r\nb\r\n",                                     # CRLF
+    "a\\\x0cb\n",                                       # pip ends a line here
+])
+def test_the_join_matches_pips_own(text):
+    assert [line for _, line in checks._pip_logical(text)] == _pip_join_oracle(text)
 
 
 @pytest.mark.parametrize("lines", [

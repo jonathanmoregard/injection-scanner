@@ -228,9 +228,11 @@ def sensitive_paths(files: list[FileChange], exceptions: list[str]) -> tuple[lis
 #
 # JSON, TOML and YAML lockfiles are PARSED, head and base, and every string
 # in them is checked: re-implementing their string folding line by line
-# (block scalars, blank lines, continuations) kept losing. Formats without
-# multi-line strings (requirements*.txt, Gemfile.lock, yarn v1) are checked
-# one added line at a time.
+# (block scalars, blank lines, continuations) kept losing. pip requirement
+# files are not parsed but are read whole the same way, head and base, as the
+# logical lines pip joins them into. Gemfile.lock and yarn v1 have neither
+# multi-line strings nor continuations and are checked one added line at a
+# time.
 
 _NPM = frozenset({"registry.npmjs.org", "registry.yarnpkg.com"})
 _PY = frozenset({"pypi.org", "files.pythonhosted.org"})
@@ -330,10 +332,12 @@ def parsed_lockfile(f: FileChange) -> bool:
 
 
 def fetched_lockfile(f: FileChange) -> bool:
-    """A lockfile core fetches whole: a parsed one; a line-checked one renamed
-    from another kind (a rename shows only the lines it changed); or a
-    requirements file, whose logical lines span physical ones through pip's
-    backslash continuation, so an added line cannot be read on its own."""
+    """A lockfile core fetches whole, head and base: a parsed one; a
+    line-checked one renamed from another kind (a rename shows only the lines
+    it changed); or a requirements file, whose logical lines span physical
+    ones through pip's backslash continuation, so no single line of the diff
+    can be read on its own -- and a deletion changes one of them while adding
+    no line at all."""
     return parsed_lockfile(f) or (f.status != "deleted" and _allowlist(f.path) is not None
                                   and (renamed_from_other_kind(f)
                                        or _kind(f.path) == "requirements"))
@@ -398,13 +402,16 @@ def _continues(line: str, pip: bool) -> bool:
     whitespace after it is ignored. pip joins on ANY trailing backslash run,
     so parity does not matter there, but pip-compile's own "pkg==1.0 \\"
     puts whitespace before it, which cannot glue a URL.
+
+    For pip this is a HEURISTIC, used only when the file is over the fetch
+    cap and there is nothing to join: `_pip_joins` is pip's own rule.
     """
     body = line.rstrip()
     n = len(body) - len(body.rstrip("\\"))
     if not pip:
         return n % 2 == 1
     prev = body[:len(body) - n][-1:]
-    return n > 0 and prev != "" and not prev.isspace()
+    return n > 0 and not prev.isspace()
 
 
 # git's scp-like remote, user@host:path (no scheme, no slashes): an ssh
@@ -454,55 +461,84 @@ def _pip_options(line: str) -> str | None:
     return " ".join(f"{t[:2]} {t[2:]}" if _PIP_ATTACHED.match(t) else t for t in opts)
 
 
-def _pip_logical(text: str) -> dict[int, str]:
-    """Physical line number (1-based) -> the whole logical line pip reads it
-    as, with backslash continuations joined. pip glues the next line straight
-    onto the previous one, so a URL can be split across any number of them.
-    Every physical line of a run maps to the same joined result: an added line
-    is then checked as what pip actually resolves, not as the fragment the
-    diff happens to show.
+def _pip_joins(line: str) -> bool:
+    """pip's own continuation test, from `join_lines`: a line ending in a
+    backslash continues onto the next one, unless the whole line is a comment.
+    ANY trailing backslash run, odd or even, and the RAW line -- no rstrip,
+    because pip tests the raw line, so whitespace after the backslash ends the
+    run (pip's own "TODO: handle space after '\\'"). A line that is nothing but
+    a backslash ends in one too: it adds nothing to the joined line and the
+    run carries on through it."""
+    return line.endswith("\\") and not _PIP_COMMENT.match(line)
 
-    Mirrors pip's `join_lines` (`pip/_internal/req/req_file.py`): it appends
-    `line.strip("\\")` for every line of a run but the last, which it appends
-    whole. Note BOTH ends -- dropping only the trailing backslashes leaves a
-    leading one that `_bad_urls` reads as a path separator, ending the host at
-    the allowlisted prefix while pip reads straight on into the attacker's
-    domain. Whitespace before the backslash is rstripped because `_continues`
-    has already treated the line as continuing; pip would not continue there
-    at all, so this is the more suspicious of the two readings."""
-    out: dict[int, str] = {}
-    physical = text.split("\n")
-    i = 0
-    while i < len(physical):
-        run = [i]
-        while _continues(physical[run[-1]], True) and run[-1] + 1 < len(physical):
-            run.append(run[-1] + 1)
-        joined = "".join(physical[j].rstrip().strip("\\")
-                         if j != run[-1] else physical[j] for j in run)
-        for j in run:
-            out[j + 1] = joined
-        i = run[-1] + 1
+
+def _pip_physical(text: str) -> list[tuple[int, str]]:
+    """(line number in the diff, line as pip sees it). pip splits its input
+    with `str.splitlines()`, which ends a line at \\r, \\x0b, \\x0c, \\x1c-\\x1e,
+    \\x85, U+2028 and U+2029 as well as at \\n; git ends one only at \\n. So a
+    single line of the diff can be several lines to pip, with the backslash
+    run that glues them sitting inside it, invisible as a continuation. The
+    number stays git's, so what gets reported points where a reader can look.
+    """
+    out: list[tuple[int, str]] = []
+    line_no = 1
+    for piece in text.splitlines(keepends=True):
+        out.append((line_no, piece.splitlines()[0]))
+        line_no += piece.count("\n")
     return out
 
 
-def _line_hits(f: FileChange, allowed: frozenset[str], lines,
-               logical: dict[int, str] | None = None) -> list[Hit]:
+def _pip_logical(text: str) -> list[tuple[int, str]]:
+    """(first line number of the run, whole logical line) for every line pip
+    reads -- a transcription of pip's `join_lines`
+    (`pip/_internal/req/req_file.py`), which is the only way to know what a
+    requirements file resolves to: pip glues the next line straight onto the
+    previous one, so a URL can be split across any number of them.
+
+    It appends `line.strip("\\")` for every line of a run but the last, which
+    it appends whole. Note BOTH ends -- dropping only the trailing backslashes
+    leaves a leading one that `_bad_urls` reads as a path separator, ending the
+    host at the allowlisted prefix while pip reads straight on into the
+    attacker's domain. A comment line never continues, and ends a run it falls
+    in; pip prefixes it with a space so its own comment stripper still sees it.
+    """
+    out: list[tuple[int, str]] = []
+    primary = 1
+    run: list[str] = []
+    for line_no, line in _pip_physical(text):
+        if _pip_joins(line):
+            if not run:
+                primary = line_no
+            run.append(line.strip("\\"))
+            continue
+        if _PIP_COMMENT.match(line):
+            line = " " + line
+        if run:
+            run.append(line)
+            out.append((primary, "".join(run)))
+            run = []
+        else:
+            out.append((line_no, line))
+    if run:  # the file ends inside a continuation run
+        out.append((primary, "".join(run)))
+    return out
+
+
+def _line_hits(f: FileChange, allowed: frozenset[str], lines, *,
+               resolved: bool = False) -> list[Hit]:
+    """`resolved`: the lines are already whole logical lines (pip's, joined
+    from the fetched file), so a backslash in one is content, not a splice
+    waiting to happen. `_continues` then stops being a hit of its own -- a
+    line ending in a backslash whose joined URL is allowlisted is harmless,
+    and flagging it on sight was a false positive. Unresolved lines (over the
+    fetch cap, nothing to join with) keep the conservative hit."""
     pip = _kind(f.path) == "requirements"
     yarn = _kind(f.path) == "yarn.lock"
     hits = []
     for line_no, original in lines:
-        # With the whole file in hand, an added line is judged as the logical
-        # line pip resolves it to. `_continues` then stops being a hit of its
-        # own: a line ending in a backslash whose joined URL is allowlisted is
-        # harmless, and flagging it on sight was a false positive. Without the
-        # file (over the fetch cap) the bare-continuation hit stays as the
-        # conservative fallback.
-        resolved = (logical or {}).get(line_no)
-        if resolved is not None:
-            original = resolved
         text, undecoded = _decode_escapes(original)
         bad = []
-        if resolved is None and _continues(original, pip):
+        if not resolved and _continues(original, pip):
             bad.append("line continuation")
         if undecoded and _SCHEMEISH.search(text):
             bad.append("undecodable escape near a URL")
@@ -853,6 +889,37 @@ def _checked_lines(f: FileChange, lf: Lockfile | None):
     return enumerate(lf.head.decode("utf-8", errors="replace").split("\n"), 1)
 
 
+def _requirements_hits(f: FileChange, allowed: frozenset[str],
+                       lf: Lockfile | None) -> list[Hit]:
+    """A requirements file is checked as pip's logical lines, and as the ones
+    NEW relative to the base.
+
+    Not as added lines: a logical line spans any number of physical ones, so
+    the line the diff shows is a fragment of what pip resolves -- and a change
+    need not add a line at all. Deleting a line from the middle of a
+    continuation run re-points the URL with nothing added anywhere, so there
+    is no added line to check and no place a hunk boundary could be trusted.
+    Comparing against the base is the same rule the parsed lockfiles use: a
+    host already on the default branch must not block every later change."""
+    if lf is None or lf.head is None:
+        # Over the fetch cap: nothing to join against, so fall back to the
+        # added lines and the conservative bare-continuation hit.
+        lines = _checked_lines(f, lf)
+        return (_line_hits(f, allowed, lines) if lines is not None else
+                [Hit("lockfile-host", f.path, "lockfile too large to check", False)])
+    base: Counter = Counter()
+    if lf.base is not None:
+        base = Counter(line for _, line
+                       in _pip_logical(lf.base.decode("utf-8", errors="replace")))
+    new = []
+    for line_no, line in _pip_logical(lf.head.decode("utf-8", errors="replace")):
+        if base[line]:
+            base[line] -= 1  # a multiset: one copy in the base covers one here
+            continue
+        new.append((line_no, line))
+    return _line_hits(f, allowed, new, resolved=True)
+
+
 def lockfile_hosts(files: list[FileChange], lockfiles: dict[str, Lockfile], *,
                    extra_hosts: frozenset[str] = frozenset()) -> list[Hit]:
     """`extra_hosts` (the lockfile-hosts input) only extends each built-in
@@ -866,14 +933,13 @@ def lockfile_hosts(files: list[FileChange], lockfiles: dict[str, Lockfile], *,
         name = PurePosixPath(f.path).name.casefold()
         lf = lockfiles.get(f.path)
         if not parsed_lockfile(f):
+            # Requirements files are fetched whole, head and base, because a
+            # logical line of one spans physical lines.
+            if _kind(f.path) == "requirements":
+                hits += _requirements_hits(f, allowed, lf)
+                continue
             lines = _checked_lines(f, lf)
-            # Requirements files are fetched whole so a split logical line can
-            # be resolved; None head means over the cap, and the fallback in
-            # _line_hits applies.
-            logical = (_pip_logical(lf.head.decode("utf-8", errors="replace"))
-                       if _kind(f.path) == "requirements" and lf is not None
-                       and lf.head is not None else None)
-            hits += (_line_hits(f, allowed, lines, logical) if lines is not None else
+            hits += (_line_hits(f, allowed, lines) if lines is not None else
                      [Hit("lockfile-host", f.path, "lockfile too large to check", False)])
             continue
         # yarn.lock with the v1 header is classic yarn's line format, which
