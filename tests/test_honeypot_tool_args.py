@@ -389,7 +389,7 @@ def test_scan_text_quarantines_an_unreadable_tool_call(monkeypatch):
     v = intercept.scan_text(
         "Benign report. Sources: 1. example.",
         use_honeypot=True,
-        use_lakera=False,
+        use_l2=False,
     )
     assert v.ok is False
     assert "malformed-tool-args" in v.reason
@@ -791,7 +791,7 @@ def test_judge_argument_bytes_never_reach_signal_or_reason(monkeypatch):
     v = intercept.scan_text(
         "Benign report. Sources: 1. example.",
         use_honeypot=True,
-        use_lakera=False,
+        use_l2=False,
     )
     assert ARG_MARKER not in v.reason
     for k, val in v.layers.items():

@@ -87,7 +87,9 @@ def test_single_unavailable_rejects(monkeypatch):
     ])
     r = judge.check("x")
     assert not r.ok
-    assert r.reason == "unavailable:openai_41_mini:api-error:TimeoutError"
+    # `<layer>_unavailable` head: the outage vocabulary consumers classify as
+    # infra once intercept wraps it as `l2_arbitration:<reason>`.
+    assert r.reason == "judge_unavailable:openai_41_mini:api-error:TimeoutError"
 
 
 def test_raising_judge_coroutine_fails_closed(monkeypatch):
@@ -107,7 +109,17 @@ def test_no_keys_fails_closed_via_adapters():
     # unavailable (no-*-api-key), which aggregates to a reject.
     r = judge.check("x")
     assert not r.ok
-    assert r.reason.startswith("unavailable:")
+    assert r.reason.startswith("judge_unavailable:")
+
+
+def test_ready_names_the_outage_a_scan_would_carry(monkeypatch):
+    """`ready()` reports the exact reason a scan needing arbitration would be
+    rejected with, so a boot failure and a scan failure read the same."""
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "k")
+    first_openai = next(j["id"] for j in judge._JUDGES if j["provider"] == "openai")
+    assert judge.ready() == (
+        f"l2_arbitration:judge_unavailable:{first_openai}:no-openai-api-key"
+    )
 
 
 # ----- adapter API errors: type name + bounded HTTP status -----

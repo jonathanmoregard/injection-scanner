@@ -25,6 +25,13 @@ dependencies = [
     # unreviewed — it merely happened not to break anything. Floor at the
     # major the code is tested against, ceiling so the next one is a change.
     "openai>=3,<4",
+    # Model Armor authenticates with a Google service-account key: an RS256
+    # JWT exchanged for an access token. RSA signing is not something to
+    # hand-roll, and google-auth is not an option because its HTTP stack
+    # would bypass vendor_http's hardened opener (pinned URL, no redirects,
+    # no proxy, capped read). Floor at the major tested against, ceiling so
+    # the next major is a reviewed change, as for the SDKs above.
+    "cryptography>=50,<51",
 ]
 
 [project.optional-dependencies]
@@ -35,7 +42,7 @@ test = [
     # not otherwise installed and a clean `.[test]` install failed at
     # collection once CI started running the whole tests/ tree.
     "httpx>=0.28,<1",
-    # tests/test_ci_relations.py parses .github/workflows/{ci,live-eval}.yml
+    # tests/test_ci_relations.py parses .github/workflows/ci.yml
     # to assert that the merge gate stays hermetic and the live jobs stay
     # serialised. TEST-only: the scanner itself parses no YAML and must not
     # gain a runtime dependency for a CI guard. Major-version ceiling for the

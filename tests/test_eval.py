@@ -175,16 +175,16 @@ def _stub_scan_text(monkeypatch, verdict) -> list[dict]:
         raw: str,
         *,
         use_honeypot: bool = False,
-        use_lakera: bool = False,
-        lakera_max_wait_s: float | None = None,
+        use_l2: bool = False,
+        l2_max_wait_s: float | None = None,
     ):
         attempt = sum(1 for entry in log if entry["raw"] == raw)
         log.append(
             {
                 "raw": raw,
                 "use_honeypot": use_honeypot,
-                "use_lakera": use_lakera,
-                "lakera_max_wait_s": lakera_max_wait_s,
+                "use_l2": use_l2,
+                "l2_max_wait_s": l2_max_wait_s,
             }
         )
         return verdict(raw, attempt)
@@ -336,7 +336,10 @@ def test_cli_gates_on_the_confirmed_verdict(monkeypatch, tmp_path: Path) -> None
         "secret_shapes_unavailable:unhandled:ValueError",
         "judge_unavailable:unhandled:RuntimeError",
         "honeypot:honeypot_unavailable:scn:no-anthropic-api-key+skipped=1/6",
-        "lakera_arbitration:judge_unavailable:unhandled:RuntimeError",
+        "l2_arbitration:judge_unavailable:unhandled:RuntimeError",
+        "model_armor_unavailable:no-key",
+        "model_armor_unavailable:unhandled:RuntimeError",
+        "l2_unavailable:unhandled:RuntimeError",
         "no-key",
         "key-config-error",
         "bad-response",
@@ -351,6 +354,7 @@ def test_outages_are_recognised_as_infra(reason) -> None:
     [
         "pass",
         "lakera:prompt_attack",
+        "model_armor:prompt_attack",
         "lakera:flagged",
         "secret_shape:anthropic_oauth_token",
         # The trap the head anchoring exists for: a RULE NAME that happens to
@@ -360,7 +364,7 @@ def test_outages_are_recognised_as_infra(reason) -> None:
         "unicode_anomaly:stripped=5/100",
         "honeypot:scn:trap:x",
         "honeypot:honeypot:unavailable",
-        "lakera_arbitration:attack:openai_4o_mini",
+        "l2_arbitration:attack:openai_4o_mini",
         "",
         "unavailable",
         None,
@@ -441,14 +445,14 @@ def test_an_outage_on_a_rescan_aborts_too(monkeypatch) -> None:
                 EvalCase(id="next", text="next", expected=PASS),
             ],
             confirm_disagreements=2,
-            lakera_max_wait_s=120.0,
+            l2_max_wait_s=120.0,
         )
     assert excinfo.value.case_id == "ok"
     assert excinfo.value.reason == "lakera_unavailable:throttled"
     assert [e["raw"] for e in log] == ["ok", "ok"], (
         "the third attempt and the next case must never be scanned"
     )
-    assert [e["lakera_max_wait_s"] for e in log] == [120.0, 120.0], (
+    assert [e["l2_max_wait_s"] for e in log] == [120.0, 120.0], (
         "every attempt, not just the first, must carry the wait budget"
     )
 
@@ -480,13 +484,13 @@ def test_a_normal_run_is_unchanged(monkeypatch) -> None:
 
 def test_evaluate_forwards_the_wait_budget(monkeypatch) -> None:
     log = _reason_scan(monkeypatch, {"a": ["pass"]})
-    evaluate([EvalCase(id="a", text="a", expected=PASS)], lakera_max_wait_s=900.0)
+    evaluate([EvalCase(id="a", text="a", expected=PASS)], l2_max_wait_s=900.0)
     assert log == [
         {
             "raw": "a",
             "use_honeypot": False,
-            "use_lakera": False,
-            "lakera_max_wait_s": 900.0,
+            "use_l2": False,
+            "l2_max_wait_s": 900.0,
         }
     ]
 
@@ -503,11 +507,11 @@ def test_the_cli_defaults_the_wait_budget_to_fifteen_minutes(
     )
     log = _reason_scan(monkeypatch, {"a": ["pass"]})
     assert _main([str(corpus)]) == 0
-    assert log[0]["lakera_max_wait_s"] == 900.0
+    assert log[0]["l2_max_wait_s"] == 900.0
 
     log.clear()
-    assert _main([str(corpus), "--lakera-max-wait", "5"]) == 0
-    assert log[0]["lakera_max_wait_s"] == 5.0
+    assert _main([str(corpus), "--l2-max-wait", "5"]) == 0
+    assert log[0]["l2_max_wait_s"] == 5.0
 
 
 def test_the_cli_reports_infra_on_stderr_and_exits_three(
@@ -553,13 +557,13 @@ def test_an_outage_can_no_longer_earn_recall(monkeypatch, tmp_path: Path) -> Non
 @pytest.mark.parametrize(
     "flag",
     [
-        pytest.param(["--lakera-max-wait", "-5"], id="negative"),
-        pytest.param(["--lakera-max-wait", "-0.001"], id="barely-negative"),
-        pytest.param(["--lakera-max-wait", "nan"], id="nan"),
-        pytest.param(["--lakera-max-wait", "inf"], id="inf"),
+        pytest.param(["--l2-max-wait", "-5"], id="negative"),
+        pytest.param(["--l2-max-wait", "-0.001"], id="barely-negative"),
+        pytest.param(["--l2-max-wait", "nan"], id="nan"),
+        pytest.param(["--l2-max-wait", "inf"], id="inf"),
         # `-inf` only reaches the guard in the `=` form: a bare `-inf` looks
         # like an option to argparse and is rejected one step earlier.
-        pytest.param(["--lakera-max-wait=-inf"], id="negative-inf"),
+        pytest.param(["--l2-max-wait=-inf"], id="negative-inf"),
     ],
 )
 def test_a_nonsense_wait_budget_is_a_usage_error(
@@ -583,7 +587,7 @@ def test_a_nonsense_wait_budget_is_a_usage_error(
     with pytest.raises(SystemExit) as excinfo:
         _main([str(corpus), *flag])
     assert excinfo.value.code == 2
-    assert "--lakera-max-wait" in capsys.readouterr().err
+    assert "--l2-max-wait" in capsys.readouterr().err
     assert log == [], "a rejected budget must not scan anything"
 
 
@@ -597,8 +601,8 @@ def test_a_sane_wait_budget_is_accepted(
         '{"id": "a", "text": "a", "expected": "pass"}\n', encoding="utf-8"
     )
     log = _reason_scan(monkeypatch, {"a": ["pass"]})
-    assert _main([str(corpus), "--lakera-max-wait", good]) == 0
-    assert log[0]["lakera_max_wait_s"] == expected
+    assert _main([str(corpus), "--l2-max-wait", good]) == 0
+    assert log[0]["l2_max_wait_s"] == expected
 
 
 # ---------------------------------------------------------------------------
@@ -670,7 +674,7 @@ def test_a_negative_confirmation_budget_is_a_usage_error(
     monkeypatch, tmp_path: Path, capsys
 ) -> None:
     """`evaluate` raises ValueError on this; escaping `_main` it became exit 1.
-    Rejected at parse time now, the same treatment `--lakera-max-wait` gets."""
+    Rejected at parse time now, the same treatment `--l2-max-wait` gets."""
     corpus = tmp_path / "c.jsonl"
     corpus.write_text(
         '{"id": "a", "text": "a", "expected": "pass"}\n', encoding="utf-8"

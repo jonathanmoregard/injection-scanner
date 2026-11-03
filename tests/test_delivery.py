@@ -86,10 +86,10 @@ def test_wrap_content_no_premature_close():
 
 
 def test_wrap_content_custom_source():
-    out = wrap_content("deadbeef" * 4, "hello", source="futuresearch-gate")
-    assert 'source="futuresearch-gate/' in out
-    assert "produced by futuresearch-gate from web sources" in out
-    assert "End of untrusted futuresearch-gate content" in out
+    out = wrap_content("deadbeef" * 4, "hello", source="research-agent")
+    assert 'source="research-agent/' in out
+    assert "produced by research-agent from web sources" in out
+    assert "End of untrusted research-agent content" in out
 
 
 def test_wrap_content_default_source():

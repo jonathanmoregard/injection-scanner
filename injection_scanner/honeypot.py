@@ -30,12 +30,13 @@ from __future__ import annotations
 
 import asyncio
 import copy
+import importlib
 import json
 import os
 import secrets
 import unicodedata
 from dataclasses import dataclass, field
-from typing import Literal
+from typing import Callable, Literal
 
 from injection_scanner import unicode_sanitize
 from injection_scanner.containment import (
@@ -411,6 +412,44 @@ def _openai_key() -> str | None:
         env_var="OPENAI_API_KEY",
         keyring_key="openai-api-key",
     )
+
+
+def provider_unready(provider: str, load: Callable[[], str | None]) -> str | None:
+    """The signal a call to `provider` would skip with before sending anything
+    (SDK not importable, `*_FILE` mount broken, no key), or `None`.
+
+    Readiness only, for the boot smoke: no client is built, nothing goes on
+    the wire, and the key is dropped. Same vocabulary and order as the
+    `_call_*` adapters below and judge's `_ask_*`, which keep their own
+    inline checks so the key they send is the one they just resolved.
+    """
+    if provider not in ("anthropic", "openai"):
+        return "unknown-provider"
+    try:
+        # A real import, not `find_spec`: a present-but-broken SDK must read
+        # as lib-missing here exactly as it would on the call path.
+        importlib.import_module(provider)
+    except ImportError:
+        return f"{provider}-lib-missing"
+    try:
+        key = load()
+    except KeyConfigError:
+        return "key-config-error"
+    if not key:
+        return f"no-{provider}-api-key"
+    return None
+
+
+def ready() -> str | None:
+    """`None` when every scenario's provider could be called, else
+    `honeypot_unavailable:<scenario>:unavailable:<signal>` for the first that
+    could not: the shape `check` reports, minus the skipped count."""
+    loaders = {"anthropic": _anthropic_key, "openai": _openai_key}
+    for s in ALL_SCENARIOS:
+        signal = provider_unready(s["provider"], loaders.get(s["provider"], lambda: None))
+        if signal is not None:
+            return f"honeypot_unavailable:{s['name']}:unavailable:{signal}"
+    return None
 
 
 # ---------- wrap sealing ----------

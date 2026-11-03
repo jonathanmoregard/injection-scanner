@@ -44,8 +44,8 @@ jobs:
           uv pip install -e ".[test]"
 
       # Deterministic suite — no API keys, no network. The whole tests/ tree
-      # is key-free (measured 2026-09-05: 436 passed with ANTHROPIC_API_KEY,
-      # OPENAI_API_KEY and LAKERA_API_KEY all unset), so it runs in full here.
+      # is key-free (measured 2026-09-05: 436 passed with every vendor key
+      # unset), so it runs in full here.
       # It used to run an explicit four-file list, which left test_judge.py
       # out — so the anthropic-SDK signature break only surfaced once a
       # live-key job hit it. test_judge.py drives the real SDK over a stub
@@ -53,8 +53,8 @@ jobs:
       # for that class of break. test_payload.py is a CLI tool with no test_
       # functions; pytest collects nothing from it.
       #
-      # This job is the whole gate. The live smoke and corpus eval moved to
-      # .github/workflows/live-eval.yml (nightly + workflow_dispatch) on
-      # 2026-09-06: "ci tests should not call external services in general".
+      # This job is the whole of CI. No workflow calls a scanner vendor
+      # (2026-10-24: "gha shouldn't ddos third party"); the corpus eval is
+      # run locally, by hand. tests/test_ci_relations.py pins this.
       - name: pytest
         run: .venv/bin/python -m pytest tests/ -v
