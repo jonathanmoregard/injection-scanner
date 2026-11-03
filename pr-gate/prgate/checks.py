@@ -460,7 +460,16 @@ def _pip_logical(text: str) -> dict[int, str]:
     onto the previous one, so a URL can be split across any number of them.
     Every physical line of a run maps to the same joined result: an added line
     is then checked as what pip actually resolves, not as the fragment the
-    diff happens to show."""
+    diff happens to show.
+
+    Mirrors pip's `join_lines` (`pip/_internal/req/req_file.py`): it appends
+    `line.strip("\\")` for every line of a run but the last, which it appends
+    whole. Note BOTH ends -- dropping only the trailing backslashes leaves a
+    leading one that `_bad_urls` reads as a path separator, ending the host at
+    the allowlisted prefix while pip reads straight on into the attacker's
+    domain. Whitespace before the backslash is rstripped because `_continues`
+    has already treated the line as continuing; pip would not continue there
+    at all, so this is the more suspicious of the two readings."""
     out: dict[int, str] = {}
     physical = text.split("\n")
     i = 0
@@ -468,7 +477,7 @@ def _pip_logical(text: str) -> dict[int, str]:
         run = [i]
         while _continues(physical[run[-1]], True) and run[-1] + 1 < len(physical):
             run.append(run[-1] + 1)
-        joined = "".join(physical[j].rstrip().removesuffix("\\").rstrip("\\")
+        joined = "".join(physical[j].rstrip().strip("\\")
                          if j != run[-1] else physical[j] for j in run)
         for j in run:
             out[j + 1] = joined

