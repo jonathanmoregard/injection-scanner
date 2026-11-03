@@ -330,10 +330,13 @@ def parsed_lockfile(f: FileChange) -> bool:
 
 
 def fetched_lockfile(f: FileChange) -> bool:
-    """A lockfile core fetches whole: a parsed one, or a line-checked one
-    renamed from another kind (a rename shows only the lines it changed)."""
+    """A lockfile core fetches whole: a parsed one; a line-checked one renamed
+    from another kind (a rename shows only the lines it changed); or a
+    requirements file, whose logical lines span physical ones through pip's
+    backslash continuation, so an added line cannot be read on its own."""
     return parsed_lockfile(f) or (f.status != "deleted" and _allowlist(f.path) is not None
-                                  and renamed_from_other_kind(f))
+                                  and (renamed_from_other_kind(f)
+                                       or _kind(f.path) == "requirements"))
 
 
 # JSON / TOML / YAML double-quoted string escapes, for the line-checked
@@ -451,14 +454,46 @@ def _pip_options(line: str) -> str | None:
     return " ".join(f"{t[:2]} {t[2:]}" if _PIP_ATTACHED.match(t) else t for t in opts)
 
 
-def _line_hits(f: FileChange, allowed: frozenset[str], lines) -> list[Hit]:
+def _pip_logical(text: str) -> dict[int, str]:
+    """Physical line number (1-based) -> the whole logical line pip reads it
+    as, with backslash continuations joined. pip glues the next line straight
+    onto the previous one, so a URL can be split across any number of them.
+    Every physical line of a run maps to the same joined result: an added line
+    is then checked as what pip actually resolves, not as the fragment the
+    diff happens to show."""
+    out: dict[int, str] = {}
+    physical = text.split("\n")
+    i = 0
+    while i < len(physical):
+        run = [i]
+        while _continues(physical[run[-1]], True) and run[-1] + 1 < len(physical):
+            run.append(run[-1] + 1)
+        joined = "".join(physical[j].rstrip().removesuffix("\\").rstrip("\\")
+                         if j != run[-1] else physical[j] for j in run)
+        for j in run:
+            out[j + 1] = joined
+        i = run[-1] + 1
+    return out
+
+
+def _line_hits(f: FileChange, allowed: frozenset[str], lines,
+               logical: dict[int, str] | None = None) -> list[Hit]:
     pip = _kind(f.path) == "requirements"
     yarn = _kind(f.path) == "yarn.lock"
     hits = []
     for line_no, original in lines:
+        # With the whole file in hand, an added line is judged as the logical
+        # line pip resolves it to. `_continues` then stops being a hit of its
+        # own: a line ending in a backslash whose joined URL is allowlisted is
+        # harmless, and flagging it on sight was a false positive. Without the
+        # file (over the fetch cap) the bare-continuation hit stays as the
+        # conservative fallback.
+        resolved = (logical or {}).get(line_no)
+        if resolved is not None:
+            original = resolved
         text, undecoded = _decode_escapes(original)
         bad = []
-        if _continues(original, pip):
+        if resolved is None and _continues(original, pip):
             bad.append("line continuation")
         if undecoded and _SCHEMEISH.search(text):
             bad.append("undecodable escape near a URL")
@@ -469,6 +504,10 @@ def _line_hits(f: FileChange, allowed: frozenset[str], lines) -> list[Hit]:
         if yarn:
             bad += _yarn_v1_line_bad(text)
         if bad:
+            # The raw text and pip's option parse resolve to the same logical
+            # line, so they report the same host twice. Order kept: the first
+            # reason stays first.
+            bad = list(dict.fromkeys(bad))
             hits.append(Hit("lockfile-host", f.path,
                             f"line {line_no}: not allowlisted: {', '.join(bad[:4])}", False))
     return hits
@@ -819,7 +858,13 @@ def lockfile_hosts(files: list[FileChange], lockfiles: dict[str, Lockfile], *,
         lf = lockfiles.get(f.path)
         if not parsed_lockfile(f):
             lines = _checked_lines(f, lf)
-            hits += (_line_hits(f, allowed, lines) if lines is not None else
+            # Requirements files are fetched whole so a split logical line can
+            # be resolved; None head means over the cap, and the fallback in
+            # _line_hits applies.
+            logical = (_pip_logical(lf.head.decode("utf-8", errors="replace"))
+                       if _kind(f.path) == "requirements" and lf is not None
+                       and lf.head is not None else None)
+            hits += (_line_hits(f, allowed, lines, logical) if lines is not None else
                      [Hit("lockfile-host", f.path, "lockfile too large to check", False)])
             continue
         # yarn.lock with the v1 header is classic yarn's line format, which

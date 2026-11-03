@@ -76,10 +76,15 @@ the base branch). In order, failing closed at every step:
      (`requirements*.txt`, `constraints*.txt`, pip-tools'
      `requirements*.in` / `constraints*.in`, and any `.txt` or `.in` in a
      directory named `requirements`), `Gemfile.lock` and yarn v1 lockfiles
-     have no multi-line strings and are checked one added line at a time;
-     an added line ending in a backslash continuation that could glue the
-     next line onto a URL is a hit (in pip requirement files any run not
-     preceded by whitespace, since pip joins them all). Any URL form a package manager
+     have no multi-line strings and are checked one added line at a time.
+     pip requirement files are fetched whole even so, because pip glues a
+     trailing backslash onto the next line: each added line is judged as the
+     **logical** line pip resolves it to, so editing only the tail of a split
+     URL cannot slip a host past the allowlist. Over the fetch cap, where
+     that resolution is impossible, an added line ending in such a
+     continuation is a hit on sight (any run not preceded by whitespace,
+     since pip joins them all). `Gemfile.lock` and yarn v1 keep the
+     on-sight rule. Any URL form a package manager
      accepts counts (`https:evil.x`, `https:\\evil.x`, escaped slashes, IPv6
      hosts). npm-family lockfiles (`package-lock.json`,
      `npm-shrinkwrap.json`, `bun.lock`, `yarn.lock`, `pnpm-lock.yaml`) can
